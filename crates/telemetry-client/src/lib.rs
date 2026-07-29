@@ -8,6 +8,9 @@ use std::{
 };
 use telemetry_core::{event_id, EventBatch, UsageEvent, SCHEMA_VERSION};
 
+const UPLOAD_MAX_ATTEMPTS: usize = 5;
+const UPLOAD_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub cc_switch_db: PathBuf,
@@ -154,24 +157,69 @@ pub async fn upload(
     config: &ClientConfig,
     events: Vec<UsageEvent>,
 ) -> anyhow::Result<telemetry_core::BatchResponse> {
+    let url = format!(
+        "{}/v1/events/batch",
+        config.server_url.trim_end_matches('/')
+    );
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
         .build()?;
-    let mut request = client
-        .post(format!(
-            "{}/v1/events/batch",
-            config.server_url.trim_end_matches('/')
-        ))
-        .json(&EventBatch {
-            schema_version: SCHEMA_VERSION,
-            node_id: config.node_id.clone(),
-            events,
-        });
-    if let Some(token) = &config.auth_token {
-        request = request.bearer_auth(token);
+    let batch = EventBatch {
+        schema_version: SCHEMA_VERSION,
+        node_id: config.node_id.clone(),
+        events,
+    };
+
+    for attempt in 0..UPLOAD_MAX_ATTEMPTS {
+        let mut request = client.post(&url).json(&batch);
+        if let Some(token) = &config.auth_token {
+            request = request.bearer_auth(token);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) if attempt + 1 < UPLOAD_MAX_ATTEMPTS => {
+                tokio::time::sleep(upload_retry_delay(attempt)).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("upload usage batch to {url} after {UPLOAD_MAX_ATTEMPTS} attempts")
+                })
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json()
+                .await
+                .with_context(|| format!("decode usage batch response from {url}"));
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        if !is_retryable_status(status) || attempt + 1 == UPLOAD_MAX_ATTEMPTS {
+            let detail = if body.trim().is_empty() {
+                status.to_string()
+            } else {
+                body.trim().to_owned()
+            };
+            anyhow::bail!("telemetry upload failed with HTTP {status} for {url}: {detail}");
+        }
+
+        tokio::time::sleep(upload_retry_delay(attempt)).await;
     }
-    let response = request.send().await?.error_for_status()?;
-    Ok(response.json().await?)
+
+    unreachable!("upload loop always returns or retries before exhausting attempts")
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn upload_retry_delay(attempt: usize) -> Duration {
+    let multiplier = 1u32 << attempt.min(3);
+    UPLOAD_INITIAL_RETRY_DELAY.saturating_mul(multiplier)
 }
 
 fn overlap_start(cursor: &Cursor, overlap_seconds: i64) -> Cursor {
@@ -235,10 +283,39 @@ pub async fn sync_available(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
+    };
     use std::{
         net::SocketAddr,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
     };
+    use telemetry_core::BatchResponse;
+
+    #[derive(Clone)]
+    struct RetryState {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    async fn retry_then_accept(State(state): State<RetryState>) -> impl IntoResponse {
+        let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt < 2 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(BatchResponse::default()),
+            );
+        }
+        (
+            StatusCode::OK,
+            Json(BatchResponse {
+                accepted: vec!["node-a:request-1".into()],
+                ..Default::default()
+            }),
+        )
+    }
     #[test]
     fn cursor_reads_same_second_in_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -292,6 +369,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_retries_service_unavailable_and_preserves_batch() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let state = RetryState {
+            attempts: attempts.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/events/batch", post(retry_then_accept))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let config = ClientConfig {
+            cc_switch_db: PathBuf::from("unused.db"),
+            server_url: format!("http://{address}"),
+            node_id: "node-a".into(),
+            auth_token: None,
+            batch_size: 1,
+            overlap_seconds: 0,
+        };
+        let response = upload(
+            &config,
+            vec![UsageEvent {
+                event_id: "node-a:request-1".into(),
+                node_id: "node-a".into(),
+                request_id: "request-1".into(),
+                created_at: 1,
+                app_type: "codex".into(),
+                provider_id: "provider".into(),
+                model: "model".into(),
+                request_model: None,
+                pricing_model: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                input_token_semantics: 0,
+                total_cost_usd: "0".into(),
+                latency_ms: 1,
+                status_code: 200,
+                is_streaming: false,
+                data_source: "proxy".into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.accepted, vec!["node-a:request-1"]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn sync_drains_backlog_and_recovers_late_events() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("cc-switch.db");
@@ -335,11 +471,8 @@ mod tests {
 
         let server_path = directory.path().join("server.db");
         let server_connection = telemetry_server::init_db(&server_path).unwrap();
-        let server_state = telemetry_server::ServerState {
-            db: Arc::new(Mutex::new(server_connection)),
-            db_path: server_path.clone(),
-            auth_token: None,
-        };
+        let server_state =
+            telemetry_server::ServerState::new(server_connection, server_path.clone(), None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {

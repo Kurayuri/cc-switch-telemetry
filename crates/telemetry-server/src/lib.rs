@@ -7,20 +7,80 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use telemetry_core::{BatchResponse, EventBatch, RejectedEvent, RollupSnapshot, SCHEMA_VERSION};
+use tokio::sync::{mpsc, oneshot};
+
+const WRITE_QUEUE_CAPACITY: usize = 256;
+const WRITE_QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ServerState {
     pub db: Arc<Mutex<Connection>>,
     pub db_path: PathBuf,
     pub auth_token: Option<String>,
+    write_tx: mpsc::Sender<WriteTask>,
+}
+
+enum WriteTask {
+    Events {
+        batch: EventBatch,
+        response: oneshot::Sender<(StatusCode, BatchResponse)>,
+    },
+    Rollup {
+        snapshot: Box<RollupSnapshot>,
+        response: oneshot::Sender<StatusCode>,
+    },
+}
+
+impl ServerState {
+    pub fn new(db: Connection, db_path: PathBuf, auth_token: Option<String>) -> Self {
+        let db = Arc::new(Mutex::new(db));
+        let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
+        spawn_write_worker(Arc::clone(&db), write_rx);
+        Self {
+            db,
+            db_path,
+            auth_token,
+            write_tx,
+        }
+    }
+}
+
+fn spawn_write_worker(db: Arc<Mutex<Connection>>, mut write_rx: mpsc::Receiver<WriteTask>) {
+    tokio::spawn(async move {
+        while let Some(task) = write_rx.recv().await {
+            match task {
+                WriteTask::Events { batch, response } => {
+                    let worker_db = Arc::clone(&db);
+                    let result =
+                        tokio::task::spawn_blocking(move || process_events(&worker_db, batch))
+                            .await
+                            .unwrap_or((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                BatchResponse::default(),
+                            ));
+                    let _ = response.send(result);
+                }
+                WriteTask::Rollup { snapshot, response } => {
+                    let worker_db = Arc::clone(&db);
+                    let result =
+                        tokio::task::spawn_blocking(move || process_rollup(&worker_db, *snapshot))
+                            .await
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let _ = response.send(result);
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +191,22 @@ fn authorized(headers: &HeaderMap, expected: &Option<String>) -> bool {
         .unwrap_or(false)
 }
 
+fn is_retryable_sqlite_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn database_error_status(error: &rusqlite::Error) -> StatusCode {
+    if is_retryable_sqlite_error(error) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 pub async fn health(State(state): State<ServerState>) -> impl IntoResponse {
     let ok = state
         .db
@@ -178,17 +254,52 @@ pub async fn ingest(
             }),
         );
     }
+    let (response_tx, response_rx) = oneshot::channel();
+    let task = WriteTask::Events {
+        batch,
+        response: response_tx,
+    };
+    match tokio::time::timeout(WRITE_QUEUE_WAIT_TIMEOUT, state.write_tx.send(task)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(BatchResponse::default()),
+            )
+        }
+    }
+    match tokio::time::timeout(WRITE_RESULT_TIMEOUT, response_rx).await {
+        Ok(Ok((status, response))) => (status, Json(response)),
+        Ok(Err(_)) | Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(BatchResponse::default()),
+        ),
+    }
+}
+
+fn process_events(db: &Arc<Mutex<Connection>>, batch: EventBatch) -> (StatusCode, BatchResponse) {
     let mut response = BatchResponse::default();
     let now = chrono::Utc::now().timestamp();
-    let Ok(db) = state.db.lock() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(response));
+    let Ok(db) = db.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, response);
     };
     let tx = match db.unchecked_transaction() {
         Ok(tx) => tx,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(response)),
+        Err(error) => return (database_error_status(&error), response),
     };
     for event in &batch.events {
-        let exists: Option<String> = tx.query_row("SELECT event_id FROM usage_events WHERE event_id = ?1 OR (node_id = ?2 AND request_id = ?3)", params![event.event_id, event.node_id, event.request_id], |r| r.get(0)).optional().unwrap_or(None);
+        let exists: Option<String> = match tx
+            .query_row(
+                "SELECT event_id FROM usage_events
+                 WHERE event_id = ?1 OR (node_id = ?2 AND request_id = ?3)",
+                params![event.event_id, event.node_id, event.request_id],
+                |row| row.get(0),
+            )
+            .optional()
+        {
+            Ok(value) => value,
+            Err(error) => return (database_error_status(&error), BatchResponse::default()),
+        };
         if exists.is_some() {
             response.duplicates.push(event.event_id.clone());
             continue;
@@ -225,19 +336,65 @@ pub async fn ingest(
         );
         match result {
             Ok(_) => response.accepted.push(event.event_id.clone()),
+            Err(error) if is_retryable_sqlite_error(&error) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, BatchResponse::default())
+            }
             Err(error) => response.rejected.push(RejectedEvent {
                 event_id: event.event_id.clone(),
                 reason: error.to_string(),
             }),
         }
     }
-    if tx.commit().is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(BatchResponse::default()),
-        );
+    if let Err(error) = tx.commit() {
+        return (database_error_status(&error), BatchResponse::default());
     }
-    (StatusCode::OK, Json(response))
+    (StatusCode::OK, response)
+}
+
+fn process_rollup(db: &Arc<Mutex<Connection>>, snapshot: RollupSnapshot) -> StatusCode {
+    let Ok(db) = db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+    let result = db.execute(
+        "INSERT INTO usage_daily_snapshots (
+             snapshot_key,node_id,date,app_type,provider_id,model,request_model,
+             pricing_model,request_count,success_count,input_tokens,output_tokens,
+             cache_read_tokens,cache_creation_tokens,total_cost_usd,avg_latency_ms,received_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(snapshot_key) DO UPDATE SET
+             request_count=excluded.request_count,
+             success_count=excluded.success_count,
+             input_tokens=excluded.input_tokens,
+             output_tokens=excluded.output_tokens,
+             cache_read_tokens=excluded.cache_read_tokens,
+             cache_creation_tokens=excluded.cache_creation_tokens,
+             total_cost_usd=excluded.total_cost_usd,
+             avg_latency_ms=excluded.avg_latency_ms,
+             received_at=excluded.received_at",
+        params![
+            snapshot.snapshot_key,
+            snapshot.node_id,
+            snapshot.date,
+            snapshot.app_type,
+            snapshot.provider_id,
+            snapshot.model,
+            snapshot.request_model,
+            snapshot.pricing_model,
+            snapshot.request_count,
+            snapshot.success_count,
+            snapshot.input_tokens,
+            snapshot.output_tokens,
+            snapshot.cache_read_tokens,
+            snapshot.cache_creation_tokens,
+            snapshot.total_cost_usd,
+            snapshot.avg_latency_ms,
+            chrono::Utc::now().timestamp()
+        ],
+    );
+    match result {
+        Ok(_) => StatusCode::OK,
+        Err(error) => database_error_status(&error),
+    }
 }
 
 pub async fn ingest_rollup(
@@ -248,14 +405,18 @@ pub async fn ingest_rollup(
     if !authorized(&headers, &state.auth_token) {
         return StatusCode::UNAUTHORIZED;
     }
-    let Ok(db) = state.db.lock() else {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+    let (response_tx, response_rx) = oneshot::channel();
+    let task = WriteTask::Rollup {
+        snapshot: Box::new(snapshot),
+        response: response_tx,
     };
-    let result = db.execute("INSERT INTO usage_daily_snapshots (snapshot_key,node_id,date,app_type,provider_id,model,request_model,pricing_model,request_count,success_count,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,total_cost_usd,avg_latency_ms,received_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(snapshot_key) DO UPDATE SET request_count=excluded.request_count,success_count=excluded.success_count,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cache_read_tokens=excluded.cache_read_tokens,cache_creation_tokens=excluded.cache_creation_tokens,total_cost_usd=excluded.total_cost_usd,avg_latency_ms=excluded.avg_latency_ms,received_at=excluded.received_at", params![snapshot.snapshot_key,snapshot.node_id,snapshot.date,snapshot.app_type,snapshot.provider_id,snapshot.model,snapshot.request_model,snapshot.pricing_model,snapshot.request_count,snapshot.success_count,snapshot.input_tokens,snapshot.output_tokens,snapshot.cache_read_tokens,snapshot.cache_creation_tokens,snapshot.total_cost_usd,snapshot.avg_latency_ms,chrono::Utc::now().timestamp()]);
-    if result.is_ok() {
-        StatusCode::OK
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+    match tokio::time::timeout(WRITE_QUEUE_WAIT_TIMEOUT, state.write_tx.send(task)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+    }
+    match tokio::time::timeout(WRITE_RESULT_TIMEOUT, response_rx).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -339,11 +500,7 @@ pub async fn serve(
     auth_token: Option<String>,
 ) -> anyhow::Result<()> {
     let db_path_for_queries = db_path.clone();
-    let state = ServerState {
-        db: Arc::new(Mutex::new(init_db(db_path)?)),
-        db_path: db_path_for_queries,
-        auth_token,
-    };
+    let state = ServerState::new(init_db(db_path)?, db_path_for_queries, auth_token);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(
         listener,
@@ -406,5 +563,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(semantics, 1);
+    }
+
+    #[test]
+    fn sqlite_lock_errors_are_reported_as_service_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE lock_probe (value INTEGER);
+                 BEGIN EXCLUSIVE;",
+            )
+            .unwrap();
+
+        let contender = Connection::open(&path).unwrap();
+        contender
+            .busy_timeout(std::time::Duration::from_millis(1))
+            .unwrap();
+        let error = contender
+            .execute("INSERT INTO lock_probe VALUES (1)", [])
+            .unwrap_err();
+
+        assert!(is_retryable_sqlite_error(&error));
+        assert_eq!(
+            database_error_status(&error),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

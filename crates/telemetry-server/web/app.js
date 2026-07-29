@@ -3,6 +3,7 @@ import { createFormatters, resolveLocale, translate } from "./i18n.js";
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
 const localeStorageKey = "cc-switch-telemetry.locale";
+const themeStorageKey = "cc-switch-telemetry.theme";
 
 function storedLocale() {
   try {
@@ -19,15 +20,31 @@ let locale = resolveLocale(
 let formatters = createFormatters(locale);
 const t = (key, variables = {}) => translate(locale, key, variables);
 
+function storedTheme() {
+  try {
+    return localStorage.getItem(themeStorageKey);
+  } catch {
+    return null;
+  }
+}
+
+let theme = storedTheme() === "light" ? "light" : "dark";
+
 const elements = {
   statusDot: $("statusDot"),
   statusText: $("statusText"),
   updatedAt: $("updatedAt"),
+  themeToggle: $("themeToggle"),
+  themeToggleLabel: $("themeToggleLabel"),
   languageToggle: $("languageToggle"),
   refreshButton: $("refreshButton"),
   errorBanner: $("errorBanner"),
   rangePreset: $("rangePreset"),
-  customRange: $("customRange"),
+  customRangeDialog: $("customRangeDialog"),
+  customRangeForm: $("customRangeForm"),
+  customRangeError: $("customRangeError"),
+  cancelRange: $("cancelRange"),
+  cancelRangeBottom: $("cancelRangeBottom"),
   customFrom: $("customFrom"),
   customTo: $("customTo"),
   applyRange: $("applyRange"),
@@ -37,9 +54,22 @@ const elements = {
   modelFilter: $("modelFilter"),
   sourceFilter: $("sourceFilter"),
   trendMetric: $("trendMetric"),
+  trendBucket: $("trendBucket"),
+  resolvedBucket: $("resolvedBucket"),
   trendChart: $("trendChart"),
   trendEmpty: $("trendEmpty"),
+  trendTooltip: $("trendTooltip"),
   coverageText: $("coverageText"),
+  kpiInputTotal: $("kpiInputTotal"),
+  kpiOutputTotal: $("kpiOutputTotal"),
+  kpiFreshTokens: $("kpiFreshTokens"),
+  kpiCreationTokens: $("kpiCreationTokens"),
+  kpiCachedTokens: $("kpiCachedTokens"),
+  tokenComposition: $("tokenComposition"),
+  freshTokenBar: $("freshTokenBar"),
+  creationTokenBar: $("creationTokenBar"),
+  cachedTokenBar: $("cachedTokenBar"),
+  kpiCostTopModels: $("kpiCostTopModels"),
   breakdownTabs: $("breakdownTabs"),
   breakdownRows: $("breakdownRows"),
   breakdownEmpty: $("breakdownEmpty"),
@@ -58,6 +88,7 @@ const state = {
   events: [],
   lastError: null,
   updatedAt: null,
+  lastNonCustomRange: "24h",
   connection: { status: "", key: "status.connecting" },
 };
 
@@ -185,23 +216,101 @@ function formatLatency(value) {
   return `${Math.round(value || 0)} ms`;
 }
 
+function animateMetric(element, target, formatter) {
+  const start = Number(element.dataset.numericValue ?? 0);
+  const duration = 460;
+  const begin = performance.now();
+  if (element.animationFrame) cancelAnimationFrame(element.animationFrame);
+  element.dataset.numericValue = String(target);
+  element.classList.remove("metric-value-updated");
+  void element.offsetWidth;
+  element.classList.add("metric-value-updated");
+  const tick = (now) => {
+    const progress = Math.min(1, (now - begin) / duration);
+    const eased = 1 - (1 - progress) ** 3;
+    element.textContent = formatter(start + (target - start) * eased);
+    if (progress < 1) {
+      element.animationFrame = requestAnimationFrame(tick);
+    } else {
+      element.textContent = formatter(target);
+      element.animationFrame = null;
+    }
+  };
+  element.animationFrame = requestAnimationFrame(tick);
+}
+
+function pulseMetric(element) {
+  element.classList.remove("metric-value-updated");
+  void element.offsetWidth;
+  element.classList.add("metric-value-updated");
+}
+
+function setTokenBarWidth(element, value, total) {
+  element.style.width = total > 0 ? `${Math.max(0, value) / total * 100}%` : "0%";
+}
+
+function animateTokenParts(summary) {
+  const fresh = Number(summary.freshInputTokens || 0);
+  const creation = Number(summary.cacheCreationTokens || 0);
+  const cached = Number(summary.cacheReadTokens || 0);
+  const output = Number(summary.outputTokens || 0);
+  const input = fresh + creation + cached;
+  animateMetric(elements.kpiInputTotal, input, formatTokens);
+  animateMetric(elements.kpiOutputTotal, output, formatTokens);
+  animateMetric(elements.kpiFreshTokens, fresh, formatTokens);
+  animateMetric(elements.kpiCreationTokens, creation, formatTokens);
+  animateMetric(elements.kpiCachedTokens, cached, formatTokens);
+  setTokenBarWidth(elements.freshTokenBar, fresh, input);
+  setTokenBarWidth(elements.creationTokenBar, creation, input);
+  setTokenBarWidth(elements.cachedTokenBar, cached, input);
+  const tokenCompositionLabel = t("kpi.tokenCompositionAria", {
+    fresh: formatTokens(fresh),
+    creation: formatTokens(creation),
+    cached: formatTokens(cached),
+  });
+  elements.tokenComposition.setAttribute("aria-label", tokenCompositionLabel);
+  elements.tokenComposition.setAttribute("title", tokenCompositionLabel);
+}
+
 function renderSummary(summary) {
-  $("kpiRequests").textContent = formatters.integerNumber.format(summary.totalRequests);
+  animateMetric($("kpiRequests"), summary.totalRequests, (value) => formatters.integerNumber.format(value));
+  animateMetric($("kpiTokens"), summary.realTotalTokens, formatTokens);
+  animateMetric($("kpiCost"), summary.totalCostUsd, (value) => formatters.moneyNumber.format(value));
+  animateMetric($("kpiSuccessRate"), summary.successRate, (value) => formatPercent(value));
+  animateMetric($("kpiCacheRate"), summary.cacheHitRate * 100, (value) => formatPercent(value));
+  animateMetric($("kpiLatency"), summary.avgLatencyMs, formatLatency);
   $("kpiSuccessCount").textContent = t("kpi.successCount", {
     count: formatters.integerNumber.format(summary.successfulRequests),
   });
-  $("kpiTokens").textContent = formatTokens(summary.realTotalTokens);
-  $("kpiTokenParts").textContent = t("kpi.tokenParts", {
-    input: formatTokens(summary.freshInputTokens),
-    output: formatTokens(summary.outputTokens),
-  });
-  $("kpiCost").textContent = formatters.moneyNumber.format(summary.totalCostUsd);
-  $("kpiSuccessRate").textContent = formatPercent(summary.successRate);
-  $("kpiCacheRate").textContent = formatPercent(summary.cacheHitRate, true);
-  $("kpiCacheTokens").textContent = t("kpi.cacheTokens", {
-    count: formatTokens(summary.cacheReadTokens),
-  });
-  $("kpiLatency").textContent = formatLatency(summary.avgLatencyMs);
+  pulseMetric($("kpiSuccessCount"));
+  animateTokenParts(summary);
+}
+
+function renderCostTopModels(items) {
+  elements.kpiCostTopModels.replaceChildren();
+  const topModels = [...(items || [])]
+    .filter((item) => Number(item.totalCostUsd || 0) > 0)
+    .sort((left, right) => Number(right.totalCostUsd || 0) - Number(left.totalCostUsd || 0))
+    .slice(0, 3);
+  for (const item of topModels) {
+    const row = document.createElement("div");
+    row.className = "cost-model-row";
+    const name = document.createElement("span");
+    name.className = "cost-model-name";
+    name.textContent = item.key || t("common.unknown");
+    name.title = name.textContent;
+    const amount = document.createElement("strong");
+    amount.className = "cost-model-amount";
+    amount.textContent = formatters.moneyNumber.format(item.totalCostUsd);
+    row.append(name, amount);
+    elements.kpiCostTopModels.append(row);
+  }
+  if (!topModels.length) {
+    const empty = document.createElement("span");
+    empty.className = "cost-model-name";
+    empty.textContent = "—";
+    elements.kpiCostTopModels.append(empty);
+  }
 }
 
 function createSvg(name, attributes = {}, text = "") {
@@ -223,9 +332,15 @@ function trendValueLabel(value, metric) {
 
 function renderTrend() {
   const points = state.overview?.trend || [];
+  elements.trendTooltip.hidden = true;
   elements.trendChart.replaceChildren();
   elements.trendEmpty.hidden = points.length > 0;
   elements.trendChart.hidden = points.length === 0;
+  if (state.overview?.range?.bucket) {
+    elements.resolvedBucket.textContent = t("trend.resolvedBucket", {
+      bucket: state.overview.range.bucket,
+    });
+  }
   if (!points.length) return;
 
   const metric = elements.trendMetric.value;
@@ -236,7 +351,10 @@ function renderTrend() {
   const plotHeight = height - padding.top - padding.bottom;
   const values = points.map((point) => trendValue(point, metric));
   const maximum = Math.max(...values, 1);
-  const x = (index) => padding.left + (points.length === 1 ? plotWidth / 2 : index * plotWidth / (points.length - 1));
+  const rangeFrom = Number(state.overview.range.from);
+  const rangeTo = Math.max(Number(state.overview.range.to), rangeFrom + 1);
+  const rangeSpan = rangeTo - rangeFrom;
+  const x = (timestamp) => padding.left + Math.max(0, Math.min(1, (timestamp - rangeFrom) / rangeSpan)) * plotWidth;
   const y = (value) => padding.top + plotHeight - value / maximum * plotHeight;
 
   for (let index = 0; index <= 4; index += 1) {
@@ -246,22 +364,62 @@ function renderTrend() {
     elements.trendChart.append(createSvg("text", { x: padding.left - 10, y: gridY + 4, "text-anchor": "end", class: "axis-label" }, trendValueLabel(labelValue, metric)));
   }
 
-  const coordinates = points.map((point, index) => [x(index), y(values[index])]);
+  const coordinates = points.map((point, index) => [x(point.bucketStart), y(values[index])]);
   const linePath = coordinates.map(([cx, cy], index) => `${index ? "L" : "M"} ${cx} ${cy}`).join(" ");
   const areaPath = `${linePath} L ${coordinates.at(-1)[0]} ${padding.top + plotHeight} L ${coordinates[0][0]} ${padding.top + plotHeight} Z`;
   elements.trendChart.append(createSvg("path", { d: areaPath, class: "area" }));
-  elements.trendChart.append(createSvg("path", { d: linePath, class: "line" }));
+  elements.trendChart.append(createSvg("path", { d: linePath, class: "line", pathLength: 1 }));
 
-  const labelIndexes = new Set([0, Math.floor((points.length - 1) / 3), Math.floor(2 * (points.length - 1) / 3), points.length - 1]);
   points.forEach((point, index) => {
     const [cx, cy] = coordinates[index];
     const circle = createSvg("circle", { cx, cy, r: 4, class: "point" });
-    circle.append(createSvg("title", {}, `${formatters.dateTime.format(point.bucketStart * 1000)} · ${trendValueLabel(values[index], metric)}`));
+    circle.addEventListener("pointerenter", (event) => showTrendTooltip(point, event));
+    circle.addEventListener("pointermove", (event) => showTrendTooltip(point, event));
+    circle.addEventListener("pointerleave", () => { elements.trendTooltip.hidden = true; });
     elements.trendChart.append(circle);
-    if (labelIndexes.has(index)) {
-      elements.trendChart.append(createSvg("text", { x: cx, y: height - 13, "text-anchor": index === 0 ? "start" : index === points.length - 1 ? "end" : "middle", class: "axis-label" }, formatters.dateTime.format(point.bucketStart * 1000).replaceAll("/", "-")));
-    }
   });
+
+  const axisLabels = [rangeFrom, rangeFrom + rangeSpan / 2, rangeTo];
+  axisLabels.forEach((timestamp, index) => {
+    elements.trendChart.append(createSvg("text", {
+      x: x(timestamp),
+      y: height - 13,
+      "text-anchor": index === 0 ? "start" : index === axisLabels.length - 1 ? "end" : "middle",
+      class: "axis-label",
+    }, formatters.dateTime.format(timestamp * 1000).replaceAll("/", "-")));
+  });
+}
+
+function showTrendTooltip(point, event) {
+  const tooltip = elements.trendTooltip;
+  const panel = elements.trendChart.parentElement;
+  tooltip.replaceChildren();
+  const title = document.createElement("strong");
+  title.textContent = formatters.dateTime.format(point.bucketStart * 1000);
+  tooltip.append(title);
+  const lines = [
+    ["trend.tooltipInput", formatTokens(point.inputTokens)],
+    ["trend.tooltipFreshInput", formatTokens(point.freshInputTokens)],
+    ["trend.tooltipCacheCreation", formatTokens(point.cacheCreationTokens)],
+    ["trend.tooltipCacheRead", formatTokens(point.cacheReadTokens)],
+    ["trend.tooltipOutput", formatTokens(point.outputTokens)],
+    ["trend.tooltipRequests", formatters.integerNumber.format(point.totalRequests)],
+    ["trend.tooltipSuccess", formatPercent(point.successRate)],
+    ["trend.tooltipCost", formatters.moneyNumber.format(point.totalCostUsd)],
+    ["trend.tooltipLatency", formatLatency(point.avgLatencyMs)],
+  ];
+  for (const [key, value] of lines) {
+    const line = document.createElement("span");
+    line.textContent = t(key, { value });
+    tooltip.append(line);
+  }
+  tooltip.hidden = false;
+  const panelRect = panel.getBoundingClientRect();
+  const targetX = event.clientX - panelRect.left + 14;
+  const targetY = event.clientY - panelRect.top - tooltip.offsetHeight - 14;
+  const maxLeft = panel.clientWidth - tooltip.offsetWidth - 12;
+  tooltip.style.left = `${Math.max(12, Math.min(targetX, maxLeft))}px`;
+  tooltip.style.top = `${Math.max(12, targetY)}px`;
 }
 
 function appendCell(row, value, className = "") {
@@ -280,10 +438,10 @@ function renderBreakdown() {
   for (const item of items) {
     const row = document.createElement("tr");
     appendCell(row, item.key || t("common.unknown"));
-    appendCell(row, formatters.integerNumber.format(item.totalRequests));
-    appendCell(row, formatTokens(item.realTotalTokens));
-    appendCell(row, formatPercent(item.successRate));
-    appendCell(row, formatters.moneyNumber.format(item.totalCostUsd));
+    appendCell(row, formatters.integerNumber.format(item.totalRequests), "table-value");
+    appendCell(row, formatTokens(item.realTotalTokens), "table-value");
+    appendCell(row, formatPercent(item.successRate), "table-value");
+    appendCell(row, formatters.moneyNumber.format(item.totalCostUsd), "table-value");
     elements.breakdownRows.append(row);
   }
 }
@@ -302,6 +460,7 @@ function renderCoverage(coverage) {
 function renderOverview(overview) {
   state.overview = overview;
   renderSummary(overview.summary);
+  renderCostTopModels(overview.breakdowns?.models);
   renderTrend();
   renderBreakdown();
   renderCoverage(overview.coverage);
@@ -321,10 +480,10 @@ function renderEventRows(items, append) {
     appendCell(row, item.nodeId || "—");
     appendCell(row, item.appType || "—");
     appendCell(row, `${item.providerId || "—"} / ${item.model || item.requestModel || "—"}`);
-    appendCell(row, formatTokens(item.realTotalTokens));
-    appendCell(row, formatTokens(item.cacheReadTokens));
-    appendCell(row, formatters.moneyNumber.format(item.totalCostUsd));
-    appendCell(row, formatLatency(item.latencyMs));
+    appendCell(row, formatTokens(item.realTotalTokens), "table-value");
+    appendCell(row, formatTokens(item.cacheReadTokens), "table-value");
+    appendCell(row, formatters.moneyNumber.format(item.totalCostUsd), "table-value");
+    appendCell(row, formatLatency(item.latencyMs), "table-value");
     const [label, className] = eventStatus(item.statusCode);
     const statusCell = appendCell(row, "");
     const pill = document.createElement("span");
@@ -372,7 +531,7 @@ async function refreshAll({ reloadFilters = false } = {}) {
   try {
     if (reloadFilters) await refreshFilters(controller.signal);
     const params = baseParams(true);
-    params.set("bucket", "auto");
+    params.set("bucket", elements.trendBucket.value);
     const [overview] = await Promise.all([
       fetchJson(`/v1/dashboard/overview?${params}`, controller.signal),
       loadEvents({ append: false, signal: controller.signal }),
@@ -406,6 +565,25 @@ function initializeCustomRange() {
   elements.customTo.value = toLocalInputValue(now);
 }
 
+function openCustomRange() {
+  elements.customRangeError.hidden = true;
+  if (typeof elements.customRangeDialog.showModal === "function") {
+    elements.customRangeDialog.showModal();
+  } else {
+    elements.customRangeDialog.setAttribute("open", "");
+  }
+  elements.customFrom.focus();
+}
+
+function closeCustomRange(restore = true) {
+  if (restore) elements.rangePreset.value = state.lastNonCustomRange;
+  if (typeof elements.customRangeDialog.close === "function") {
+    elements.customRangeDialog.close();
+  } else {
+    elements.customRangeDialog.removeAttribute("open");
+  }
+}
+
 function updateFilterPlaceholders() {
   const labels = [
     [elements.nodeFilter, "filters.allNodes"],
@@ -419,6 +597,19 @@ function updateFilterPlaceholders() {
   }
 }
 
+function applyTheme() {
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme;
+  elements.themeToggleLabel.textContent = t(
+    theme === "dark" ? "theme.switchLightShort" : "theme.switchDarkShort",
+  );
+  elements.themeToggle.setAttribute(
+    "aria-label",
+    t(theme === "dark" ? "theme.switchLight" : "theme.switchDark"),
+  );
+  elements.themeToggle.setAttribute("aria-pressed", String(theme === "light"));
+}
+
 function applyTranslations() {
   document.documentElement.lang = locale;
   document.title = t("page.title");
@@ -430,6 +621,7 @@ function applyTranslations() {
   }
   elements.languageToggle.textContent = t("language.switchShort");
   elements.languageToggle.setAttribute("aria-label", t("language.switch"));
+  applyTheme();
   updateFilterPlaceholders();
   setConnection(state.connection.status, state.connection.key);
   elements.updatedAt.textContent = state.updatedAt
@@ -439,6 +631,16 @@ function applyTranslations() {
   renderEventRows(state.events, false);
   if (state.lastError) showError(state.lastError);
 }
+
+elements.themeToggle.addEventListener("click", () => {
+  theme = theme === "dark" ? "light" : "dark";
+  try {
+    localStorage.setItem(themeStorageKey, theme);
+  } catch {
+    // The theme still changes for this page when persistent storage is unavailable.
+  }
+  applyTheme();
+});
 
 elements.languageToggle.addEventListener("click", () => {
   locale = locale === "zh-CN" ? "en-US" : "zh-CN";
@@ -452,10 +654,30 @@ elements.languageToggle.addEventListener("click", () => {
 });
 
 elements.refreshButton.addEventListener("click", () => refreshAll({ reloadFilters: true }));
-elements.applyRange.addEventListener("click", () => refreshAll({ reloadFilters: true }));
 elements.rangePreset.addEventListener("change", () => {
-  elements.customRange.hidden = elements.rangePreset.value !== "custom";
-  if (elements.rangePreset.value !== "custom") refreshAll({ reloadFilters: true });
+  if (elements.rangePreset.value === "custom") {
+    openCustomRange();
+    return;
+  }
+  state.lastNonCustomRange = elements.rangePreset.value;
+  refreshAll({ reloadFilters: true });
+});
+elements.customRangeForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  try {
+    selectedRange();
+    closeCustomRange(false);
+    refreshAll({ reloadFilters: true });
+  } catch (error) {
+    elements.customRangeError.textContent = error.translationKey ? t(error.translationKey) : error.message;
+    elements.customRangeError.hidden = false;
+  }
+});
+elements.cancelRange.addEventListener("click", () => closeCustomRange());
+elements.cancelRangeBottom.addEventListener("click", () => closeCustomRange());
+elements.customRangeDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeCustomRange();
 });
 
 for (const select of [elements.nodeFilter, elements.appFilter, elements.providerFilter, elements.modelFilter, elements.sourceFilter]) {
@@ -463,6 +685,7 @@ for (const select of [elements.nodeFilter, elements.appFilter, elements.provider
 }
 
 elements.trendMetric.addEventListener("change", renderTrend);
+elements.trendBucket.addEventListener("change", () => refreshAll());
 elements.breakdownTabs.addEventListener("click", (event) => {
   const button = event.target.closest("[data-dimension]");
   if (!button) return;
@@ -479,6 +702,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 initializeCustomRange();
+applyTheme();
 applyTranslations();
 refreshAll({ reloadFilters: true });
 setInterval(() => {

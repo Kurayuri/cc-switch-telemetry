@@ -49,6 +49,9 @@ ssh -L 8787:127.0.0.1:8787 user@server-host
 - 所有上传事件以 `node_id + ':' + request_id` 幂等。
 - Client 每 5 秒比较 `cc-switch.db` 和 `cc-switch.db-wal` 的修改时间与大小；有变化立即同步，无变化不查询数据库。
 - Client 每次变化后回看 10 分钟，容忍会话日志的迟到写入；满 500 条时连续读取下一批，不在历史回填批次间等待。
+- Client 对短暂的连接失败以及 HTTP 408、425、429、500、502、503、504 使用指数退避重试；只有服务确认 batch 后才推进游标。
+- Client 使用 reqwest 的默认代理发现逻辑，遵循 `HTTP_PROXY`/`HTTPS_PROXY` 与 `NO_PROXY`/`no_proxy`；不对目标地址做硬编码绕过。
+- Server 通过有界写入队列和单一后台 worker 串行处理 event/rollup SQLite 写入；队列满时等待最多 30 秒，只有入队超时、worker 不可用或写入处理超时才返回 503。
 - 同步日志分别报告 `sent`、`accepted`、`duplicates`、`rejected`；Server 重复写入不会重复计费。
 - `usage_daily_rollups` 的 snapshot 接口预留给已从 cc-switch detail 删除的完整历史日；不能把 detail 与同一日期 rollup 直接相加。
 - Dashboard 明确采用 **detail-only** 统计，只查询 Server 的 `usage_events`，不合并
@@ -74,7 +77,8 @@ Dashboard 查询公共参数为：
 
 - `from`、`to`：Unix 秒，范围为 `[from, to)`；默认最近 24 小时，最多 365 天；
 - `node_id`、`app_type`、`provider_id`、`model`、`data_source`：可选精确筛选；
-- overview 额外支持 `bucket=auto|5m|1h|1d` 和 `tz_offset_minutes`；
+- overview 额外支持 `bucket=auto|1s|1m|5m|1h|1d` 和 `tz_offset_minutes`；`auto` 会按筛选范围选择至少 10 个零填充数据点的最大粒度，并在 response 的 `range.bucket` 返回实际粒度；
+- overview 的 `trend` 覆盖完整 `[from, to)` 时间轴，没有事件的 bucket 返回全零指标；趋势点同时提供 `input_tokens`、`fresh_input_tokens`、`cache_creation_tokens`、`cache_read_tokens` 和 `output_tokens`；
 - events 支持 `limit`（默认 50、最多 200）以及成对出现的
   `before_created_at`、`before_event_id` 游标。
 

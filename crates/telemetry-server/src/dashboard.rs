@@ -10,13 +10,19 @@ use axum::{
 };
 use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, net::SocketAddr, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    path::Path,
+    time::Duration,
+};
 
 const DASHBOARD_HTML: &str = include_str!("../web/index.html");
 const DASHBOARD_CSS: &str = include_str!("../web/styles.css");
 const DASHBOARD_JS: &str = include_str!("../web/app.js");
 const DASHBOARD_I18N_JS: &str = include_str!("../web/i18n.js");
 const MAX_RANGE_SECONDS: i64 = 365 * 24 * 60 * 60;
+const MAX_TREND_POINTS: i64 = 20_000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DashboardQuery {
@@ -47,6 +53,8 @@ struct ResolvedQuery {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 enum Bucket {
+    Second,
+    Minute,
     FiveMinutes,
     Hour,
     Day,
@@ -55,6 +63,8 @@ enum Bucket {
 impl Bucket {
     fn seconds(self) -> i64 {
         match self {
+            Self::Second => 1,
+            Self::Minute => 60,
             Self::FiveMinutes => 5 * 60,
             Self::Hour => 60 * 60,
             Self::Day => 24 * 60 * 60,
@@ -63,10 +73,28 @@ impl Bucket {
 
     fn label(self) -> &'static str {
         match self {
+            Self::Second => "1s",
+            Self::Minute => "1m",
             Self::FiveMinutes => "5m",
             Self::Hour => "1h",
             Self::Day => "1d",
         }
+    }
+
+    fn auto_for_range(duration: i64) -> Self {
+        for bucket in [
+            Self::Day,
+            Self::Hour,
+            Self::FiveMinutes,
+            Self::Minute,
+            Self::Second,
+        ] {
+            let points = (duration + bucket.seconds() - 1) / bucket.seconds();
+            if points >= 10 {
+                return bucket;
+            }
+        }
+        Self::Second
     }
 }
 
@@ -120,9 +148,51 @@ pub struct TrendPoint {
     pub total_requests: i64,
     pub successful_requests: i64,
     pub success_rate: f64,
+    pub fresh_input_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
     pub real_total_tokens: i64,
     pub total_cost_usd: f64,
     pub avg_latency_ms: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TrendAggregate {
+    total_requests: i64,
+    successful_requests: i64,
+    fresh_input_tokens: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
+    output_tokens: i64,
+    total_cost_usd: f64,
+    latency_total_ms: f64,
+}
+
+impl TrendAggregate {
+    fn into_point(self, bucket_start: i64) -> TrendPoint {
+        let input_tokens =
+            self.fresh_input_tokens + self.cache_creation_tokens + self.cache_read_tokens;
+        TrendPoint {
+            bucket_start,
+            total_requests: self.total_requests,
+            successful_requests: self.successful_requests,
+            success_rate: percentage(self.successful_requests, self.total_requests),
+            fresh_input_tokens: self.fresh_input_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            input_tokens,
+            output_tokens: self.output_tokens,
+            real_total_tokens: input_tokens + self.output_tokens,
+            total_cost_usd: self.total_cost_usd,
+            avg_latency_ms: if self.total_requests > 0 {
+                self.latency_total_ms / self.total_requests as f64
+            } else {
+                0.0
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -262,18 +332,25 @@ fn resolve_query(query: DashboardQuery) -> Result<ResolvedQuery, ApiError> {
         ));
     }
     let bucket = match query.bucket.as_deref().unwrap_or("auto") {
-        "auto" if to - from <= 6 * 60 * 60 => Bucket::FiveMinutes,
-        "auto" if to - from <= 48 * 60 * 60 => Bucket::Hour,
-        "auto" => Bucket::Day,
+        "auto" => Bucket::auto_for_range(to - from),
+        "1s" => Bucket::Second,
+        "1m" => Bucket::Minute,
         "5m" => Bucket::FiveMinutes,
         "1h" => Bucket::Hour,
         "1d" => Bucket::Day,
         _ => {
             return Err(ApiError::BadRequest(
-                "bucket must be auto, 5m, 1h, or 1d".to_owned(),
+                "bucket must be auto, 1s, 1m, 5m, 1h, or 1d".to_owned(),
             ))
         }
     };
+    let estimated_points = (to - from + bucket.seconds() - 1) / bucket.seconds();
+    if estimated_points > MAX_TREND_POINTS {
+        return Err(ApiError::BadRequest(format!(
+            "bucket {} would produce too many trend points",
+            bucket.label()
+        )));
+    }
     Ok(ResolvedQuery {
         from,
         to,
@@ -412,7 +489,7 @@ fn query_overview(path: &Path, query: ResolvedQuery) -> anyhow::Result<OverviewR
         summary_from_row,
     )?;
 
-    let trend = query_trend(&connection, &query, &fresh_input, &real_total)?;
+    let trend = query_trend(&connection, &query, &fresh_input)?;
     let breakdowns = BreakdownsResponse {
         nodes: query_breakdown(&connection, &query, "node_id", &fresh_input, &real_total)?,
         apps: query_breakdown(&connection, &query, "app_type", &fresh_input, &real_total)?,
@@ -444,7 +521,6 @@ fn query_trend(
     connection: &Connection,
     query: &ResolvedQuery,
     fresh_input: &str,
-    real_total: &str,
 ) -> anyhow::Result<Vec<TrendPoint>> {
     let seconds = query.bucket.seconds();
     let offset = if matches!(query.bucket, Bucket::Day) {
@@ -459,10 +535,12 @@ fn query_trend(
                 COUNT(*),
                 COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300
                                   THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM({real_total}), 0),
+                COALESCE(SUM({fresh_input}), 0),
+                COALESCE(SUM(l.cache_creation_tokens), 0),
+                COALESCE(SUM(l.cache_read_tokens), 0),
+                COALESCE(SUM(l.output_tokens), 0),
                 COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0.0),
-                COALESCE(AVG(l.latency_ms), 0.0),
-                COALESCE(SUM({fresh_input}), 0)
+                COALESCE(SUM(l.latency_ms), 0.0)
          FROM usage_events l
          WHERE {where_sql}
          GROUP BY 1
@@ -470,19 +548,37 @@ fn query_trend(
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), |row| {
-        let requests = row.get::<_, i64>(1)?;
-        let successful = row.get::<_, i64>(2)?;
-        Ok(TrendPoint {
-            bucket_start: row.get(0)?,
-            total_requests: requests,
-            successful_requests: successful,
-            success_rate: percentage(successful, requests),
-            real_total_tokens: row.get(3)?,
-            total_cost_usd: row.get(4)?,
-            avg_latency_ms: row.get(5)?,
-        })
+        Ok((
+            row.get::<_, i64>(0)?,
+            TrendAggregate {
+                total_requests: row.get(1)?,
+                successful_requests: row.get(2)?,
+                fresh_input_tokens: row.get(3)?,
+                cache_creation_tokens: row.get(4)?,
+                cache_read_tokens: row.get(5)?,
+                output_tokens: row.get(6)?,
+                total_cost_usd: row.get(7)?,
+                latency_total_ms: row.get(8)?,
+            },
+        ))
     })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let aggregates = rows.collect::<Result<BTreeMap<_, _>, _>>()?;
+    let first_bucket = bucket_start_for(query.from, seconds, offset);
+    let last_bucket = bucket_start_for(query.to - 1, seconds, offset);
+    let mut points = Vec::new();
+    let mut bucket = first_bucket;
+    while bucket <= last_bucket {
+        let aggregate = aggregates.get(&bucket).cloned().unwrap_or_default();
+        points.push(aggregate.into_point(bucket));
+        bucket = bucket
+            .checked_add(seconds)
+            .ok_or_else(|| anyhow::anyhow!("trend bucket range overflow"))?;
+    }
+    Ok(points)
+}
+
+fn bucket_start_for(timestamp: i64, seconds: i64, offset: i64) -> i64 {
+    ((timestamp + offset) / seconds) * seconds - offset
 }
 
 fn query_breakdown(
@@ -779,7 +875,6 @@ mod tests {
         extract::connect_info::MockConnectInfo,
         http::Request,
     };
-    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
     struct TestUsage<'a> {
@@ -831,12 +926,67 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(query.bucket, Bucket::FiveMinutes));
+        let ten_hours = resolve_query(DashboardQuery {
+            from: Some(0),
+            to: Some(10 * 60 * 60),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(ten_hours.bucket, Bucket::Hour));
+        let seven_days = resolve_query(DashboardQuery {
+            from: Some(0),
+            to: Some(7 * 24 * 60 * 60),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(seven_days.bucket, Bucket::Hour));
+        let ten_days = resolve_query(DashboardQuery {
+            from: Some(0),
+            to: Some(10 * 24 * 60 * 60),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(ten_days.bucket, Bucket::Day));
+        let short = resolve_query(DashboardQuery {
+            from: Some(0),
+            to: Some(5),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(short.bucket, Bucket::Second));
         let invalid = resolve_query(DashboardQuery {
             from: Some(10),
             to: Some(10),
             ..Default::default()
         });
         assert!(matches!(invalid, Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn trend_zero_fills_requested_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        init_db(&path).unwrap();
+        let query = resolve_query(DashboardQuery {
+            from: Some(100),
+            to: Some(160),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = query_overview(&path, query).unwrap();
+        assert_eq!(result.range.from, 100);
+        assert_eq!(result.range.to, 160);
+        assert_eq!(result.range.bucket, "1s");
+        assert_eq!(result.trend.len(), 60);
+        assert_eq!(result.trend.first().unwrap().bucket_start, 100);
+        assert_eq!(result.trend.last().unwrap().bucket_start, 159);
+        assert!(result.trend.iter().all(|point| {
+            point.total_requests == 0
+                && point.input_tokens == 0
+                && point.output_tokens == 0
+                && point.real_total_tokens == 0
+                && point.avg_latency_ms == 0.0
+        }));
     }
 
     #[test]
@@ -935,6 +1085,12 @@ mod tests {
         assert_eq!(result.coverage.first_event_at, Some(101));
         assert_eq!(result.coverage.last_event_at, Some(104));
         assert_eq!(result.breakdowns.nodes[0].key, "node-a");
+        assert_eq!(result.trend.len(), 1);
+        assert_eq!(result.trend[0].fresh_input_tokens, 1100);
+        assert_eq!(result.trend[0].cache_creation_tokens, 310);
+        assert_eq!(result.trend[0].cache_read_tokens, 1840);
+        assert_eq!(result.trend[0].input_tokens, 3250);
+        assert_eq!(result.trend[0].output_tokens, 220);
     }
 
     #[test]
@@ -991,11 +1147,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("telemetry.db");
         let connection = init_db(&path).unwrap();
-        let state = ServerState {
-            db: Arc::new(Mutex::new(connection)),
-            db_path: path,
-            auth_token: Some("secret".to_owned()),
-        };
+        let state = ServerState::new(connection, path, Some("secret".to_owned()));
         let local = router(state.clone()).layer(MockConnectInfo(
             "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
         ));

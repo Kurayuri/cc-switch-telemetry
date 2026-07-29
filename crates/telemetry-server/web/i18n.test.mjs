@@ -31,6 +31,83 @@ test("every translation key used by the dashboard exists in both locales", () =>
   }
 });
 
+test("dashboard has an English static fallback without remote assets", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  assert.match(html, /<html lang="en-US"(?: data-theme="dark")?>/);
+  assert.doesNotMatch(html, /[\u3400-\u9fff]/u);
+  assert.doesNotMatch(html, /https?:\/\//u);
+  assert.match(html, /\/dashboard\/styles\.css/);
+  assert.match(html, /\/dashboard\/app\.js/);
+});
+
+test("dashboard defaults to dark and exposes a theme toggle", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  assert.match(html, /<html lang="en-US" data-theme="dark">/);
+  assert.match(html, /id="themeToggle"/);
+  assert.match(css, /:root\s*\{[\s\S]*color-scheme: dark/);
+  assert.match(css, /\[data-theme="light"\]/);
+  assert.doesNotMatch(css, /prefers-color-scheme/);
+  assert.match(app, /cc-switch-telemetry\.theme/);
+  assert.match(app, /themeToggle\.addEventListener/);
+});
+
+test("trend exposes metric and granularity controls with rich tooltip support", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  assert.match(html, /id="trendMetric"/);
+  assert.match(html, /id="trendBucket"/);
+  assert.match(html, /value="auto"/);
+  assert.match(html, /value="1m"/);
+  assert.match(html, /id="trendTooltip"/);
+  assert.match(app, /params\.set\("bucket", elements\.trendBucket\.value\)/);
+  assert.match(app, /trend\.tooltipCacheCreation/);
+});
+
+test("dashboard exposes compact KPI details, custom range dialog, and directional animations", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  assert.match(html, /class="kpi-heading"/);
+  assert.match(html, /id="tokenComposition"/);
+  assert.match(html, /id="customRangeDialog"/);
+  assert.match(html, /id="customRangeForm"/);
+  assert.match(app, /customRangeDialog\.showModal/);
+  assert.match(app, /pathLength: 1/);
+  assert.match(app, /requestAnimationFrame/);
+  assert.match(css, /stroke-dasharray: 1/);
+  assert.doesNotMatch(css, /@keyframes value-update\s*\{[^}]*transform:/s);
+});
+
+test("actual token KPI owns the cache rate and spans two grid units", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  assert.match(html, /class="cache-hit-inline"/);
+  assert.match(html, /id="kpiCacheRate"/);
+  assert.match(html, /class="token-bar-row"/);
+  assert.doesNotMatch(html, /class="kpi-card cache-card"/);
+  assert.match(css, /\.tokens-card\s*\{[^}]*grid-column:\s*span 2/);
+  assert.match(css, /\.kpi-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3/);
+  assert.match(css, /\.token-summary\s*\{[^}]*font-size:\s*14px/);
+  assert.match(css, /\.cache-hit-inline span\s*\{[^}]*font-size:\s*14px/);
+  assert.match(css, /\.cache-hit-inline span\s*\{[^}]*position:\s*absolute/);
+  assert.match(css, /\.cache-hit-inline\s*\{[^}]*min-height:\s*14px/);
+  assert.match(css, /\.token-bar-row\s*\{[^}]*gap:\s*10px/);
+  assert.match(css, /\.cache-hit-inline\s*\{[^}]*width:\s*108px/);
+  assert.match(css, /\.token-legend\s*\{[^}]*flex-wrap:\s*nowrap/);
+});
+
+test("estimated cost exposes a dynamic top-three model list", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  assert.match(html, /id="kpiCostTopModels"/);
+  assert.match(html, /data-i18n="kpi\.topModels"/);
+  assert.match(app, /sort\(\(left, right\) => Number\(right\.totalCostUsd/);
+  assert.match(app, /\.slice\(0, 3\)/);
+  assert.match(app, /renderCostTopModels\(overview\.breakdowns\?\.models\)/);
+});
+
 test("translations interpolate variables and formatters follow locale", () => {
   assert.equal(translate("en-US", "kpi.successCount", { count: 3 }), "3 successful");
   assert.match(createFormatters("zh-CN").integerNumber.format(1234), /1[,.]234/);
