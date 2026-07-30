@@ -13,8 +13,8 @@
 <body>
   <div class="shell">
     <header class="topbar">
-      <div class="brand-lockup">
-        <div class="brand-mark" aria-hidden="true">
+      <div id="brandLockup" class="brand-lockup">
+        <div id="brandMark" class="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none">
             <path d="M7.25 8.25 4 12l3.25 3.75M16.75 8.25 20 12l-3.25 3.75M14.25 5.5 9.75 18.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
@@ -57,13 +57,11 @@
         <div class="filter-grid">
           <label>
             <span data-i18n="filters.range">Time range</span>
-            <select id="rangePreset">
-              <option value="1h" data-i18n="filters.range1h">Last hour</option>
-              <option value="24h" selected data-i18n="filters.range24h">Last 24 hours</option>
-              <option value="7d" data-i18n="filters.range7d">Last 7 days</option>
-              <option value="30d" data-i18n="filters.range30d">Last 30 days</option>
-              <option value="custom" data-i18n="filters.custom">Custom</option>
-            </select>
+            <button id="rangePickerTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="4" y="5.5" width="16" height="14" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M8 3.5v4M16 3.5v4M4 10h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+              <span id="rangePickerLabel">Last 24 hours</span>
+              <svg class="picker-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m7 9 5 5 5-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
           </label>
           <label>
             <span data-i18n="filters.node">Node</span>
@@ -88,24 +86,83 @@
         </div>
       </section>
 
-      <dialog id="customRangeDialog" class="custom-range-dialog" aria-labelledby="customRangeTitle">
-        <form id="customRangeForm">
+      <dialog id="rangePickerDialog" class="range-picker-dialog" aria-labelledby="customRangeTitle">
+        <form id="rangePickerForm">
           <div class="dialog-heading">
             <div>
               <p class="eyebrow">CUSTOM RANGE</p>
               <h2 id="customRangeTitle" data-i18n="filters.customTitle">Custom time range</h2>
             </div>
-            <button id="cancelRange" class="icon-button" type="button" aria-label="Close" data-i18n-aria-label="action.cancel">×</button>
+            <button id="closeRangePicker" class="icon-button" type="button" aria-label="Close" data-i18n-aria-label="action.cancel">×</button>
           </div>
-          <div class="custom-range-fields">
-            <label><span data-i18n="filters.start">Start</span><input id="customFrom" type="datetime-local" required></label>
-            <label><span data-i18n="filters.end">End</span><input id="customTo" type="datetime-local" required></label>
+          <div id="rangePresetOptions" class="range-preset-options">
+            <button type="button" class="range-preset-button" data-range-preset="today" data-i18n="filters.rangeToday">Today</button>
+            <button type="button" class="range-preset-button" data-range-preset="1h" data-i18n="filters.range1h">Last hour</button>
+            <button type="button" class="range-preset-button" data-range-preset="24h" data-i18n="filters.range24h">Last 24 hours</button>
+            <button type="button" class="range-preset-button" data-range-preset="7d" data-i18n="filters.range7d">Last 7 days</button>
+            <button type="button" class="range-preset-button" data-range-preset="14d" data-i18n="filters.range14d">Last 14 days</button>
+            <button type="button" class="range-preset-button" data-range-preset="30d" data-i18n="filters.range30d">Last 30 days</button>
+            <button type="button" id="customRangePreset" class="range-preset-button active" data-range-preset="custom" data-i18n="filters.custom">Custom</button>
           </div>
-          <p id="customRangeError" class="dialog-error" role="alert" hidden></p>
-          <div class="dialog-actions">
-            <button id="cancelRangeBottom" class="button secondary" type="button" data-i18n="action.cancel">Cancel</button>
-            <button id="applyRange" class="button primary" type="submit" data-i18n="action.applyRange">Apply range</button>
+          <div id="customRangeEditor" class="custom-range-editor">
+            <p class="range-picker-hint muted" data-i18n="filters.customHint">Choose dates and times. The first default is the latest complete local day.</p>
+            <div class="custom-range-layout">
+              <div class="custom-range-fields">
+                <label class="range-field-card" data-range-field="start">
+                  <span data-i18n="filters.start">Start</span>
+                  <div class="range-field-inputs"><input id="customFromDate" type="date" required><input id="customFromTime" type="time" step="60" required></div>
+                </label>
+                <label class="range-field-card" data-range-field="end">
+                  <span data-i18n="filters.end">End</span>
+                  <div class="range-field-inputs"><input id="customToDate" type="date" required><input id="customToTime" type="time" step="60" required></div>
+                </label>
+                <p id="customRangeError" class="dialog-error" role="alert" hidden></p>
+              </div>
+              <div class="range-calendar" aria-label="Calendar">
+                <div class="calendar-heading">
+                  <button id="previousCalendarMonth" class="icon-button" type="button" aria-label="Previous month">‹</button>
+                  <span id="calendarMonthLabel" class="calendar-month-label">—</span>
+                  <button id="nextCalendarMonth" class="icon-button" type="button" aria-label="Next month">›</button>
+                </div>
+                <div id="calendarWeekdays" class="calendar-weekdays"></div>
+                <div id="calendarDays" class="calendar-days"></div>
+              </div>
+            </div>
+            <div class="dialog-actions">
+              <button id="cancelRange" class="button secondary" type="button" data-i18n="action.cancel">Cancel</button>
+              <button id="applyRange" class="button primary" type="submit" data-i18n="action.applyRange">Apply range</button>
+            </div>
           </div>
+        </form>
+      </dialog>
+
+      <dialog id="bucketPickerDialog" class="bucket-picker-dialog" aria-labelledby="bucketPickerTitle">
+        <form id="bucketPickerForm">
+          <div class="dialog-heading">
+            <div>
+              <p class="eyebrow">TREND BUCKET</p>
+              <h2 id="bucketPickerTitle" data-i18n="trend.bucketTitle">Trend granularity</h2>
+            </div>
+            <button id="closeBucketPicker" class="icon-button" type="button" aria-label="Close" data-i18n-aria-label="action.cancel">×</button>
+          </div>
+          <div id="bucketPresetOptions" class="bucket-preset-options">
+            <button type="button" class="bucket-preset-button active" data-bucket="auto" data-i18n="trend.bucketAuto">Auto</button>
+            <button type="button" class="bucket-preset-button" data-bucket="1s" data-i18n="trend.bucket1s">1 second</button>
+            <button type="button" class="bucket-preset-button" data-bucket="1m" data-i18n="trend.bucket1m">1 minute</button>
+            <button type="button" class="bucket-preset-button" data-bucket="5m" data-i18n="trend.bucket5m">5 minutes</button>
+            <button type="button" class="bucket-preset-button" data-bucket="15m" data-i18n="trend.bucket15m">15 minutes</button>
+            <button type="button" class="bucket-preset-button" data-bucket="30m" data-i18n="trend.bucket30m">30 minutes</button>
+            <button type="button" class="bucket-preset-button" data-bucket="1h" data-i18n="trend.bucket1h">1 hour</button>
+            <button type="button" class="bucket-preset-button" data-bucket="2h" data-i18n="trend.bucket2h">2 hours</button>
+            <button type="button" class="bucket-preset-button" data-bucket="6h" data-i18n="trend.bucket6h">6 hours</button>
+            <button type="button" class="bucket-preset-button" data-bucket="12h" data-i18n="trend.bucket12h">12 hours</button>
+            <button type="button" class="bucket-preset-button" data-bucket="1d" data-i18n="trend.bucket1d">1 day</button>
+          </div>
+          <div class="custom-bucket-editor">
+            <label><span data-i18n="trend.bucketCustom">Custom bucket</span><div class="custom-bucket-inputs"><input id="customBucketAmount" type="number" min="1" max="31536000" step="1" value="10"><select id="customBucketUnit"><option value="s" data-i18n="trend.bucketSeconds">seconds</option><option value="m" data-i18n="trend.bucketMinutes">minutes</option><option value="h" data-i18n="trend.bucketHours">hours</option><option value="d" data-i18n="trend.bucketDays">days</option></select></div></label>
+            <button id="applyCustomBucket" class="button secondary" type="button" data-i18n="action.applyBucket">Use custom bucket</button>
+          </div>
+          <p id="customBucketError" class="dialog-error" role="alert" hidden></p>
         </form>
       </dialog>
 
@@ -116,7 +173,7 @@
           <small id="kpiSuccessCount">— successful</small>
         </article>
         <article class="kpi-card tokens-card">
-          <div class="kpi-heading"><span class="kpi-icon tokens-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3.5 19.5 7.75v8.5L12 20.5l-7.5-4.25v-8.5L12 3.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m8 9.5 4 2.25 4-2.25M12 11.75v4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="kpi-label" data-i18n="kpi.tokens">Actual tokens</span></div>
+          <div class="kpi-heading"><span class="kpi-icon tokens-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3.5 19.5 7.75v8.5L12 20.5l-7.5-4.25v-8.5L12 3.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m8 9.5 4 2.25 4-2.25M12 11.75v4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="kpi-label" data-i18n="kpi.tokens">Token</span></div>
           <strong id="kpiTokens">—</strong>
           <div class="token-summary" aria-label="Input and output tokens">
             <span class="token-total"><span data-i18n="kpi.input">Input</span> <strong id="kpiInputTotal">—</strong></span>
@@ -126,7 +183,7 @@
           <div id="tokenComposition" class="token-composition" role="img" aria-label="Input token composition" data-i18n-aria-label="kpi.tokenCompositionAria">
             <div class="token-bar-row">
               <div class="token-bar" aria-hidden="true"><span id="freshTokenBar" class="token-segment fresh-segment"></span><span id="creationTokenBar" class="token-segment creation-segment"></span><span id="cachedTokenBar" class="token-segment cached-segment"></span></div>
-              <div class="cache-hit-inline"><span data-i18n="kpi.cacheRate">Cache hit rate</span><strong id="kpiCacheRate">—</strong></div>
+              <div class="cache-hit-inline"><span data-i18n="kpi.cacheRate">Cache Hit Rate</span><strong id="kpiCacheRate">—</strong></div>
             </div>
             <div class="token-legend">
               <span><i class="legend-dot fresh-segment"></i><span data-i18n="kpi.freshInput">Fresh</span> <strong id="kpiFreshTokens">—</strong></span>
@@ -163,7 +220,7 @@
             <label class="metric-picker">
               <span class="sr-only" data-i18n="trend.metricAria">Trend metric</span>
               <select id="trendMetric">
-                <option value="realTotalTokens" data-i18n="kpi.tokens">Actual tokens</option>
+                <option value="realTotalTokens" data-i18n="kpi.tokens">Token</option>
                 <option value="totalRequests" data-i18n="kpi.requests">Requests</option>
                 <option value="totalCostUsd" data-i18n="kpi.cost">Estimated cost</option>
                 <option value="avgLatencyMs" data-i18n="kpi.latency">Average latency</option>
@@ -171,14 +228,10 @@
             </label>
             <label class="bucket-picker">
               <span class="sr-only" data-i18n="trend.bucketAria">Time granularity</span>
-              <select id="trendBucket">
-                <option value="auto" data-i18n="trend.bucketAuto">Auto</option>
-                <option value="1s" data-i18n="trend.bucket1s">1 second</option>
-                <option value="1m" data-i18n="trend.bucket1m">1 minute</option>
-                <option value="5m" data-i18n="trend.bucket5m">5 minutes</option>
-                <option value="1h" data-i18n="trend.bucket1h">1 hour</option>
-                <option value="1d" data-i18n="trend.bucket1d">1 day</option>
-              </select>
+              <button id="trendBucketTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
+                <span id="trendBucketLabel">Auto</span>
+                <svg class="picker-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m7 9 5 5 5-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
             </label>
             <span id="resolvedBucket" class="resolved-bucket muted" aria-live="polite"></span>
           </div>
@@ -187,6 +240,31 @@
         <svg id="trendChart" class="trend-chart" viewBox="0 0 900 280" role="img" aria-label="Usage trend chart" data-i18n-aria-label="trend.chartAria"></svg>
         <div id="trendTooltip" class="chart-tooltip" role="tooltip" hidden></div>
         <p id="coverageText" class="coverage muted">Data coverage: —</p>
+      </section>
+
+      <section id="dailyPanel" class="panel daily-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">DAILY</p>
+            <h2 data-i18n="daily.title">Daily usage</h2>
+          </div>
+          <div class="daily-controls">
+            <label class="daily-metric-picker">
+              <span class="sr-only" data-i18n="daily.metricAria">Daily metric</span>
+              <select id="dailyMetric">
+                <option value="realTotalTokens" data-i18n="kpi.tokens">Token</option>
+                <option value="totalRequests" data-i18n="kpi.requests">Requests</option>
+                <option value="totalCostUsd" data-i18n="kpi.cost">Estimated cost</option>
+              </select>
+            </label>
+            <div class="daily-legend" aria-hidden="true"><span data-i18n="daily.less">Less</span><i class="daily-level-0"></i><i class="daily-level-1"></i><i class="daily-level-2"></i><i class="daily-level-3"></i><i class="daily-level-4"></i><span data-i18n="daily.more">More</span></div>
+          </div>
+        </div>
+        <div id="dailyEmpty" class="empty-state" hidden data-i18n="daily.empty">No daily data for the current filters</div>
+        <div class="daily-scroll">
+          <div id="dailyHeatmap" class="daily-heatmap" role="grid" aria-label="Daily usage" data-i18n-aria-label="daily.chartAria"></div>
+        </div>
+        <div id="dailyTooltip" class="chart-tooltip daily-tooltip" role="tooltip" hidden></div>
       </section>
 
       <section class="panel breakdown-panel">
@@ -204,7 +282,7 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th data-i18n="breakdown.name">Name</th><th data-i18n="breakdown.requests">Requests</th><th data-i18n="kpi.tokens">Actual tokens</th><th data-i18n="kpi.successRate">Success rate</th><th data-i18n="kpi.cost">Estimated cost</th></tr></thead>
+            <thead><tr><th data-i18n="breakdown.name">Name</th><th data-i18n="breakdown.requests">Requests</th><th data-i18n="kpi.tokens">Token</th><th data-i18n="kpi.successRate">Success rate</th><th data-i18n="kpi.cost">Estimated cost</th></tr></thead>
             <tbody id="breakdownRows"></tbody>
           </table>
         </div>

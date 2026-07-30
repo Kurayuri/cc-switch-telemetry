@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 use telemetry_client::{
-    database_fingerprint, load_cursor, save_cursor, sync_available, ClientConfig,
-    DatabaseFingerprint,
+    database_fingerprint, load_cursor, save_cursor, sync_available, sync_provider_catalog,
+    ClientConfig, DatabaseFingerprint,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -13,7 +13,11 @@ async fn sync_until_stable(
 ) -> anyhow::Result<DatabaseFingerprint> {
     loop {
         let before = database_fingerprint(&config.cc_switch_db)?;
+        let provider_count = sync_provider_catalog(config).await?;
         let summary = sync_available(config, cursor).await?;
+        if provider_count > 0 {
+            eprintln!("provider sync: {provider_count} mapped providers");
+        }
         if summary.cursor_advanced {
             save_cursor(state_path, cursor)?;
         }

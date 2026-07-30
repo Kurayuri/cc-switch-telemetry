@@ -15,7 +15,9 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use telemetry_core::{BatchResponse, EventBatch, RejectedEvent, RollupSnapshot, SCHEMA_VERSION};
+use telemetry_core::{
+    BatchResponse, EventBatch, ProviderSnapshot, RejectedEvent, RollupSnapshot, SCHEMA_VERSION,
+};
 use tokio::sync::{mpsc, oneshot};
 
 const WRITE_QUEUE_CAPACITY: usize = 256;
@@ -37,6 +39,10 @@ enum WriteTask {
     },
     Rollup {
         snapshot: Box<RollupSnapshot>,
+        response: oneshot::Sender<StatusCode>,
+    },
+    Providers {
+        snapshot: ProviderSnapshot,
         response: oneshot::Sender<StatusCode>,
     },
 }
@@ -76,6 +82,15 @@ fn spawn_write_worker(db: Arc<Mutex<Connection>>, mut write_rx: mpsc::Receiver<W
                         tokio::task::spawn_blocking(move || process_rollup(&worker_db, *snapshot))
                             .await
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let _ = response.send(result);
+                }
+                WriteTask::Providers { snapshot, response } => {
+                    let worker_db = Arc::clone(&db);
+                    let result = tokio::task::spawn_blocking(move || {
+                        process_provider_snapshot(&worker_db, snapshot)
+                    })
+                    .await
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     let _ = response.send(result);
                 }
             }
@@ -137,6 +152,14 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
              ON usage_events(created_at);
          CREATE INDEX IF NOT EXISTS idx_usage_events_node
              ON usage_events(node_id, created_at);
+         CREATE TABLE IF NOT EXISTS provider_catalog (
+             node_id TEXT NOT NULL,
+             app_type TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             updated_at INTEGER NOT NULL,
+             PRIMARY KEY (node_id, app_type, provider_id)
+         );
          CREATE TABLE IF NOT EXISTS usage_daily_snapshots (
              snapshot_key TEXT PRIMARY KEY,
              node_id TEXT NOT NULL,
@@ -397,6 +420,42 @@ fn process_rollup(db: &Arc<Mutex<Connection>>, snapshot: RollupSnapshot) -> Stat
     }
 }
 
+fn process_provider_snapshot(
+    db: &Arc<Mutex<Connection>>,
+    snapshot: ProviderSnapshot,
+) -> StatusCode {
+    let Ok(db) = db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+    let tx = match db.unchecked_transaction() {
+        Ok(tx) => tx,
+        Err(error) => return database_error_status(&error),
+    };
+    let updated_at = chrono::Utc::now().timestamp();
+    for provider in snapshot.providers {
+        if let Err(error) = tx.execute(
+            "INSERT INTO provider_catalog (node_id, app_type, provider_id, name, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(node_id, app_type, provider_id) DO UPDATE SET
+                 name=excluded.name,
+                 updated_at=excluded.updated_at",
+            params![
+                &snapshot.node_id,
+                provider.app_type,
+                provider.provider_id,
+                provider.name,
+                updated_at
+            ],
+        ) {
+            return database_error_status(&error);
+        }
+    }
+    match tx.commit() {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(error) => database_error_status(&error),
+    }
+}
+
 pub async fn ingest_rollup(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -408,6 +467,40 @@ pub async fn ingest_rollup(
     let (response_tx, response_rx) = oneshot::channel();
     let task = WriteTask::Rollup {
         snapshot: Box::new(snapshot),
+        response: response_tx,
+    };
+    match tokio::time::timeout(WRITE_QUEUE_WAIT_TIMEOUT, state.write_tx.send(task)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+    }
+    match tokio::time::timeout(WRITE_RESULT_TIMEOUT, response_rx).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+pub async fn ingest_provider_snapshot(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(snapshot): Json<ProviderSnapshot>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.auth_token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    if snapshot.schema_version != SCHEMA_VERSION
+        || snapshot.node_id.trim().is_empty()
+        || snapshot.providers.len() > 10_000
+        || snapshot.providers.iter().any(|provider| {
+            provider.app_type.trim().is_empty()
+                || provider.provider_id.trim().is_empty()
+                || provider.name.trim().is_empty()
+        })
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    let task = WriteTask::Providers {
+        snapshot,
         response: response_tx,
     };
     match tokio::time::timeout(WRITE_QUEUE_WAIT_TIMEOUT, state.write_tx.send(task)).await {
@@ -489,6 +582,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/healthz", get(health))
         .route("/v1/events/batch", post(ingest))
         .route("/v1/rollups/snapshot", post(ingest_rollup))
+        .route("/v1/providers/snapshot", post(ingest_provider_snapshot))
         .route("/v1/usage/summary", get(summary))
         .merge(dashboard::routes())
         .with_state(state)
@@ -513,12 +607,121 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
     #[test]
     fn schema_initializes() {
         let db = init_db(":memory:").unwrap();
         assert!(db
             .query_row("SELECT 1 FROM usage_events LIMIT 1", [], |_| Ok(()))
             .is_err());
+        let providers: i64 = db
+            .query_row("SELECT COUNT(*) FROM provider_catalog", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(providers, 0);
+    }
+
+    #[test]
+    fn provider_snapshot_upserts_current_name() {
+        let db = Arc::new(Mutex::new(init_db(":memory:").unwrap()));
+        let snapshot = ProviderSnapshot {
+            schema_version: SCHEMA_VERSION,
+            node_id: "node-a".into(),
+            providers: vec![telemetry_core::ProviderEntry {
+                app_type: "codex".into(),
+                provider_id: "provider-a".into(),
+                name: "DeepSeek".into(),
+            }],
+        };
+        assert_eq!(
+            process_provider_snapshot(&db, snapshot),
+            StatusCode::NO_CONTENT
+        );
+        let renamed = ProviderSnapshot {
+            schema_version: SCHEMA_VERSION,
+            node_id: "node-a".into(),
+            providers: vec![telemetry_core::ProviderEntry {
+                app_type: "codex".into(),
+                provider_id: "provider-a".into(),
+                name: "DeepSeek Renamed".into(),
+            }],
+        };
+        assert_eq!(
+            process_provider_snapshot(&db, renamed),
+            StatusCode::NO_CONTENT
+        );
+        let name: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT name FROM provider_catalog
+                 WHERE node_id = 'node-a' AND app_type = 'codex' AND provider_id = 'provider-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "DeepSeek Renamed");
+    }
+
+    #[tokio::test]
+    async fn provider_snapshot_endpoint_requires_auth_and_persists_names() {
+        let state = ServerState::new(
+            init_db(":memory:").unwrap(),
+            PathBuf::from("telemetry.db"),
+            Some("secret".into()),
+        );
+        let snapshot = ProviderSnapshot {
+            schema_version: SCHEMA_VERSION,
+            node_id: "node-a".into(),
+            providers: vec![telemetry_core::ProviderEntry {
+                app_type: "codex".into(),
+                provider_id: "provider-a".into(),
+                name: "DeepSeek".into(),
+            }],
+        };
+        let payload = serde_json::to_vec(&snapshot).unwrap();
+        let unauthorized = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/providers/snapshot")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/providers/snapshot")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let name: String = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT name FROM provider_catalog
+                 WHERE node_id = 'node-a' AND app_type = 'codex' AND provider_id = 'provider-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "DeepSeek");
     }
 
     #[test]

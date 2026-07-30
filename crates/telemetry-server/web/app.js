@@ -1,4 +1,20 @@
 import { createFormatters, resolveLocale, translate } from "./i18n.js";
+import {
+  DAY_SECONDS,
+  addLocalDaysMs,
+  bucketDisplayLabel,
+  calendarDays,
+  dateInputValue,
+  defaultCustomRange,
+  parseBucketValue,
+  parseDateTimeParts,
+  resolvePresetRange,
+  sameLocalDay,
+  setDateKeepTime,
+  splitBucketValue,
+  startOfLocalDayMs,
+  timeInputValue,
+} from "./range.js";
 
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
@@ -39,22 +55,42 @@ const elements = {
   languageToggle: $("languageToggle"),
   refreshButton: $("refreshButton"),
   errorBanner: $("errorBanner"),
-  rangePreset: $("rangePreset"),
-  customRangeDialog: $("customRangeDialog"),
-  customRangeForm: $("customRangeForm"),
+  brandLockup: $("brandLockup"),
+  brandMark: $("brandMark"),
+  rangePickerTrigger: $("rangePickerTrigger"),
+  rangePickerLabel: $("rangePickerLabel"),
+  rangePickerDialog: $("rangePickerDialog"),
+  rangePickerForm: $("rangePickerForm"),
+  rangePresetOptions: $("rangePresetOptions"),
   customRangeError: $("customRangeError"),
+  closeRangePicker: $("closeRangePicker"),
   cancelRange: $("cancelRange"),
-  cancelRangeBottom: $("cancelRangeBottom"),
-  customFrom: $("customFrom"),
-  customTo: $("customTo"),
+  customFromDate: $("customFromDate"),
+  customFromTime: $("customFromTime"),
+  customToDate: $("customToDate"),
+  customToTime: $("customToTime"),
   applyRange: $("applyRange"),
+  calendarMonthLabel: $("calendarMonthLabel"),
+  calendarWeekdays: $("calendarWeekdays"),
+  calendarDays: $("calendarDays"),
+  previousCalendarMonth: $("previousCalendarMonth"),
+  nextCalendarMonth: $("nextCalendarMonth"),
+  trendBucketTrigger: $("trendBucketTrigger"),
+  trendBucketLabel: $("trendBucketLabel"),
+  bucketPickerDialog: $("bucketPickerDialog"),
+  bucketPickerForm: $("bucketPickerForm"),
+  bucketPresetOptions: $("bucketPresetOptions"),
+  closeBucketPicker: $("closeBucketPicker"),
+  customBucketAmount: $("customBucketAmount"),
+  customBucketUnit: $("customBucketUnit"),
+  applyCustomBucket: $("applyCustomBucket"),
+  customBucketError: $("customBucketError"),
   nodeFilter: $("nodeFilter"),
   appFilter: $("appFilter"),
   providerFilter: $("providerFilter"),
   modelFilter: $("modelFilter"),
   sourceFilter: $("sourceFilter"),
   trendMetric: $("trendMetric"),
-  trendBucket: $("trendBucket"),
   resolvedBucket: $("resolvedBucket"),
   trendChart: $("trendChart"),
   trendEmpty: $("trendEmpty"),
@@ -76,10 +112,16 @@ const elements = {
   eventRows: $("eventRows"),
   eventsEmpty: $("eventsEmpty"),
   loadMore: $("loadMore"),
+  dailyMetric: $("dailyMetric"),
+  dailyEmpty: $("dailyEmpty"),
+  dailyPanel: $("dailyPanel"),
+  dailyHeatmap: $("dailyHeatmap"),
+  dailyTooltip: $("dailyTooltip"),
 };
 
 const state = {
   overview: null,
+  daily: null,
   breakdownDimension: "nodes",
   eventCursor: null,
   requestController: null,
@@ -88,32 +130,23 @@ const state = {
   events: [],
   lastError: null,
   updatedAt: null,
-  lastNonCustomRange: "24h",
+  rangePreset: "24h",
+  customRange: defaultCustomRange(),
+  rangeDraft: null,
+  rangeCalendarMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
+  activeRangeField: "start",
+  trendBucket: "auto",
   connection: { status: "", key: "status.connecting" },
 };
 
-function epochNow() {
-  return Math.floor(Date.now() / 1000);
-}
-
 function selectedRange() {
-  const to = epochNow();
-  switch (elements.rangePreset.value) {
-    case "1h": return { from: to - 3600, to };
-    case "7d": return { from: to - 7 * 86400, to };
-    case "30d": return { from: to - 30 * 86400, to };
-    case "custom": {
-      const from = Math.floor(new Date(elements.customFrom.value).getTime() / 1000);
-      const customTo = Math.floor(new Date(elements.customTo.value).getTime() / 1000);
-      if (!Number.isFinite(from) || !Number.isFinite(customTo) || from >= customTo) {
-        const error = new Error(t("error.invalidRange"));
-        error.translationKey = "error.invalidRange";
-        throw error;
-      }
-      return { from, to: customTo };
-    }
-    default: return { from: to - 86400, to };
+  const range = resolvePresetRange(state.rangePreset, Date.now(), state.customRange);
+  if (!Number.isFinite(range.from) || !Number.isFinite(range.to) || range.from >= range.to) {
+    const error = new Error(t("error.invalidRange"));
+    error.translationKey = "error.invalidRange";
+    throw error;
   }
+  return range;
 }
 
 function baseParams(includeFilters = true) {
@@ -132,6 +165,29 @@ function baseParams(includeFilters = true) {
       ["data_source", elements.sourceFilter.value],
     ];
     for (const [key, value] of filters) {
+      if (value) params.set(key, value);
+    }
+  }
+  return params;
+}
+
+function dailyParams(includeFilters = true) {
+  const now = Date.now();
+  const end = startOfLocalDayMs(now) + DAY_SECONDS * 1000;
+  const start = addLocalDaysMs(end, -365);
+  const params = new URLSearchParams({
+    from: String(Math.floor(start / 1000)),
+    to: String(Math.floor(end / 1000)),
+    tz_offset_minutes: String(-new Date().getTimezoneOffset()),
+  });
+  if (includeFilters) {
+    for (const [key, value] of [
+      ["node_id", elements.nodeFilter.value],
+      ["app_type", elements.appFilter.value],
+      ["provider_id", elements.providerFilter.value],
+      ["model", elements.modelFilter.value],
+      ["data_source", elements.sourceFilter.value],
+    ]) {
       if (value) params.set(key, value);
     }
   }
@@ -180,11 +236,13 @@ function setSelectOptions(select, values, allLabel) {
   all.value = "";
   all.textContent = allLabel;
   select.append(all);
-  for (const value of values) {
+  for (const item of values) {
+    const value = typeof item === "string" ? item : item?.value;
+    const label = typeof item === "string" ? item : item?.label || value;
     if (!value) continue;
     const option = document.createElement("option");
     option.value = value;
-    option.textContent = value;
+    option.textContent = label;
     select.append(option);
   }
   if ([...select.options].some((option) => option.value === previous)) {
@@ -330,6 +388,17 @@ function trendValueLabel(value, metric) {
   return formatters.compactNumber.format(value);
 }
 
+function formatTrendAxis(timestamp, spanSeconds) {
+  const options = spanSeconds <= 2 * DAY_SECONDS
+    ? { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }
+    : spanSeconds <= 14 * DAY_SECONDS
+      ? { month: "2-digit", day: "2-digit" }
+      : { year: "numeric", month: "2-digit", day: "2-digit" };
+  return new Intl.DateTimeFormat(locale, options)
+    .format(timestamp * 1000)
+    .replaceAll("/", "-");
+}
+
 function renderTrend() {
   const points = state.overview?.trend || [];
   elements.trendTooltip.hidden = true;
@@ -386,16 +455,14 @@ function renderTrend() {
       y: height - 13,
       "text-anchor": index === 0 ? "start" : index === axisLabels.length - 1 ? "end" : "middle",
       class: "axis-label",
-    }, formatters.dateTime.format(timestamp * 1000).replaceAll("/", "-")));
+    }, formatTrendAxis(timestamp, rangeSpan)));
   });
 }
 
-function showTrendTooltip(point, event) {
-  const tooltip = elements.trendTooltip;
-  const panel = elements.trendChart.parentElement;
+function showUsageTooltip(tooltip, panel, point, titleText, event) {
   tooltip.replaceChildren();
   const title = document.createElement("strong");
-  title.textContent = formatters.dateTime.format(point.bucketStart * 1000);
+  title.textContent = titleText;
   tooltip.append(title);
   const lines = [
     ["trend.tooltipInput", formatTokens(point.inputTokens)],
@@ -422,6 +489,26 @@ function showTrendTooltip(point, event) {
   tooltip.style.top = `${Math.max(12, targetY)}px`;
 }
 
+function showTrendTooltip(point, event) {
+  showUsageTooltip(
+    elements.trendTooltip,
+    elements.trendChart.parentElement,
+    point,
+    formatters.dateTime.format(point.bucketStart * 1000),
+    event,
+  );
+}
+
+function showDailyTooltip(point, date, event) {
+  showUsageTooltip(
+    elements.dailyTooltip,
+    elements.dailyPanel,
+    point,
+    new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(date),
+    event,
+  );
+}
+
 function appendCell(row, value, className = "") {
   const cell = document.createElement("td");
   cell.textContent = value;
@@ -437,7 +524,7 @@ function renderBreakdown() {
   if (!items.length) return;
   for (const item of items) {
     const row = document.createElement("tr");
-    appendCell(row, item.key || t("common.unknown"));
+    appendCell(row, item.label || item.key || t("common.unknown"));
     appendCell(row, formatters.integerNumber.format(item.totalRequests), "table-value");
     appendCell(row, formatTokens(item.realTotalTokens), "table-value");
     appendCell(row, formatPercent(item.successRate), "table-value");
@@ -466,6 +553,113 @@ function renderOverview(overview) {
   renderCoverage(overview.coverage);
 }
 
+function dailyMetricValue(point, metric) {
+  return Number(point?.[metric] || 0);
+}
+
+function dailyMetricLabel(value, metric) {
+  if (metric === "totalCostUsd") return formatters.moneyNumber.format(value);
+  if (metric === "totalRequests") return formatters.integerNumber.format(value);
+  return formatTokens(value);
+}
+
+function localDateKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+let brandMarkSyncQueued = false;
+
+function syncBrandMarkSize() {
+  if (brandMarkSyncQueued) return;
+  brandMarkSyncQueued = true;
+  requestAnimationFrame(() => {
+    brandMarkSyncQueued = false;
+    const height = Math.round(elements.brandMark.getBoundingClientRect().height);
+    if (height > 0) elements.brandMark.style.setProperty("--brand-mark-size", `${height}px`);
+  });
+}
+
+function renderDaily() {
+  const points = state.daily?.days || [];
+  const metric = elements.dailyMetric.value;
+  elements.dailyTooltip.hidden = true;
+  elements.dailyHeatmap.replaceChildren();
+  elements.dailyEmpty.hidden = points.length > 0;
+  elements.dailyHeatmap.hidden = points.length === 0;
+  if (!points.length) return;
+
+  const byDay = new Map();
+  for (const point of points) {
+    byDay.set(localDateKey(new Date(point.bucketStart * 1000)), point);
+  }
+  const first = new Date(points[0].bucketStart * 1000);
+  const last = new Date(points.at(-1).bucketStart * 1000);
+  first.setHours(0, 0, 0, 0);
+  last.setHours(0, 0, 0, 0);
+  const gridStart = new Date(first);
+  gridStart.setDate(gridStart.getDate() - gridStart.getDay());
+  const gridEnd = new Date(last);
+  gridEnd.setDate(gridEnd.getDate() + (6 - gridEnd.getDay()));
+  const weekCount = Math.floor((gridEnd - gridStart) / (7 * DAY_SECONDS * 1000)) + 1;
+  elements.dailyHeatmap.style.gridTemplateColumns = `30px repeat(${weekCount}, 13px)`;
+
+  const values = points.map((point) => dailyMetricValue(point, metric)).filter((value) => value > 0).sort((a, b) => a - b);
+  const maxValue = values.at(-1) || 0;
+  const levelFor = (value) => {
+    if (value <= 0 || maxValue <= 0) return 0;
+    if (value === maxValue) return 4;
+    const rank = values.findIndex((item) => item >= value);
+    return Math.max(1, Math.min(4, Math.ceil((rank + 1) / values.length * 4)));
+  };
+  const weekdayFormatter = new Intl.DateTimeFormat(locale, { weekday: "short" });
+  for (let weekday = 0; weekday < 7; weekday += 1) {
+    const label = document.createElement("span");
+    label.className = "daily-weekday";
+    label.style.gridRow = String(weekday + 2);
+    label.textContent = weekdayFormatter.format(new Date(2024, 0, weekday));
+    elements.dailyHeatmap.append(label);
+  }
+  const monthFormatter = new Intl.DateTimeFormat(locale, { month: "short" });
+  let previousMonth = -1;
+  for (let week = 0; week < weekCount; week += 1) {
+    const weekDate = new Date(gridStart);
+    weekDate.setDate(gridStart.getDate() + week * 7);
+    if (weekDate.getMonth() !== previousMonth) {
+      const label = document.createElement("span");
+      label.className = "daily-month";
+      label.style.gridColumn = String(week + 2);
+      label.style.gridRow = "1";
+      label.textContent = monthFormatter.format(weekDate);
+      elements.dailyHeatmap.append(label);
+      previousMonth = weekDate.getMonth();
+    }
+    for (let weekday = 0; weekday < 7; weekday += 1) {
+      const date = new Date(weekDate);
+      date.setDate(weekDate.getDate() + weekday);
+      const tile = document.createElement("span");
+      tile.className = "daily-tile";
+      tile.style.gridColumn = String(week + 2);
+      tile.style.gridRow = String(weekday + 2);
+      const point = byDay.get(localDateKey(date));
+      const value = dailyMetricValue(point, metric);
+      tile.classList.add(`daily-level-${levelFor(value)}`);
+      if (point) {
+        const dateLabel = new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(date);
+        const tooltip = `${dateLabel}: ${dailyMetricLabel(value, metric)}`;
+        tile.setAttribute("aria-label", tooltip);
+        tile.setAttribute("role", "gridcell");
+        tile.addEventListener("pointerenter", (event) => showDailyTooltip(point, date, event));
+        tile.addEventListener("pointermove", (event) => showDailyTooltip(point, date, event));
+        tile.addEventListener("pointerleave", () => { elements.dailyTooltip.hidden = true; });
+      } else {
+        tile.classList.add("empty");
+        tile.setAttribute("aria-hidden", "true");
+      }
+      elements.dailyHeatmap.append(tile);
+    }
+  }
+}
+
 function eventStatus(statusCode) {
   if (statusCode >= 200 && statusCode < 300) return [t("events.success"), "status-pill"];
   return [String(statusCode || t("events.failure")), "status-pill failed"];
@@ -479,7 +673,7 @@ function renderEventRows(items, append) {
     appendCell(row, formatters.dateTime.format(item.createdAt * 1000));
     appendCell(row, item.nodeId || "—");
     appendCell(row, item.appType || "—");
-    appendCell(row, `${item.providerId || "—"} / ${item.model || item.requestModel || "—"}`);
+    appendCell(row, `${item.providerName || item.providerId || "—"} / ${item.model || item.requestModel || "—"}`);
     appendCell(row, formatTokens(item.realTotalTokens), "table-value");
     appendCell(row, formatTokens(item.cacheReadTokens), "table-value");
     appendCell(row, formatters.moneyNumber.format(item.totalCostUsd), "table-value");
@@ -531,12 +725,16 @@ async function refreshAll({ reloadFilters = false } = {}) {
   try {
     if (reloadFilters) await refreshFilters(controller.signal);
     const params = baseParams(true);
-    params.set("bucket", elements.trendBucket.value);
-    const [overview] = await Promise.all([
+    params.set("bucket", state.trendBucket);
+    const daily = dailyParams(true);
+    const [overview, dailyResponse] = await Promise.all([
       fetchJson(`/v1/dashboard/overview?${params}`, controller.signal),
+      fetchJson(`/v1/dashboard/daily?${daily}`, controller.signal),
       loadEvents({ append: false, signal: controller.signal }),
     ]);
     renderOverview(overview);
+    state.daily = dailyResponse;
+    renderDaily();
     clearError();
     setConnection("online", "status.online");
     state.updatedAt = Date.now();
@@ -553,35 +751,182 @@ async function refreshAll({ reloadFilters = false } = {}) {
   }
 }
 
-function toLocalInputValue(timestamp) {
-  const date = new Date(timestamp);
-  const offset = date.getTimezoneOffset() * 60_000;
-  return new Date(timestamp - offset).toISOString().slice(0, 16);
+function dialogIsOpen(dialog) {
+  return dialog.open || dialog.hasAttribute("open");
 }
 
-function initializeCustomRange() {
-  const now = Date.now();
-  elements.customFrom.value = toLocalInputValue(now - 24 * 60 * 60 * 1000);
-  elements.customTo.value = toLocalInputValue(now);
+function positionDialog(dialog, trigger) {
+  if (!dialogIsOpen(dialog) || !trigger) return;
+  const viewportPadding = 12;
+  const triggerRect = trigger.getBoundingClientRect();
+  const top = Math.max(viewportPadding, triggerRect.bottom + 8);
+  dialog.style.setProperty("--picker-top", `${top}px`);
+  dialog.style.setProperty("--picker-max-height", `${Math.max(0, window.innerHeight - top - viewportPadding)}px`);
+  const dialogWidth = dialog.getBoundingClientRect().width;
+  const left = Math.max(viewportPadding, Math.min(triggerRect.left, window.innerWidth - dialogWidth - viewportPadding));
+  dialog.style.setProperty("--picker-left", `${left}px`);
 }
 
-function openCustomRange() {
+function positionOpenPickers() {
+  positionDialog(elements.rangePickerDialog, elements.rangePickerTrigger);
+  positionDialog(elements.bucketPickerDialog, elements.trendBucketTrigger);
+}
+
+function openDialog(dialog, trigger) {
+  if (!dialogIsOpen(dialog)) {
+    if (typeof dialog.show === "function") dialog.show();
+    else dialog.setAttribute("open", "");
+  }
+  trigger?.setAttribute("aria-expanded", "true");
+  positionDialog(dialog, trigger);
+}
+
+function closeDialog(dialog, trigger) {
+  if (typeof dialog.close === "function" && dialog.open) dialog.close();
+  else dialog.removeAttribute("open");
+  trigger?.setAttribute("aria-expanded", "false");
+}
+
+function rangeLabelKey(preset) {
+  return {
+    today: "filters.rangeToday",
+    "1h": "filters.range1h",
+    "24h": "filters.range24h",
+    "7d": "filters.range7d",
+    "14d": "filters.range14d",
+    "30d": "filters.range30d",
+    custom: "filters.custom",
+  }[preset] || "filters.range24h";
+}
+
+function updateRangePickerTrigger() {
+  elements.rangePickerLabel.textContent = t(rangeLabelKey(state.rangePreset));
+  for (const button of elements.rangePresetOptions.querySelectorAll("[data-range-preset]")) {
+    const active = button.dataset.rangePreset === state.rangePreset;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+}
+
+function syncRangeInputs() {
+  const range = state.rangeDraft || defaultCustomRange();
+  elements.customFromDate.value = dateInputValue(range.from);
+  elements.customFromTime.value = timeInputValue(range.from);
+  elements.customToDate.value = dateInputValue(range.to);
+  elements.customToTime.value = timeInputValue(range.to);
+  state.rangeCalendarMonth = new Date(new Date(range.from * 1000).getFullYear(), new Date(range.from * 1000).getMonth(), 1);
+  renderCalendar();
+}
+
+function readRangeInputs() {
+  const from = parseDateTimeParts(elements.customFromDate.value, elements.customFromTime.value);
+  const to = parseDateTimeParts(elements.customToDate.value, elements.customToTime.value);
+  return { from, to };
+}
+
+function renderCalendar() {
+  const month = state.rangeCalendarMonth;
+  elements.calendarMonthLabel.textContent = new Intl.DateTimeFormat(locale, { year: "numeric", month: "long" }).format(month);
+  elements.calendarWeekdays.replaceChildren();
+  const weekdayFormatter = new Intl.DateTimeFormat(locale, { weekday: "short" });
+  for (let index = 0; index < 7; index += 1) {
+    const label = document.createElement("span");
+    label.textContent = weekdayFormatter.format(new Date(2024, 0, index + 7));
+    elements.calendarWeekdays.append(label);
+  }
+  elements.calendarDays.replaceChildren();
+  const range = state.rangeDraft || defaultCustomRange();
+  const start = new Date(range.from * 1000);
+  const end = new Date(range.to * 1000);
+  for (const day of calendarDays(month)) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "calendar-day";
+    button.textContent = String(day.getDate());
+    button.classList.toggle("outside-month", day.getMonth() !== month.getMonth());
+    button.classList.toggle("today", sameLocalDay(day, new Date()));
+    button.classList.toggle("in-range", day >= new Date(start.getFullYear(), start.getMonth(), start.getDate()) && day <= new Date(end.getFullYear(), end.getMonth(), end.getDate()));
+    button.classList.toggle("endpoint", sameLocalDay(day, start) || sameLocalDay(day, end));
+    button.addEventListener("click", () => {
+      const draft = readRangeInputs();
+      if (!Number.isFinite(draft.from) || !Number.isFinite(draft.to)) return;
+      const timestamp = setDateKeepTime(state.activeRangeField === "start" ? draft.from : draft.to, day);
+      state.rangeDraft = state.activeRangeField === "start"
+        ? { from: timestamp, to: draft.to }
+        : { from: draft.from, to: timestamp };
+      syncRangeInputs();
+      if (state.activeRangeField === "start") state.activeRangeField = "end";
+    });
+    elements.calendarDays.append(button);
+  }
+}
+
+function openRangePicker() {
+  if (dialogIsOpen(elements.rangePickerDialog)) {
+    closeRangePicker();
+    return;
+  }
+  state.rangeDraft = { ...(state.customRange || defaultCustomRange()) };
   elements.customRangeError.hidden = true;
-  if (typeof elements.customRangeDialog.showModal === "function") {
-    elements.customRangeDialog.showModal();
-  } else {
-    elements.customRangeDialog.setAttribute("open", "");
-  }
-  elements.customFrom.focus();
+  syncRangeInputs();
+  openDialog(elements.rangePickerDialog, elements.rangePickerTrigger);
 }
 
-function closeCustomRange(restore = true) {
-  if (restore) elements.rangePreset.value = state.lastNonCustomRange;
-  if (typeof elements.customRangeDialog.close === "function") {
-    elements.customRangeDialog.close();
-  } else {
-    elements.customRangeDialog.removeAttribute("open");
+function closeRangePicker(discard = true) {
+  if (discard) state.rangeDraft = null;
+  closeDialog(elements.rangePickerDialog, elements.rangePickerTrigger);
+}
+
+function setRangePreset(preset) {
+  if (preset === "custom") {
+    state.rangePreset = "custom";
+    state.rangeDraft = { ...(state.customRange || defaultCustomRange()) };
+    updateRangePickerTrigger();
+    syncRangeInputs();
+    return;
   }
+  state.rangePreset = preset;
+  state.rangeDraft = null;
+  updateRangePickerTrigger();
+  closeRangePicker();
+  refreshAll({ reloadFilters: true });
+}
+
+function updateBucketPicker() {
+  elements.trendBucketLabel.textContent = state.trendBucket === "auto"
+    ? t("trend.bucketAuto")
+    : bucketDisplayLabel(state.trendBucket);
+  for (const button of elements.bucketPresetOptions.querySelectorAll("[data-bucket]")) {
+    const active = button.dataset.bucket === state.trendBucket;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  const custom = splitBucketValue(state.trendBucket);
+  if (custom) {
+    elements.customBucketAmount.value = String(custom.amount);
+    elements.customBucketUnit.value = custom.unit;
+  }
+}
+
+function openBucketPicker() {
+  if (dialogIsOpen(elements.bucketPickerDialog)) {
+    closeBucketPicker();
+    return;
+  }
+  elements.customBucketError.hidden = true;
+  updateBucketPicker();
+  openDialog(elements.bucketPickerDialog, elements.trendBucketTrigger);
+}
+
+function closeBucketPicker() {
+  closeDialog(elements.bucketPickerDialog, elements.trendBucketTrigger);
+}
+
+function setTrendBucket(bucket) {
+  state.trendBucket = bucket;
+  updateBucketPicker();
+  closeBucketPicker();
+  refreshAll();
 }
 
 function updateFilterPlaceholders() {
@@ -623,11 +968,15 @@ function applyTranslations() {
   elements.languageToggle.setAttribute("aria-label", t("language.switch"));
   applyTheme();
   updateFilterPlaceholders();
+  updateRangePickerTrigger();
+  updateBucketPicker();
+  renderCalendar();
   setConnection(state.connection.status, state.connection.key);
   elements.updatedAt.textContent = state.updatedAt
     ? t("status.updatedAt", { time: formatters.dateTime.format(state.updatedAt) })
     : t("status.neverUpdated");
   if (state.overview) renderOverview(state.overview);
+  if (state.daily) renderDaily();
   renderEventRows(state.events, false);
   if (state.lastError) showError(state.lastError);
 }
@@ -654,38 +1003,100 @@ elements.languageToggle.addEventListener("click", () => {
 });
 
 elements.refreshButton.addEventListener("click", () => refreshAll({ reloadFilters: true }));
-elements.rangePreset.addEventListener("change", () => {
-  if (elements.rangePreset.value === "custom") {
-    openCustomRange();
+elements.rangePickerTrigger.addEventListener("click", openRangePicker);
+elements.rangePresetOptions.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-range-preset]");
+  if (button) setRangePreset(button.dataset.rangePreset);
+});
+elements.rangePickerForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const range = readRangeInputs();
+  if (!Number.isFinite(range.from) || !Number.isFinite(range.to) || range.from >= range.to) {
+    const error = new Error(t("error.invalidRange"));
+    error.translationKey = "error.invalidRange";
+    elements.customRangeError.textContent = t(error.translationKey);
+    elements.customRangeError.hidden = false;
     return;
   }
-  state.lastNonCustomRange = elements.rangePreset.value;
+  state.customRange = range;
+  state.rangePreset = "custom";
+  state.rangeDraft = null;
+  updateRangePickerTrigger();
+  closeRangePicker(false);
   refreshAll({ reloadFilters: true });
 });
-elements.customRangeForm.addEventListener("submit", (event) => {
+elements.closeRangePicker.addEventListener("click", () => closeRangePicker());
+elements.cancelRange.addEventListener("click", () => closeRangePicker());
+elements.rangePickerDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
-  try {
-    selectedRange();
-    closeCustomRange(false);
-    refreshAll({ reloadFilters: true });
-  } catch (error) {
-    elements.customRangeError.textContent = error.translationKey ? t(error.translationKey) : error.message;
-    elements.customRangeError.hidden = false;
+  closeRangePicker();
+});
+elements.previousCalendarMonth.addEventListener("click", () => {
+  state.rangeCalendarMonth = new Date(state.rangeCalendarMonth.getFullYear(), state.rangeCalendarMonth.getMonth() - 1, 1);
+  renderCalendar();
+});
+elements.nextCalendarMonth.addEventListener("click", () => {
+  state.rangeCalendarMonth = new Date(state.rangeCalendarMonth.getFullYear(), state.rangeCalendarMonth.getMonth() + 1, 1);
+  renderCalendar();
+});
+for (const input of [elements.customFromDate, elements.customFromTime, elements.customToDate, elements.customToTime]) {
+  input.addEventListener("change", () => {
+    const range = readRangeInputs();
+    if (Number.isFinite(range.from) && Number.isFinite(range.to)) {
+      state.rangeDraft = range;
+      renderCalendar();
+    }
+  });
+}
+for (const field of elements.rangePickerForm.querySelectorAll("[data-range-field]")) {
+  field.addEventListener("click", () => {
+    state.activeRangeField = field.dataset.rangeField;
+  });
+}
+elements.trendBucketTrigger.addEventListener("click", openBucketPicker);
+elements.bucketPresetOptions.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-bucket]");
+  if (button) setTrendBucket(button.dataset.bucket);
+});
+elements.closeBucketPicker.addEventListener("click", closeBucketPicker);
+elements.bucketPickerDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeBucketPicker();
+});
+document.addEventListener("pointerdown", (event) => {
+  const pickers = [
+    [elements.rangePickerDialog, elements.rangePickerTrigger, closeRangePicker],
+    [elements.bucketPickerDialog, elements.trendBucketTrigger, closeBucketPicker],
+  ];
+  for (const [dialog, trigger, close] of pickers) {
+    if (!dialogIsOpen(dialog) || dialog.contains(event.target) || trigger.contains(event.target)) continue;
+    close();
   }
 });
-elements.cancelRange.addEventListener("click", () => closeCustomRange());
-elements.cancelRangeBottom.addEventListener("click", () => closeCustomRange());
-elements.customRangeDialog.addEventListener("cancel", (event) => {
-  event.preventDefault();
-  closeCustomRange();
+window.addEventListener("resize", positionOpenPickers);
+window.addEventListener("scroll", positionOpenPickers, true);
+elements.applyCustomBucket.addEventListener("click", () => {
+  const bucket = parseBucketValue(elements.customBucketAmount.value, elements.customBucketUnit.value);
+  if (!bucket) {
+    elements.customBucketError.textContent = t("error.invalidBucket");
+    elements.customBucketError.hidden = false;
+    return;
+  }
+  setTrendBucket(bucket);
 });
+elements.bucketPickerForm.addEventListener("submit", (event) => event.preventDefault());
+
+elements.rangePickerForm.addEventListener("invalid", () => {
+  elements.customRangeError.textContent = t("error.invalidRange");
+  elements.customRangeError.hidden = false;
+}, true);
 
 for (const select of [elements.nodeFilter, elements.appFilter, elements.providerFilter, elements.modelFilter, elements.sourceFilter]) {
   select.addEventListener("change", () => refreshAll());
 }
 
 elements.trendMetric.addEventListener("change", renderTrend);
-elements.trendBucket.addEventListener("change", () => refreshAll());
+elements.dailyMetric.addEventListener("change", renderDaily);
 elements.breakdownTabs.addEventListener("click", (event) => {
   const button = event.target.closest("[data-dimension]");
   if (!button) return;
@@ -701,9 +1112,15 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refreshAll();
 });
 
-initializeCustomRange();
+updateRangePickerTrigger();
+updateBucketPicker();
 applyTheme();
 applyTranslations();
+if (typeof ResizeObserver === "function") {
+  new ResizeObserver(syncBrandMarkSize).observe(elements.brandLockup);
+}
+window.addEventListener("resize", syncBrandMarkSize);
+syncBrandMarkSize();
 refreshAll({ reloadFilters: true });
 setInterval(() => {
   if (!document.hidden) refreshAll();

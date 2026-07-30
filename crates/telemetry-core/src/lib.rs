@@ -38,6 +38,22 @@ pub struct EventBatch {
     pub events: Vec<UsageEvent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSnapshot {
+    pub schema_version: u32,
+    pub node_id: String,
+    pub providers: Vec<ProviderEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderEntry {
+    pub app_type: String,
+    pub provider_id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchResponse {

@@ -1,88 +1,216 @@
-# cc-switch-telemetry
+# CC Switch Telemetry
 
-独立的 cc-switch usage telemetry client/server。它不读取 Claude/Codex/Gemini 原始日志，而是复用 cc-switch 已物化的 SQLite usage 表。
+CC Switch Telemetry is an independent Rust workspace for collecting usage
+statistics from distributed cc-switch installations. The client reads the
+usage data that cc-switch has already materialized in SQLite and uploads it to
+the server. It does not scan Claude, Codex, Gemini, or other raw session-log
+files.
 
-## 运行
+The server is the sole writer of the central SQLite database. It provides
+authenticated ingestion, idempotent event handling, summary APIs, and an
+embedded local dashboard.
+
+## Workspace layout
+
+- `telemetry-core`: shared wire-format types and identifiers.
+- `telemetry-client`: read-only cc-switch database reader and uploader.
+- `telemetry-server`: central SQLite collector, HTTP API, and embedded dashboard.
+
+## Quick start
+
+Build the workspace with the installed Rust toolchain:
 
 ```bash
-cargo run -p telemetry-server
-CC_SWITCH_DB=~/.cc-switch/cc-switch.db TELEMETRY_SERVER_URL=http://127.0.0.1:8787 \
-  TELEMETRY_NODE_ID=node-a cargo run -p telemetry-client
+cargo build --workspace
 ```
 
-Server 使用 `TELEMETRY_DB`、`TELEMETRY_LISTEN`、`TELEMETRY_TOKEN` 环境变量。Client 使用 `CC_SWITCH_DB`、`TELEMETRY_SERVER_URL`、`TELEMETRY_NODE_ID`、`TELEMETRY_TOKEN`。Client 默认将游标保存到 `./data/client-cursor.json`，可通过 `TELEMETRY_STATE` 覆盖。
+Start the server:
 
-Server 默认监听 `127.0.0.1:8787`。启动后在本机打开：
+```bash
+TELEMETRY_TOKEN='replace-with-a-long-random-token' \
+  cargo run -p telemetry-server
+```
+
+Start one client node. Use the real path to the local cc-switch database:
+
+```bash
+CC_SWITCH_DB="$HOME/.cc-switch/cc-switch.db" \
+TELEMETRY_SERVER_URL='http://127.0.0.1:8787' \
+TELEMETRY_NODE_ID='node-a' \
+TELEMETRY_TOKEN='replace-with-a-long-random-token' \
+  cargo run -p telemetry-client
+```
+
+The client should use a stable, unique `TELEMETRY_NODE_ID` for each cc-switch
+installation. If `TELEMETRY_TOKEN` is set on the server, the same value must be
+set on every client.
+
+## Environment variables
+
+The variables below are read directly by the binaries. A variable marked
+`Server and Client` has the same meaning on both sides and should be configured
+consistently.
+
+| Variable | Used by | Default | Meaning |
+| --- | --- | --- | --- |
+| `TELEMETRY_TOKEN` | Server and Client | Unset | Shared bearer token. When set on the server, protected ingestion and summary endpoints require `Authorization: Bearer <token>`; the client sends this token with uploads. When unset, those endpoints do not require authentication. |
+| `TELEMETRY_DB` | Server | `./data/telemetry.db` | Path of the server's central SQLite database. The server creates the parent directory and initializes or migrates its schema on startup. |
+| `TELEMETRY_LISTEN` | Server | `127.0.0.1:8787` | Local address and TCP port on which the server listens. Use an externally reachable address, such as `0.0.0.0:8787`, only when remote clients need to upload directly. |
+| `CC_SWITCH_DB` | Client | `~/.cc-switch/cc-switch.db` | Path of the local cc-switch SQLite database. The client opens it read-only and reads `proxy_request_logs` plus the `providers` table. The binary does not expand `~`, so use an absolute path or expand it in the shell when setting this variable. |
+| `TELEMETRY_SERVER_URL` | Client | `http://127.0.0.1:8787` | Base URL of the telemetry server. The client appends `/v1/events/batch` and `/v1/providers/snapshot` when uploading data. |
+| `TELEMETRY_NODE_ID` | Client | `node-1` | Stable identity of this client node. It is included in every event and provider snapshot and participates in event idempotency. Use a different value for each source cc-switch installation. |
+| `TELEMETRY_STATE` | Client | `./data/client-cursor.json` | Persistent client cursor file. The client atomically stores the last acknowledged `(created_at, request_id)` position here and resumes from it after restart. |
+
+The client also follows reqwest's standard proxy discovery. These are not
+`cc-switch-telemetry`-specific variables:
+
+- `HTTP_PROXY` / `http_proxy`: proxy for HTTP requests.
+- `HTTPS_PROXY` / `https_proxy`: proxy for HTTPS requests.
+- `ALL_PROXY` / `all_proxy`: fallback proxy for supported schemes.
+- `NO_PROXY` / `no_proxy`: comma-separated hosts or addresses that should bypass
+  the proxy.
+
+The client does not hard-code a loopback bypass; proxy behavior is determined by
+reqwest and these environment variables.
+
+## Client synchronization
+
+The client opens the cc-switch database in read-only mode and watches both the
+main database file and its `-wal` file. It polls their modification time and
+size every five seconds. A detected change triggers synchronization immediately;
+when there is no change, the client does not query SQLite.
+
+Each scan:
+
+- Reads up to 512 rows per batch from `proxy_request_logs` using the composite
+  cursor `(created_at, request_id)`, so multiple requests in the same second are
+  not skipped.
+- Re-scans the previous 10 minutes to tolerate delayed session-log imports and
+  relies on server-side idempotency to suppress duplicates.
+- Drains full batches continuously without sleeping between batches.
+- Sends a provider-name snapshot from cc-switch's `providers` table.
+- Retries transient connection failures and HTTP `408`, `425`, `429`, `500`,
+  `502`, `503`, and `504` responses with exponential backoff.
+- Advances the cursor only after the server acknowledges the batch. Logs report
+  `sent`, `accepted`, `duplicates`, and `rejected` counts.
+
+The server derives the event id as `node_id + ":" + request_id` and stores it
+with a uniqueness constraint. Re-uploading an already accepted event therefore
+does not count or charge it twice.
+
+## Dashboard
+
+Open the dashboard locally at:
 
 ```text
 http://127.0.0.1:8787/dashboard/
 ```
 
-Dashboard 的 HTML、CSS 和 JavaScript 已编译进 Server 二进制，不需要 Node.js、CDN 或单独部署前端。
+The HTML, CSS, and JavaScript are embedded in the server binary. No Node.js,
+CDN, or separate frontend deployment is required.
 
-## Dashboard
+The dashboard provides:
 
-Dashboard 提供：
+- Request count, token usage, estimated cost, success rate, cache hit rate, and
+  average latency.
+- Fixed or custom trend buckets, including local-calendar-day views and zero-
+  filled buckets with no events.
+- Top-10 breakdowns by node, application, provider, and model.
+- Combined time, node, application, provider, model, and data-source filters.
+- Stable cursor pagination for recent requests.
+- English and Simplified Chinese localization, with browser-language detection
+  and persisted user selection.
+- Dark and light themes with persisted user selection.
+- Automatic refresh every 30 seconds; refresh pauses while the browser tab is
+  hidden.
 
-- 请求数、真实 Token、预估费用、成功率、缓存命中率和平均延迟；
-- 5 分钟、小时或本地自然日的使用趋势；
-- 节点、应用、Provider 和模型 Top 10 分布；
-- 时间、节点、应用、Provider、模型和数据来源组合筛选；
-- 最近请求的稳定游标分页；
-- 简体中文与英文切换；首次按浏览器语言选择，并持久化用户选择；
-- 每 30 秒自动刷新，浏览器标签页隐藏时暂停。
+Dashboard HTML, assets, and `/v1/dashboard/*` APIs are restricted to loopback
+clients. This restriction is independent of `TELEMETRY_TOKEN`: remote clients
+can upload data to the server's listening address, but cannot access the
+dashboard through that address.
 
-页面和 `/v1/dashboard/*` API 只允许来自 loopback 地址的连接。即使
-`TELEMETRY_LISTEN=0.0.0.0:8787` 用于接收远程 Client，远程客户端也不能直接访问 Dashboard。
-需要从另一台机器查看时，通过 SSH 转发：
+To view the dashboard from another machine, use SSH port forwarding:
 
 ```bash
 ssh -L 8787:127.0.0.1:8787 user@server-host
 ```
 
-然后在本机访问 `http://127.0.0.1:8787/dashboard/`。不要通过未认证的反向代理暴露 Dashboard；
-服务端刻意忽略 `X-Forwarded-For`，本机反向代理会被视为 loopback。
+Then open `http://127.0.0.1:8787/dashboard/` locally. Do not expose the
+dashboard through an unauthenticated reverse proxy. The server intentionally
+ignores `X-Forwarded-For`; a reverse proxy on the same host is still seen as a
+loopback peer.
 
-## 数据边界
+## Data boundaries and semantics
 
-- `proxy_request_logs.created_at` 是 Unix epoch 秒；Client 使用 `(created_at, request_id)` 复合游标。
-- 所有上传事件以 `node_id + ':' + request_id` 幂等。
-- Client 每 5 秒比较 `cc-switch.db` 和 `cc-switch.db-wal` 的修改时间与大小；有变化立即同步，无变化不查询数据库。
-- Client 每次变化后回看 10 分钟，容忍会话日志的迟到写入；满 500 条时连续读取下一批，不在历史回填批次间等待。
-- Client 对短暂的连接失败以及 HTTP 408、425、429、500、502、503、504 使用指数退避重试；只有服务确认 batch 后才推进游标。
-- Client 使用 reqwest 的默认代理发现逻辑，遵循 `HTTP_PROXY`/`HTTPS_PROXY` 与 `NO_PROXY`/`no_proxy`；不对目标地址做硬编码绕过。
-- Server 通过有界写入队列和单一后台 worker 串行处理 event/rollup SQLite 写入；队列满时等待最多 30 秒，只有入队超时、worker 不可用或写入处理超时才返回 503。
-- 同步日志分别报告 `sent`、`accepted`、`duplicates`、`rejected`；Server 重复写入不会重复计费。
-- `usage_daily_rollups` 的 snapshot 接口预留给已从 cc-switch detail 删除的完整历史日；不能把 detail 与同一日期 rollup 直接相加。
-- Dashboard 明确采用 **detail-only** 统计，只查询 Server 的 `usage_events`，不合并
-  `usage_daily_snapshots`；页面会显示当前筛选实际覆盖的首末事件时间。
-- `input_token_semantics` 会随 detail event 上传；旧 cc-switch schema 或旧事件默认按 legacy
-  语义处理。Server 启动时会幂等迁移旧数据库。
-- 真实 Token 和缓存命中率沿用 cc-switch 的 cache-normalization 口径；成功请求定义为 HTTP 2xx。
-- 页面费用是上传事件中本地定价产生的估算值，不是 Provider 账单。
-- 上传内容不包含 API key、prompt、response body 或原始会话文本。
+- The client reuses cc-switch's materialized `proxy_request_logs` records. It
+  does not read raw provider files or session-log text.
+- `created_at` is a Unix epoch timestamp in seconds.
+- Detail events are idempotent by node and request. Daily rollup snapshots are
+  a separate ingestion path reserved for historical days whose detail rows have
+  been removed by cc-switch retention.
+- The dashboard is intentionally **detail-only**: it queries `usage_events` and
+  does not combine them with `usage_daily_snapshots`. Older data may therefore
+  have incomplete coverage; the dashboard reports the covered event range.
+- Token normalization and cache-hit calculations follow cc-switch semantics.
+  Successful requests are those with HTTP status codes from `200` through
+  `299`.
+- Displayed cost is a local estimate calculated from uploaded event pricing
+  data, not a provider invoice.
+- Provider names are synchronized per node and application type. Historical
+  dashboard rows use the current mapped name when available and fall back to the
+  provider ID when no mapping exists.
+- Uploaded data does not contain API keys, prompts, response bodies, or raw
+  session text.
 
-## API
+## HTTP API
 
-- `GET /healthz`
+### Health endpoint
+
+- `GET /healthz` is unauthenticated and reports server/database health.
+
+### Authenticated endpoints
+
+These endpoints use `TELEMETRY_TOKEN` when it is configured:
+
 - `POST /v1/events/batch`
 - `POST /v1/rollups/snapshot`
+- `POST /v1/providers/snapshot`
 - `GET /v1/usage/summary`
-- `GET /dashboard/`（仅 loopback）
-- `GET /v1/dashboard/overview`（仅 loopback）
-- `GET /v1/dashboard/filters`（仅 loopback）
-- `GET /v1/dashboard/events`（仅 loopback）
 
-Dashboard 查询公共参数为：
+### Loopback-only dashboard endpoints
 
-- `from`、`to`：Unix 秒，范围为 `[from, to)`；默认最近 24 小时，最多 365 天；
-- `node_id`、`app_type`、`provider_id`、`model`、`data_source`：可选精确筛选；
-- overview 额外支持 `bucket=auto|1s|1m|5m|1h|1d` 和 `tz_offset_minutes`；`auto` 会按筛选范围选择至少 10 个零填充数据点的最大粒度，并在 response 的 `range.bucket` 返回实际粒度；
-- overview 的 `trend` 覆盖完整 `[from, to)` 时间轴，没有事件的 bucket 返回全零指标；趋势点同时提供 `input_tokens`、`fresh_input_tokens`、`cache_creation_tokens`、`cache_read_tokens` 和 `output_tokens`；
-- events 支持 `limit`（默认 50、最多 200）以及成对出现的
-  `before_created_at`、`before_event_id` 游标。
+- `GET /dashboard/`
+- `GET /dashboard/app.js`
+- `GET /dashboard/i18n.js`
+- `GET /dashboard/range.js`
+- `GET /dashboard/styles.css`
+- `GET /v1/dashboard/overview`
+- `GET /v1/dashboard/daily`
+- `GET /v1/dashboard/filters`
+- `GET /v1/dashboard/events`
 
-`TELEMETRY_TOKEN` 继续保护摄入接口及原有 summary API，不会发送到浏览器。
-Dashboard 依靠 loopback 访问边界，不提供网页登录。
+Dashboard query parameters include:
 
-Server 是中心 SQLite 的唯一写入者；不要让多个节点直接打开共享网络 SQLite 文件。
+- `from` and `to`: Unix seconds defining the half-open range `[from, to)`;
+  default is the most recent 24 hours and the maximum range is 365 days.
+- `node_id`, `app_type`, `provider_id`, `model`, and `data_source`: optional
+  exact-match filters.
+- `bucket`: for overview trends, `auto`, a fixed bucket such as `5m` or `1d`,
+  or a custom integer duration such as `10m`. `auto` selects a suitable bucket
+  and returns the resolved value in `range.bucket`.
+- `tz_offset_minutes`: timezone offset used for local-day alignment.
+- `limit`: for events, defaults to 50 and is capped at 200.
+- `before_created_at` and `before_event_id`: paired cursor parameters for
+  loading older events.
+
+The server is the only writer of the central SQLite database. Do not let
+multiple nodes open a shared network SQLite file directly.
+
+## Development checks
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+node --check crates/telemetry-server/web/app.js
+```

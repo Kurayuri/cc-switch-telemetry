@@ -6,7 +6,9 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
-use telemetry_core::{event_id, EventBatch, UsageEvent, SCHEMA_VERSION};
+use telemetry_core::{
+    event_id, EventBatch, ProviderEntry, ProviderSnapshot, UsageEvent, SCHEMA_VERSION,
+};
 
 const UPLOAD_MAX_ATTEMPTS: usize = 5;
 const UPLOAD_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -153,6 +155,34 @@ pub fn read_events(config: &ClientConfig, cursor: &Cursor) -> anyhow::Result<Vec
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+pub fn read_provider_snapshot(config: &ClientConfig) -> anyhow::Result<ProviderSnapshot> {
+    let conn = Connection::open_with_flags(
+        &config.cc_switch_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .context("open cc-switch db read-only")?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, app_type, name FROM providers
+         WHERE TRIM(name) <> ''
+         ORDER BY app_type, id",
+    )?;
+    let providers = stmt
+        .query_map([], |row| {
+            Ok(ProviderEntry {
+                provider_id: row.get("id")?,
+                app_type: row.get("app_type")?,
+                name: row.get("name")?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ProviderSnapshot {
+        schema_version: SCHEMA_VERSION,
+        node_id: config.node_id.clone(),
+        providers,
+    })
+}
+
 pub async fn upload(
     config: &ClientConfig,
     events: Vec<UsageEvent>,
@@ -161,17 +191,39 @@ pub async fn upload(
         "{}/v1/events/batch",
         config.server_url.trim_end_matches('/')
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
     let batch = EventBatch {
         schema_version: SCHEMA_VERSION,
         node_id: config.node_id.clone(),
         events,
     };
+    let response = post_json_with_retry(config, &url, &batch).await?;
+    response
+        .json()
+        .await
+        .with_context(|| format!("decode usage batch response from {url}"))
+}
 
+pub async fn sync_provider_catalog(config: &ClientConfig) -> anyhow::Result<usize> {
+    let snapshot = read_provider_snapshot(config)?;
+    let provider_count = snapshot.providers.len();
+    let url = format!(
+        "{}/v1/providers/snapshot",
+        config.server_url.trim_end_matches('/')
+    );
+    post_json_with_retry(config, &url, &snapshot).await?;
+    Ok(provider_count)
+}
+
+async fn post_json_with_retry<T: Serialize>(
+    config: &ClientConfig,
+    url: &str,
+    payload: &T,
+) -> anyhow::Result<reqwest::Response> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
     for attempt in 0..UPLOAD_MAX_ATTEMPTS {
-        let mut request = client.post(&url).json(&batch);
+        let mut request = client.post(url).json(payload);
         if let Some(token) = &config.auth_token {
             request = request.bearer_auth(token);
         }
@@ -184,17 +236,14 @@ pub async fn upload(
             }
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!("upload usage batch to {url} after {UPLOAD_MAX_ATTEMPTS} attempts")
+                    format!("post telemetry payload to {url} after {UPLOAD_MAX_ATTEMPTS} attempts")
                 })
             }
         };
 
         let status = response.status();
         if status.is_success() {
-            return response
-                .json()
-                .await
-                .with_context(|| format!("decode usage batch response from {url}"));
+            return Ok(response);
         }
 
         let body = response.text().await.unwrap_or_default();
@@ -338,6 +387,42 @@ mod tests {
                 .map(|e| e.request_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn provider_snapshot_reads_cc_switch_provider_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE providers (
+                 id TEXT NOT NULL,
+                 app_type TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 PRIMARY KEY (id, app_type)
+             );
+             INSERT INTO providers (id, app_type, name)
+             VALUES ('6bae9aab-8fb5-457f-8c70-1f91dd9e5c30', 'codex', 'DeepSeek');",
+        )
+        .unwrap();
+        let config = ClientConfig {
+            cc_switch_db: path,
+            server_url: "http://localhost".into(),
+            node_id: "node-a".into(),
+            auth_token: None,
+            batch_size: 10,
+            overlap_seconds: 0,
+        };
+        let snapshot = read_provider_snapshot(&config).unwrap();
+        assert_eq!(snapshot.node_id, "node-a");
+        assert_eq!(
+            snapshot.providers,
+            vec![ProviderEntry {
+                app_type: "codex".into(),
+                provider_id: "6bae9aab-8fb5-457f-8c70-1f91dd9e5c30".into(),
+                name: "DeepSeek".into(),
+            }]
         );
     }
 
