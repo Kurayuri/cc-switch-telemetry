@@ -795,6 +795,7 @@ function rangeLabelKey(preset) {
     "7d": "filters.range7d",
     "14d": "filters.range14d",
     "30d": "filters.range30d",
+    "1y": "filters.range1y",
     custom: "filters.custom",
   }[preset] || "filters.range24h";
 }

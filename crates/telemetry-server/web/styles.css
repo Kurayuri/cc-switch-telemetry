@@ -515,7 +515,7 @@ select:focus, input:focus {
 .token-summary strong, .token-legend strong, .cache-hit-inline strong { display: inline; margin: 0; color: var(--text); font-size: inherit; font-weight: 800; letter-spacing: normal; line-height: inherit; }
 .token-separator { color: var(--faint); }
 .token-composition { margin-top: 19px; }
-.token-bar-row { display: flex; min-width: 0; align-items: center; gap: 10px; }
+.token-bar-row { display: flex; min-width: 0; align-items: center; gap: 30px; }
 .token-bar { display: flex; height: 7px; overflow: hidden; border-radius: 999px; background: var(--surface-raised); }
 .token-bar-row .token-bar { min-width: 0; flex: 1 1 auto; }
 .token-segment { display: block; min-width: 0; height: 100%; transition: width 420ms ease; }

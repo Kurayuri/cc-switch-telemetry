@@ -36,6 +36,7 @@ test("dashboard has an English static fallback without remote assets", () => {
   assert.match(html, /<html lang="en-US"(?: data-theme="dark")?>/);
   assert.doesNotMatch(html, /[\u3400-\u9fff]/u);
   assert.doesNotMatch(html, /https?:\/\//u);
+  assert.match(html, /<link rel="icon" href="\/dashboard\/favicon\.svg" type="image\/svg\+xml">/);
   assert.match(html, /\/dashboard\/styles\.css/);
   assert.match(html, /\/dashboard\/app\.js/);
 });

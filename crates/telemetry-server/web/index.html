@@ -7,6 +7,7 @@
   <meta name="theme-color" content="#0b1020">
   <meta name="description" content="CC Switch request usage and telemetry dashboard">
   <title>CC Switch Telemetry</title>
+  <link rel="icon" href="/dashboard/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/dashboard/styles.css">
   <script type="module" src="/dashboard/app.js"></script>
 </head>
@@ -102,6 +103,7 @@
             <button type="button" class="range-preset-button" data-range-preset="7d" data-i18n="filters.range7d">Last 7 days</button>
             <button type="button" class="range-preset-button" data-range-preset="14d" data-i18n="filters.range14d">Last 14 days</button>
             <button type="button" class="range-preset-button" data-range-preset="30d" data-i18n="filters.range30d">Last 30 days</button>
+            <button type="button" class="range-preset-button" data-range-preset="1y" data-i18n="filters.range1y">Last calendar year</button>
             <button type="button" id="customRangePreset" class="range-preset-button active" data-range-preset="custom" data-i18n="filters.custom">Custom</button>
           </div>
           <div id="customRangeEditor" class="custom-range-editor">
@@ -157,6 +159,7 @@
             <button type="button" class="bucket-preset-button" data-bucket="6h" data-i18n="trend.bucket6h">6 hours</button>
             <button type="button" class="bucket-preset-button" data-bucket="12h" data-i18n="trend.bucket12h">12 hours</button>
             <button type="button" class="bucket-preset-button" data-bucket="1d" data-i18n="trend.bucket1d">1 day</button>
+            <button type="button" class="bucket-preset-button" data-bucket="1mo" data-i18n="trend.bucket1mo">1 month</button>
           </div>
           <div class="custom-bucket-editor">
             <label><span data-i18n="trend.bucketCustom">Custom bucket</span><div class="custom-bucket-inputs"><input id="customBucketAmount" type="number" min="1" max="31536000" step="1" value="10"><select id="customBucketUnit"><option value="s" data-i18n="trend.bucketSeconds">seconds</option><option value="m" data-i18n="trend.bucketMinutes">minutes</option><option value="h" data-i18n="trend.bucketHours">hours</option><option value="d" data-i18n="trend.bucketDays">days</option></select></div></label>

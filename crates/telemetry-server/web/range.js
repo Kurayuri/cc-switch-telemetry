@@ -1,6 +1,9 @@
 export const DAY_SECONDS = 24 * 60 * 60;
+// Keep browser validation aligned with the Server query limit.
+export const MAX_RANGE_DAYS = 720;
+export const MAX_RANGE_SECONDS = MAX_RANGE_DAYS * DAY_SECONDS;
 
-export const RANGE_PRESETS = ["today", "1h", "24h", "7d", "14d", "30d"];
+export const RANGE_PRESETS = ["today", "1h", "24h", "7d", "14d", "30d", "1y"];
 
 export const BUCKET_PRESETS = [
   "1s",
@@ -13,6 +16,7 @@ export const BUCKET_PRESETS = [
   "6h",
   "12h",
   "1d",
+  "1mo",
 ];
 
 export function startOfLocalDayMs(timestampMs) {
@@ -47,6 +51,14 @@ export function resolvePresetRange(preset, nowMs = Date.now(), customRange = nul
       const days = Number(preset.slice(0, -1));
       const startMs = addLocalDaysMs(startOfLocalDayMs(nowMs), -(days - 1));
       return { from: Math.floor(startMs / 1000), to: now };
+    }
+    case "1y": {
+      const nowDate = new Date(nowMs);
+      const year = nowDate.getFullYear() - 1;
+      const month = nowDate.getMonth();
+      const lastDay = new Date(year, month + 1, 0).getDate();
+      const start = new Date(year, month, Math.min(nowDate.getDate(), lastDay));
+      return { from: Math.floor(startOfLocalDayMs(start.getTime()) / 1000), to: now };
     }
     case "custom":
       return customRange ? { ...customRange } : defaultCustomRange(nowMs);
@@ -119,7 +131,7 @@ export function parseBucketValue(amount, unit) {
   const multipliers = { s: 1, m: 60, h: 60 * 60, d: DAY_SECONDS };
   if (!Number.isInteger(value) || value < 1 || !multipliers[unit]) return null;
   const seconds = value * multipliers[unit];
-  if (!Number.isSafeInteger(seconds) || seconds > 365 * DAY_SECONDS) return null;
+  if (!Number.isSafeInteger(seconds) || seconds > MAX_RANGE_SECONDS) return null;
   return `${value}${unit}`;
 }
 

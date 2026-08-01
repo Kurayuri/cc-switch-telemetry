@@ -1,10 +1,10 @@
 # CC Switch Telemetry
 
 CC Switch Telemetry is an independent Rust workspace for collecting usage
-statistics from distributed cc-switch installations. The client reads the
-usage data that cc-switch has already materialized in SQLite and uploads it to
-the server. It does not scan Claude, Codex, Gemini, or other raw session-log
-files.
+statistics from distributed cc-switch installations. Its default mode reads
+the usage data that cc-switch has already materialized in SQLite and uploads it
+to the server. An explicit local mode can instead materialize raw session
+statistics into an independent, uncompressed SQLite ledger.
 
 The server is the sole writer of the central SQLite database. It provides
 authenticated ingestion, idempotent event handling, summary APIs, and an
@@ -15,6 +15,8 @@ embedded local dashboard.
 - `telemetry-core`: shared wire-format types and identifiers.
 - `telemetry-client`: read-only cc-switch database reader and uploader.
 - `telemetry-server`: central SQLite collector, HTTP API, and embedded dashboard.
+- `session-usage-core`: Tauri-free raw-session parsers synchronized against the
+  pinned cc-switch importer revision.
 
 ## Quick start
 
@@ -41,6 +43,33 @@ TELEMETRY_TOKEN='replace-with-a-long-random-token' \
   cargo run -p telemetry-client
 ```
 
+The client also has an independent, uncompressed local usage ledger. It is
+built from raw Claude, Codex, Gemini, OpenCode, and Grok Build session data;
+it does not need to write to cc-switch and it never creates a daily rollup:
+
+```bash
+# Rebuild the Client-owned ledger, then immediately upload its complete history.
+cargo run -p telemetry-client -- rebuild --upload
+
+# Continuously update that ledger and upload its detail events.
+cargo run -p telemetry-client -- run --source local
+
+# Mirror cc-switch DB/WAL changes into the same Client-owned ledger, then upload.
+cargo run -p telemetry-client -- run --source cc-switch
+```
+
+The raw-session adapter is pinned to the cc-switch checkout under
+`3rdparty/cc-switch`. Before changing importer behavior, update the pinned
+revision and review the five upstream `session_usage*.rs` files; the following
+check fails closed if either the revision or their SHA-256 manifest drifts:
+
+```bash
+./scripts/sync-session-usage.sh
+```
+
+This keeps the telemetry sink independent while making upstream importer
+updates an explicit, reviewable synchronization step.
+
 The client should use a stable, unique `TELEMETRY_NODE_ID` for each cc-switch
 installation. If `TELEMETRY_TOKEN` is set on the server, the same value must be
 set on every client.
@@ -59,7 +88,12 @@ consistently.
 | `CC_SWITCH_DB` | Client | `~/.cc-switch/cc-switch.db` | Path of the local cc-switch SQLite database. The client opens it read-only and reads `proxy_request_logs` plus the `providers` table. The binary does not expand `~`, so use an absolute path or expand it in the shell when setting this variable. |
 | `TELEMETRY_SERVER_URL` | Client | `http://127.0.0.1:8787` | Base URL of the telemetry server. The client appends `/v1/events/batch` and `/v1/providers/snapshot` when uploading data. |
 | `TELEMETRY_NODE_ID` | Client | `node-1` | Stable identity of this client node. It is included in every event and provider snapshot and participates in event idempotency. Use a different value for each source cc-switch installation. |
-| `TELEMETRY_STATE` | Client | `./data/client-cursor.json` | Persistent client cursor file. The client atomically stores the last acknowledged `(created_at, request_id)` position here and resumes from it after restart. |
+| `TELEMETRY_STATE` | Legacy Client | `./data/client-cursor.json` | Legacy direct-source cursor; no longer used by current Client versions. |
+| `TELEMETRY_LOCAL_USAGE_DB` | Client local mode | `./data/local-usage.db` | Independent, uncompressed SQLite usage ledger generated from raw session files. |
+| `TELEMETRY_UPLOAD_STATE` | Client | `./data/client-upload-cursor.json` | Upload cursor for the Client-owned ledger. It is reset by `rebuild`. |
+| `TELEMETRY_MODELS_DEV_URL` | Client | `https://models.dev/api.json` | Optional models.dev endpoint override for rebuild pricing and local tests. |
+| `TELEMETRY_LOCAL_STATE` | Legacy Client local mode | `./data/client-local-cursor.json` | Legacy local upload cursor; no longer used by current Client versions. |
+| `TELEMETRY_CLAUDE_DIR`, `TELEMETRY_CODEX_DIR`, `TELEMETRY_GEMINI_DIR`, `TELEMETRY_OPENCODE_DB`, `TELEMETRY_GROK_DIR` | Client local mode | Tool-specific standard paths | Optional raw-session source overrides. |
 
 The client also follows reqwest's standard proxy discovery. These are not
 `cc-switch-telemetry`-specific variables:
@@ -75,18 +109,20 @@ reqwest and these environment variables.
 
 ## Client synchronization
 
-The client opens the cc-switch database in read-only mode and watches both the
-main database file and its `-wal` file. It polls their modification time and
-size every five seconds. A detected change triggers synchronization immediately;
-when there is no change, the client does not query SQLite.
+The Client always uploads from its own durable ledger (`TELEMETRY_LOCAL_USAGE_DB`).
+`run --source local` refreshes that ledger from raw sessions; `run --source cc-switch`
+first mirrors the cc-switch detail table into it. The latter watches both the main
+database file and its `-wal` file every five seconds. A detected change triggers
+the ledger update and then upload; when there is no change, the client does not
+query SQLite.
 
 Each scan:
 
-- Reads up to 512 rows per batch from `proxy_request_logs` using the composite
+- Reads up to 512 rows per batch from the Client ledger using the composite
   cursor `(created_at, request_id)`, so multiple requests in the same second are
   not skipped.
-- Re-scans the previous 10 minutes to tolerate delayed session-log imports and
-  relies on server-side idempotency to suppress duplicates.
+- Keeps source-mirroring and upload cursors separate, so a `rebuild --upload`
+  sends the full rebuilt history regardless of legacy cursors.
 - Drains full batches continuously without sleeping between batches.
 - Sends a provider-name snapshot from cc-switch's `providers` table.
 - Retries transient connection failures and HTTP `408`, `425`, `429`, `500`,
@@ -161,6 +197,13 @@ loopback peer.
   provider ID when no mapping exists.
 - Uploaded data does not contain API keys, prompts, response bodies, or raw
   session text.
+- The local ledger is detail-only and uncompressed: it has `proxy_request_logs`,
+  and `session_log_sync`, but intentionally has no
+  `usage_daily_rollups` table or retention/pruning job. It can reconstruct raw
+  session usage, not proxy requests that only cc-switch observed; use
+  `--source cc-switch` for those rows.
+- Rebuild pricing is fetched from `https://models.dev/api.json`. The client does
+  not read `model_pricing` or any other pricing table from `cc-switch.db`.
 
 ## HTTP API
 
@@ -180,6 +223,7 @@ These endpoints use `TELEMETRY_TOKEN` when it is configured:
 ### Loopback-only dashboard endpoints
 
 - `GET /dashboard/`
+- `GET /dashboard/favicon.svg`
 - `GET /dashboard/app.js`
 - `GET /dashboard/i18n.js`
 - `GET /dashboard/range.js`

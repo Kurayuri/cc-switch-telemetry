@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/telemetry-core", "crates/telemetry-server", "crates/telemetry-client"]
+members = [
+    "crates/telemetry-core",
+    "crates/session-usage-core",
+    "crates/telemetry-server",
+    "crates/telemetry-client",
+]
 resolver = "2"
 
 [workspace.package]
@@ -11,6 +16,7 @@ license = "MIT"
 anyhow = "1"
 axum = "0.7"
 chrono = "0.4"
+dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

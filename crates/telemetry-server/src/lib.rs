@@ -594,8 +594,20 @@ pub async fn serve(
     auth_token: Option<String>,
 ) -> anyhow::Result<()> {
     let db_path_for_queries = db_path.clone();
-    let state = ServerState::new(init_db(db_path)?, db_path_for_queries, auth_token);
-    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let state = ServerState::new(
+        init_db(&db_path).map_err(|error| {
+            anyhow::anyhow!(
+                "initialize telemetry database {}: {error}",
+                db_path.display()
+            )
+        })?,
+        db_path_for_queries,
+        auth_token,
+    );
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|error| anyhow::anyhow!("bind telemetry-server listener {listen}: {error}"))?;
+    eprintln!("telemetry-server listening on http://{listen}");
     axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),

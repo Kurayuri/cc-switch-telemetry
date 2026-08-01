@@ -8,6 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use chrono::{Datelike, TimeZone};
 use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,10 +20,12 @@ use std::{
 
 const DASHBOARD_HTML: &str = include_str!("../web/index.html");
 const DASHBOARD_CSS: &str = include_str!("../web/styles.css");
+const DASHBOARD_FAVICON: &str = include_str!("../web/favicon.svg");
 const DASHBOARD_JS: &str = include_str!("../web/app.js");
 const DASHBOARD_I18N_JS: &str = include_str!("../web/i18n.js");
 const DASHBOARD_RANGE_JS: &str = include_str!("../web/range.js");
-const MAX_RANGE_SECONDS: i64 = 365 * 24 * 60 * 60;
+const MAX_RANGE_DAYS: i64 = 720;
+const MAX_RANGE_SECONDS: i64 = MAX_RANGE_DAYS * 24 * 60 * 60;
 const MAX_TREND_POINTS: i64 = 20_000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -63,6 +66,7 @@ enum Bucket {
     SixHours,
     TwelveHours,
     Day,
+    Month,
     Custom(i64),
 }
 
@@ -79,6 +83,7 @@ impl Bucket {
             Self::SixHours => 6 * 60 * 60,
             Self::TwelveHours => 12 * 60 * 60,
             Self::Day => 24 * 60 * 60,
+            Self::Month => 30 * 24 * 60 * 60,
             Self::Custom(seconds) => seconds,
         }
     }
@@ -95,6 +100,7 @@ impl Bucket {
             Self::SixHours => "6h".to_owned(),
             Self::TwelveHours => "12h".to_owned(),
             Self::Day => "1d".to_owned(),
+            Self::Month => "1mo".to_owned(),
             Self::Custom(seconds) => {
                 for (suffix, unit) in [("d", 86_400), ("h", 3_600), ("m", 60), ("s", 1)] {
                     if seconds % unit == 0 {
@@ -107,7 +113,9 @@ impl Bucket {
     }
 
     fn auto_for_range(duration: i64) -> Self {
-        for seconds in [86_400, 43_200, 21_600, 7_200, 3_600, 1_800, 900, 300, 60, 1] {
+        for seconds in [
+            2_592_000, 86_400, 43_200, 21_600, 7_200, 3_600, 1_800, 900, 300, 60, 1,
+        ] {
             let points = (duration + seconds - 1) / seconds;
             if points >= 10 {
                 return Self::from_seconds(seconds);
@@ -377,6 +385,7 @@ fn parse_bucket(value: &str) -> Result<Bucket, ApiError> {
         "6h" => Some(Bucket::SixHours),
         "12h" => Some(Bucket::TwelveHours),
         "1d" => Some(Bucket::Day),
+        "1mo" => Some(Bucket::Month),
         _ => None,
     };
     if let Some(bucket) = fixed {
@@ -402,10 +411,11 @@ fn parse_bucket(value: &str) -> Result<Bucket, ApiError> {
     let seconds = amount
         .checked_mul(multiplier)
         .ok_or_else(|| ApiError::BadRequest("custom bucket duration is too large".to_owned()))?;
-    if !(1..=365 * 24 * 60 * 60).contains(&seconds) {
-        return Err(ApiError::BadRequest(
-            "custom bucket must be between 1 second and 365 days".to_owned(),
-        ));
+    if !(1..=MAX_RANGE_SECONDS).contains(&seconds) {
+        return Err(ApiError::BadRequest(format!(
+            "custom bucket must be between 1 second and {} days",
+            MAX_RANGE_DAYS
+        )));
     }
     Ok(Bucket::from_seconds(seconds))
 }
@@ -418,9 +428,10 @@ fn resolve_query(query: DashboardQuery) -> Result<ResolvedQuery, ApiError> {
         return Err(ApiError::BadRequest("from must be less than to".to_owned()));
     }
     if to - from > MAX_RANGE_SECONDS {
-        return Err(ApiError::BadRequest(
-            "time range cannot exceed 365 days".to_owned(),
-        ));
+        return Err(ApiError::BadRequest(format!(
+            "time range cannot exceed {} days",
+            MAX_RANGE_DAYS
+        )));
     }
     let tz_offset_minutes = query.tz_offset_minutes.unwrap_or(0);
     if !(-840..=840).contains(&tz_offset_minutes) {
@@ -622,12 +633,17 @@ fn query_trend(
     fresh_input: &str,
 ) -> anyhow::Result<Vec<TrendPoint>> {
     let seconds = query.bucket.seconds();
+    let is_month = matches!(query.bucket, Bucket::Month);
     let offset = if matches!(query.bucket, Bucket::Day) {
         i64::from(query.tz_offset_minutes) * 60
     } else {
         0
     };
-    let bucket_start = format!("(((l.created_at + {offset}) / {seconds}) * {seconds}) - {offset}");
+    let bucket_start = if is_month {
+        format!("(strftime('%s', strftime('%Y-%m-01 00:00:00', l.created_at + {offset}, 'unixepoch')) - {offset})")
+    } else {
+        format!("(((l.created_at + {offset}) / {seconds}) * {seconds}) - {offset}")
+    };
     let (where_sql, values) = where_clause(query);
     let sql = format!(
         "SELECT {bucket_start},
@@ -662,18 +678,54 @@ fn query_trend(
         ))
     })?;
     let aggregates = rows.collect::<Result<BTreeMap<_, _>, _>>()?;
-    let first_bucket = bucket_start_for(query.from, seconds, offset);
-    let last_bucket = bucket_start_for(query.to - 1, seconds, offset);
+    let first_bucket = if is_month {
+        month_bucket_start(query.from, offset)
+    } else {
+        bucket_start_for(query.from, seconds, offset)
+    };
+    let last_bucket = if is_month {
+        month_bucket_start(query.to - 1, offset)
+    } else {
+        bucket_start_for(query.to - 1, seconds, offset)
+    };
     let mut points = Vec::new();
     let mut bucket = first_bucket;
     while bucket <= last_bucket {
         let aggregate = aggregates.get(&bucket).cloned().unwrap_or_default();
         points.push(aggregate.into_point(bucket));
-        bucket = bucket
-            .checked_add(seconds)
-            .ok_or_else(|| anyhow::anyhow!("trend bucket range overflow"))?;
+        bucket = if is_month {
+            next_month_bucket(bucket, offset)?
+        } else {
+            bucket
+                .checked_add(seconds)
+                .ok_or_else(|| anyhow::anyhow!("trend bucket range overflow"))?
+        };
     }
     Ok(points)
+}
+
+fn month_bucket_start(timestamp: i64, offset: i64) -> i64 {
+    let shifted = timestamp + offset;
+    let tm = chrono::DateTime::from_timestamp(shifted, 0).unwrap_or_else(chrono::Utc::now);
+    chrono::Utc::with_ymd_and_hms(&chrono::Utc, tm.year(), tm.month(), 1, 0, 0, 0)
+        .single()
+        .map(|date| date.timestamp() - offset)
+        .unwrap_or(timestamp)
+}
+
+fn next_month_bucket(bucket: i64, offset: i64) -> anyhow::Result<i64> {
+    let shifted = bucket + offset;
+    let tm = chrono::DateTime::from_timestamp(shifted, 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid month bucket"))?;
+    let (year, month) = if tm.month() == 12 {
+        (tm.year() + 1, 1)
+    } else {
+        (tm.year(), tm.month() + 1)
+    };
+    chrono::Utc::with_ymd_and_hms(&chrono::Utc, year, month, 1, 0, 0, 0)
+        .single()
+        .map(|date| date.timestamp() - offset)
+        .ok_or_else(|| anyhow::anyhow!("trend month range overflow"))
 }
 
 fn bucket_start_for(timestamp: i64, seconds: i64, offset: i64) -> i64 {
@@ -1015,6 +1067,10 @@ async fn styles() -> Response {
     static_response("text/css; charset=utf-8", DASHBOARD_CSS)
 }
 
+async fn favicon() -> Response {
+    static_response("image/svg+xml", DASHBOARD_FAVICON)
+}
+
 async fn script() -> Response {
     static_response("text/javascript; charset=utf-8", DASHBOARD_JS)
 }
@@ -1037,6 +1093,7 @@ pub fn routes() -> Router<ServerState> {
         .route("/dashboard", get(root))
         .route("/dashboard/", get(index))
         .route("/dashboard/styles.css", get(styles))
+        .route("/dashboard/favicon.svg", get(favicon))
         .route("/dashboard/app.js", get(script))
         .route("/dashboard/i18n.js", get(i18n_script))
         .route("/dashboard/range.js", get(range_script))
@@ -1442,6 +1499,24 @@ mod tests {
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
+        );
+
+        let favicon = router(state.clone()).layer(MockConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = favicon
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/favicon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/svg+xml"
         );
 
         let i18n = router(state.clone()).layer(MockConnectInfo(

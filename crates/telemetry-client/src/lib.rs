@@ -10,6 +10,8 @@ use telemetry_core::{
     event_id, EventBatch, ProviderEntry, ProviderSnapshot, UsageEvent, SCHEMA_VERSION,
 };
 
+pub mod usage_ledger;
+
 const UPLOAD_MAX_ATTEMPTS: usize = 5;
 const UPLOAD_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -160,8 +162,18 @@ pub fn read_provider_snapshot(config: &ClientConfig) -> anyhow::Result<ProviderS
         &config.cc_switch_db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
-    .context("open cc-switch db read-only")?;
+    .context("open usage source database read-only")?;
     conn.busy_timeout(Duration::from_secs(2))?;
+    let has_providers: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'providers')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_providers {
+        return Ok(usage_ledger::local_provider_snapshot(
+            config.node_id.clone(),
+        ));
+    }
     let mut stmt = conn.prepare(
         "SELECT id, app_type, name FROM providers
          WHERE TRIM(name) <> ''
@@ -608,6 +620,51 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(collected, 1_202);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_drains_a_ten_thousand_row_client_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("client-ledger.db");
+        let mut source = Connection::open(&source_path).unwrap();
+        source.execute_batch("CREATE TABLE proxy_request_logs (request_id TEXT PRIMARY KEY, created_at INTEGER, app_type TEXT, provider_id TEXT, model TEXT, request_model TEXT, pricing_model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER, input_token_semantics INTEGER, total_cost_usd TEXT, latency_ms INTEGER, status_code INTEGER, is_streaming INTEGER, data_source TEXT);").unwrap();
+        let transaction = source.transaction().unwrap();
+        for index in 1..=10_001 {
+            transaction.execute("INSERT INTO proxy_request_logs VALUES (?1,?2,'codex','provider','model','','',1,1,0,0,1,'0',0,200,1,'codex_session')", rusqlite::params![format!("request-{index:05}"), index]).unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let server_path = directory.path().join("server.db");
+        let state = telemetry_server::ServerState::new(
+            telemetry_server::init_db(&server_path).unwrap(),
+            server_path.clone(),
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                telemetry_server::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let config = ClientConfig {
+            cc_switch_db: source_path,
+            server_url: format!("http://{address}"),
+            node_id: "node-a".into(),
+            auth_token: None,
+            batch_size: 512,
+            overlap_seconds: 0,
+        };
+        let mut cursor = Cursor::default();
+        let summary = sync_available(&config, &mut cursor).await.unwrap();
+        assert_eq!(summary.sent, 10_001);
+        assert_eq!(summary.accepted, 10_001);
+        assert_eq!(summary.duplicates, 0);
+        assert_eq!(cursor.created_at, 10_001);
         server.abort();
     }
 }
