@@ -6,13 +6,16 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+cc-switch-usage-core.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
+rust_decimal.workspace = true
 session-usage-core = { path = "../session-usage-core" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 telemetry-core = { path = "../telemetry-core" }
 tokio.workspace = true
 uuid.workspace = true

@@ -4,6 +4,8 @@
 //! pricing DAO, or the destination schema. They emit stable usage records and
 //! leave persistence, deduplication, and pricing to the caller.
 
+mod pi;
+
 use anyhow::Context;
 use chrono::DateTime;
 use rusqlite::Connection;
@@ -14,7 +16,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const IMPORTER_REVISION: &str = "cc-switch-ff3bc242:session-usage-v1";
+pub const IMPORTER_REVISION: &str = "cc-switch-3217f725:session-usage-v2-six-source";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageIdentity {
+    pub semantic_id: String,
+    pub has_entry_id: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageRecord {
@@ -38,6 +46,7 @@ pub struct UsageRecord {
     pub status_code: i64,
     pub latency_ms: i64,
     pub reported_total_cost_usd: Option<String>,
+    pub identity: Option<UsageIdentity>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -56,6 +65,7 @@ pub struct SourceConfig {
     pub gemini_dir: PathBuf,
     pub opencode_db: PathBuf,
     pub grok_dir: PathBuf,
+    pub pi_dir: PathBuf,
 }
 
 pub fn import_all(config: &SourceConfig) -> anyhow::Result<ImportReport> {
@@ -76,6 +86,7 @@ where
     import_gemini_files(&config.gemini_dir.join("tmp"), &mut report, &should_scan)?;
     import_opencode(&config.opencode_db, &mut report, &should_scan)?;
     import_grok_tree(&config.grok_dir, &mut report, &should_scan)?;
+    pi::import_pi_files(&config.pi_dir, &mut report, &should_scan)?;
     Ok(report)
 }
 
@@ -441,6 +452,7 @@ fn import_gemini_file(path: &Path, report: &mut ImportReport) -> anyhow::Result<
             status_code: 200,
             latency_ms: 0,
             reported_total_cost_usd: None,
+            identity: None,
         });
     }
     Ok(())
@@ -628,6 +640,7 @@ fn parse_claude_file(path: &Path, _thread_id: &str) -> anyhow::Result<Vec<UsageR
             status_code: 200,
             latency_ms: 0,
             reported_total_cost_usd: None,
+            identity: None,
         });
     }
     Ok(records)
@@ -742,6 +755,7 @@ fn parse_codex_file(path: &Path, thread_id: &str) -> anyhow::Result<Vec<UsageRec
                     status_code: 200,
                     latency_ms: 0,
                     reported_total_cost_usd: None,
+                    identity: None,
                 });
             }
             _ => {}
@@ -791,6 +805,7 @@ fn import_opencode(
         return Ok(());
     }
     report.files_scanned += 1;
+    report.scanned_paths.push(path.to_owned());
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open OpenCode database {}", path.display()))?;
     let mut statement = match conn.prepare("SELECT id, session_id, data FROM message") {
@@ -862,6 +877,7 @@ fn import_opencode(
                 .and_then(Value::as_f64)
                 .filter(|cost| *cost > 0.0)
                 .map(|cost| cost.to_string()),
+            identity: None,
         });
     }
     Ok(())
@@ -956,6 +972,7 @@ fn import_grok_tree(
                     status_code: 200,
                     latency_ms: number(counters, &["apiDurationMs"]),
                     reported_total_cost_usd: reported_cost(counters),
+                    identity: None,
                 });
             }
         }
@@ -984,5 +1001,104 @@ mod tests {
             vec![10, 5]
         );
         assert_eq!(records[1].cache_read_tokens, 2);
+    }
+
+    #[test]
+    fn import_all_executes_all_six_vendored_adapters() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude = temp.path().join("claude");
+        let codex = temp.path().join("codex");
+        let gemini = temp.path().join("gemini");
+        let grok = temp.path().join("grok/session-1");
+        let pi = temp.path().join("pi");
+        let opencode = temp.path().join("opencode.db");
+
+        fs::create_dir_all(claude.join("projects/project")).unwrap();
+        fs::write(
+            claude.join("projects/project/session.jsonl"),
+            r#"{"type":"assistant","sessionId":"claude-session","timestamp":"2020-01-01T00:00:00Z","message":{"id":"claude-message","model":"claude-model","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}}
+"#,
+        )
+        .unwrap();
+
+        let thread = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
+        let codex_sessions = codex.join("sessions/2020/01/01");
+        fs::create_dir_all(&codex_sessions).unwrap();
+        fs::write(
+            codex_sessions.join(format!("rollout-2020-01-01T00-00-00-{thread}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"timestamp\":\"2020-01-01T00:00:00Z\",\"payload\":{{\"id\":\"{thread}\"}}}}\n{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-fixture\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2020-01-01T00:00:01Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":3,\"output_tokens\":4}}}}}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let gemini_chats = gemini.join("tmp/project/chats");
+        fs::create_dir_all(&gemini_chats).unwrap();
+        fs::write(
+            gemini_chats.join("session-fixture.json"),
+            r#"{"sessionId":"gemini-session","messages":[{"id":"gemini-message","type":"gemini","model":"gemini-model","timestamp":"2020-01-01T00:00:02Z","tokens":{"input":5,"output":6}}]}"#,
+        )
+        .unwrap();
+
+        let opencode_conn = Connection::open(&opencode).unwrap();
+        opencode_conn
+            .execute_batch("CREATE TABLE message(id TEXT, session_id TEXT, data TEXT);")
+            .unwrap();
+        opencode_conn
+            .execute(
+                "INSERT INTO message VALUES (?1,?2,?3)",
+                rusqlite::params![
+                    "opencode-message",
+                    "opencode-session",
+                    r#"{"role":"assistant","modelID":"opencode-model","tokens":{"input":7,"output":8,"cache":{"read":0,"write":0}},"time":{"created":1577836803000,"completed":1577836804000}}"#
+                ],
+            )
+            .unwrap();
+        drop(opencode_conn);
+
+        fs::create_dir_all(&grok).unwrap();
+        fs::write(
+            grok.join("updates.jsonl"),
+            r#"{"method":"_x.ai/session/update","timestamp":"2020-01-01T00:00:04Z","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"grok-prompt","usage":{"modelUsage":{"grok-model":{"inputTokens":9,"outputTokens":10,"cachedReadTokens":0}}}}}}
+"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(&pi).unwrap();
+        fs::write(
+            pi.join("session.jsonl"),
+            r#"{"type":"session","id":"pi-session","timestamp":"2020-01-01T00:00:05Z"}
+{"type":"message","id":"pi-message","timestamp":"2020-01-01T00:00:06Z","message":{"role":"assistant","provider":"pi-provider","model":"pi-model","usage":{"input":11,"output":12,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}
+"#,
+        )
+        .unwrap();
+
+        let report = import_all(&SourceConfig {
+            claude_dir: claude,
+            codex_dir: codex,
+            gemini_dir: gemini,
+            opencode_db: opencode,
+            grok_dir: temp.path().join("grok"),
+            pi_dir: pi,
+        })
+        .unwrap();
+        let sources = report
+            .records
+            .iter()
+            .map(|record| record.data_source.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            sources,
+            std::collections::BTreeSet::from([
+                "session_log",
+                "codex_session",
+                "gemini_session",
+                "opencode_session",
+                "grok_session",
+                "pi_session",
+            ])
+        );
+        assert_eq!(report.files_scanned, 6);
+        assert_eq!(report.scanned_paths.len(), 6);
     }
 }

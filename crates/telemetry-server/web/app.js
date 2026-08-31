@@ -252,7 +252,7 @@ function setSelectOptions(select, values, allLabel) {
 
 async function refreshFilters(signal) {
   const params = baseParams(false);
-  const filters = await fetchJson(`/v1/dashboard/filters?${params}`, signal);
+  const filters = await fetchJson(`/v2/dashboard/filters?${params}`, signal);
   setSelectOptions(elements.nodeFilter, filters.nodes, t("filters.allNodes"));
   setSelectOptions(elements.appFilter, filters.apps, t("filters.allApps"));
   setSelectOptions(elements.providerFilter, filters.providers, t("filters.allProviders"));
@@ -534,13 +534,20 @@ function renderBreakdown() {
 }
 
 function renderCoverage(coverage) {
-  if (!coverage.firstEventAt || !coverage.lastEventAt) {
+  if (coverage.firstEventAt == null || coverage.lastEventAt == null) {
     elements.coverageText.textContent = t("coverage.empty");
     return;
   }
+  const scope = coverage.includesDetail && coverage.includesRollups
+    ? t("coverage.detailAndRollup")
+    : coverage.includesRollups
+      ? t("coverage.rollupOnly")
+      : t("coverage.detailOnly");
   elements.coverageText.textContent = t("coverage.range", {
     from: formatters.dateTime.format(coverage.firstEventAt * 1000),
     to: formatters.dateTime.format(coverage.lastEventAt * 1000),
+    scope,
+    sources: coverage.sourceKinds?.join(", ") || "—",
   });
 }
 
@@ -669,9 +676,9 @@ function renderEventRows(items, append) {
   if (!append) elements.eventRows.replaceChildren();
   for (const item of items) {
     const row = document.createElement("tr");
-    row.title = t("events.requestId", { id: item.requestId });
+    row.title = `${t("events.requestId", { id: item.requestId })} · UUID: ${item.nodeId || "—"}`;
     appendCell(row, formatters.dateTime.format(item.createdAt * 1000));
-    appendCell(row, item.nodeId || "—");
+    appendCell(row, item.nodeName || item.nodeId || "—");
     appendCell(row, item.appType || "—");
     appendCell(row, `${item.providerName || item.providerId || "—"} / ${item.model || item.requestModel || "—"}`);
     appendCell(row, formatTokens(item.realTotalTokens), "table-value");
@@ -701,7 +708,7 @@ async function loadEvents({ append = false, signal = undefined } = {}) {
       params.set("before_created_at", String(state.eventCursor.beforeCreatedAt));
       params.set("before_event_id", state.eventCursor.beforeEventId);
     }
-    const response = await fetchJson(`/v1/dashboard/events?${params}`, signal);
+    const response = await fetchJson(`/v2/dashboard/events?${params}`, signal);
     if (generation !== state.eventsGeneration) return;
     state.events = append ? [...state.events, ...response.items] : response.items;
     renderEventRows(state.events, false);
@@ -728,8 +735,8 @@ async function refreshAll({ reloadFilters = false } = {}) {
     params.set("bucket", state.trendBucket);
     const daily = dailyParams(true);
     const [overview, dailyResponse] = await Promise.all([
-      fetchJson(`/v1/dashboard/overview?${params}`, controller.signal),
-      fetchJson(`/v1/dashboard/daily?${daily}`, controller.signal),
+      fetchJson(`/v2/dashboard/overview?${params}`, controller.signal),
+      fetchJson(`/v2/dashboard/daily?${daily}`, controller.signal),
       loadEvents({ append: false, signal: controller.signal }),
     ]);
     renderOverview(overview);

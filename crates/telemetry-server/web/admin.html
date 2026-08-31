@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telemetry Node Admin</title>
+  <link rel="stylesheet" href="/admin/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <div>
+        <p class="eyebrow">CC SWITCH TELEMETRY</p>
+        <h1>Node 管理</h1>
+      </div>
+      <button id="logoutButton" class="button secondary" type="button" hidden>退出登录</button>
+    </header>
+
+    <section id="loginPanel" class="panel">
+      <h2>管理员登录</h2>
+      <p class="muted">需要 server 启动时配置 <code>ADMIN_PASSWORD</code>。</p>
+      <form id="loginForm" class="stack-form">
+        <label>管理员密码<input id="passwordInput" type="password" autocomplete="current-password" required></label>
+        <button class="button" type="submit">登录</button>
+      </form>
+      <p id="loginMessage" class="message" role="alert"></p>
+    </section>
+
+    <section id="adminPanel" hidden>
+      <div class="panel">
+        <div class="section-heading">
+          <div>
+            <h2>节点</h2>
+            <p class="muted">Token 只在创建或重新生成后显示一次，请立即复制到对应 client。</p>
+          </div>
+        </div>
+        <form id="createForm" class="inline-form">
+          <label>Node_Name<input id="nodeNameInput" maxlength="128" placeholder="例如 Kurayuri-LB16" required></label>
+          <button class="button" type="submit">创建节点并生成 Token</button>
+        </form>
+        <p id="actionMessage" class="message" role="status"></p>
+      </div>
+
+      <div id="tokenPanel" class="panel token-panel" hidden>
+        <div class="section-heading">
+          <h2>新 Token</h2>
+          <button id="closeTokenButton" class="button secondary" type="button">关闭</button>
+        </div>
+        <p class="warning">此 Token 只显示本次。关闭后只能重新生成，旧 Token 会立即失效。</p>
+        <div class="token-row"><code id="tokenValue"></code><button id="copyTokenButton" class="button secondary" type="button">复制</button></div>
+      </div>
+
+      <div class="panel table-wrap">
+        <table>
+          <thead><tr><th>Node_Name</th><th>UUID</th><th>Token</th><th>更新时间</th><th>操作</th></tr></thead>
+          <tbody id="nodeRows"></tbody>
+        </table>
+        <p id="emptyMessage" class="muted" hidden>暂无节点。</p>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="/admin/app.js"></script>
+</body>
+</html>

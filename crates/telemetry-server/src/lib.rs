@@ -1,4 +1,7 @@
+mod admin;
 mod dashboard;
+pub mod nodes;
+mod sync_v2;
 
 use axum::{
     extract::{Query, State},
@@ -10,13 +13,15 @@ use axum::{
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use telemetry_core::{
-    BatchResponse, EventBatch, ProviderSnapshot, RejectedEvent, RollupSnapshot, SCHEMA_VERSION,
+    event_id, rollup_key, BatchResponse, EventBatch, ProviderSnapshot, RejectedEvent,
+    RollupSnapshot, SCHEMA_VERSION,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -28,34 +33,39 @@ const WRITE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ServerState {
     pub db: Arc<Mutex<Connection>>,
     pub db_path: PathBuf,
-    pub auth_token: Option<String>,
+    pub admin_password: Option<String>,
+    pub admin_sessions: Arc<Mutex<HashMap<String, Instant>>>,
     write_tx: mpsc::Sender<WriteTask>,
 }
 
 enum WriteTask {
     Events {
+        node_id: String,
         batch: EventBatch,
         response: oneshot::Sender<(StatusCode, BatchResponse)>,
     },
     Rollup {
+        node_id: String,
         snapshot: Box<RollupSnapshot>,
         response: oneshot::Sender<StatusCode>,
     },
     Providers {
+        node_id: String,
         snapshot: ProviderSnapshot,
         response: oneshot::Sender<StatusCode>,
     },
 }
 
 impl ServerState {
-    pub fn new(db: Connection, db_path: PathBuf, auth_token: Option<String>) -> Self {
+    pub fn new(db: Connection, db_path: PathBuf, admin_password: Option<String>) -> Self {
         let db = Arc::new(Mutex::new(db));
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
         spawn_write_worker(Arc::clone(&db), write_rx);
         Self {
             db,
             db_path,
-            auth_token,
+            admin_password,
+            admin_sessions: Arc::new(Mutex::new(HashMap::new())),
             write_tx,
         }
     }
@@ -65,29 +75,40 @@ fn spawn_write_worker(db: Arc<Mutex<Connection>>, mut write_rx: mpsc::Receiver<W
     tokio::spawn(async move {
         while let Some(task) = write_rx.recv().await {
             match task {
-                WriteTask::Events { batch, response } => {
-                    let worker_db = Arc::clone(&db);
-                    let result =
-                        tokio::task::spawn_blocking(move || process_events(&worker_db, batch))
-                            .await
-                            .unwrap_or((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                BatchResponse::default(),
-                            ));
-                    let _ = response.send(result);
-                }
-                WriteTask::Rollup { snapshot, response } => {
-                    let worker_db = Arc::clone(&db);
-                    let result =
-                        tokio::task::spawn_blocking(move || process_rollup(&worker_db, *snapshot))
-                            .await
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let _ = response.send(result);
-                }
-                WriteTask::Providers { snapshot, response } => {
+                WriteTask::Events {
+                    node_id,
+                    batch,
+                    response,
+                } => {
                     let worker_db = Arc::clone(&db);
                     let result = tokio::task::spawn_blocking(move || {
-                        process_provider_snapshot(&worker_db, snapshot)
+                        process_events(&worker_db, node_id, batch)
+                    })
+                    .await
+                    .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, BatchResponse::default()));
+                    let _ = response.send(result);
+                }
+                WriteTask::Rollup {
+                    node_id,
+                    snapshot,
+                    response,
+                } => {
+                    let worker_db = Arc::clone(&db);
+                    let result = tokio::task::spawn_blocking(move || {
+                        process_rollup(&worker_db, node_id, *snapshot)
+                    })
+                    .await
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let _ = response.send(result);
+                }
+                WriteTask::Providers {
+                    node_id,
+                    snapshot,
+                    response,
+                } => {
+                    let worker_db = Arc::clone(&db);
+                    let result = tokio::task::spawn_blocking(move || {
+                        process_provider_snapshot(&worker_db, node_id, snapshot)
                     })
                     .await
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -145,6 +166,7 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
              status_code INTEGER NOT NULL,
              is_streaming INTEGER NOT NULL,
              data_source TEXT NOT NULL DEFAULT '',
+             content_hash TEXT NOT NULL DEFAULT '',
              received_at INTEGER NOT NULL,
              UNIQUE(node_id, request_id)
          );
@@ -175,9 +197,55 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
              output_tokens INTEGER NOT NULL,
              cache_read_tokens INTEGER NOT NULL,
              cache_creation_tokens INTEGER NOT NULL,
+             input_token_semantics INTEGER NOT NULL DEFAULT 2,
              total_cost_usd TEXT NOT NULL,
              avg_latency_ms INTEGER NOT NULL,
+             day_start_utc INTEGER NOT NULL DEFAULT 0,
+             day_end_utc INTEGER NOT NULL DEFAULT 0,
+             content_hash TEXT NOT NULL DEFAULT '',
              received_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_usage_snapshots_node_day
+             ON usage_daily_snapshots(node_id, day_start_utc, day_end_utc);
+         CREATE TABLE IF NOT EXISTS sync_generations (
+             generation_id TEXT PRIMARY KEY,
+             node_id TEXT NOT NULL,
+             source_kind TEXT NOT NULL,
+             replace_all INTEGER NOT NULL,
+             status TEXT NOT NULL,
+             manifest_hash TEXT NOT NULL DEFAULT '',
+             result_json TEXT,
+             created_at INTEGER NOT NULL,
+             committed_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS staged_event_mutations (
+             generation_id TEXT NOT NULL,
+             request_id TEXT NOT NULL,
+             operation TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             payload_json TEXT,
+             PRIMARY KEY (generation_id, request_id),
+             FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                 ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS staged_rollup_mutations (
+             generation_id TEXT NOT NULL,
+             snapshot_key TEXT NOT NULL,
+             operation TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             payload_json TEXT,
+             PRIMARY KEY (generation_id, snapshot_key),
+             FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                 ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS staged_providers (
+             generation_id TEXT NOT NULL,
+             app_type TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             PRIMARY KEY (generation_id, app_type, provider_id),
+             FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                 ON DELETE CASCADE
          );
          CREATE TABLE IF NOT EXISTS ingest_batches (
              batch_id TEXT PRIMARY KEY,
@@ -200,18 +268,181 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
             [],
         )?;
     }
+    ensure_column(
+        &conn,
+        "usage_events",
+        "content_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "usage_daily_snapshots",
+        "input_token_semantics",
+        "INTEGER NOT NULL DEFAULT 2",
+    )?;
+    ensure_column(
+        &conn,
+        "usage_daily_snapshots",
+        "day_start_utc",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "usage_daily_snapshots",
+        "day_end_utc",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "usage_daily_snapshots",
+        "content_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    nodes::ensure_schema(&conn)?;
     Ok(conn)
 }
 
-fn authorized(headers: &HeaderMap, expected: &Option<String>) -> bool {
-    let Some(expected) = expected else {
-        return true;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildV2Summary {
+    pub nodes: usize,
+    pub providers: usize,
+}
+
+/// Build a fresh protocol-v2 central database while preserving only node
+/// identities/token hashes and current provider labels. Usage is deliberately
+/// omitted: each node must repopulate it with a forced v2 replacement.
+pub fn rebuild_v2_metadata(
+    source_path: impl AsRef<Path>,
+    target_path: impl AsRef<Path>,
+) -> anyhow::Result<RebuildV2Summary> {
+    let source_path = source_path.as_ref();
+    let target_path = target_path.as_ref();
+    if source_path == target_path {
+        anyhow::bail!("source and target database paths must differ");
+    }
+    if target_path.exists() {
+        anyhow::bail!("target database already exists: {}", target_path.display());
+    }
+    let source = Connection::open_with_flags(
+        source_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let has_nodes: bool = source.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_nodes {
+        anyhow::bail!("source database has no nodes table");
+    }
+    let node_rows = {
+        let mut statement = source.prepare(
+            "SELECT uuid,node_name,token_hash,created_at,updated_at FROM nodes ORDER BY uuid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
     };
+    let has_providers: bool = source.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_catalog'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let provider_rows = if has_providers {
+        let mut statement = source.prepare(
+            "SELECT node_id,app_type,provider_id,name,updated_at
+             FROM provider_catalog ORDER BY node_id,app_type,provider_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
+    let mut target = init_db(target_path)?;
+    let transaction = target.transaction()?;
+    for row in &node_rows {
+        transaction.execute(
+            "INSERT INTO nodes(uuid,node_name,token_hash,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![row.0, row.1, row.2, row.3, row.4],
+        )?;
+    }
+    for row in &provider_rows {
+        transaction.execute(
+            "INSERT INTO provider_catalog(node_id,app_type,provider_id,name,updated_at)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![row.0, row.1, row.2, row.3, row.4],
+        )?;
+    }
+    transaction.commit()?;
+    let integrity: String = target.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        anyhow::bail!("rebuilt v2 database failed integrity_check: {integrity}");
+    }
+    Ok(RebuildV2Summary {
+        nodes: node_rows.len(),
+        providers: provider_rows.len(),
+    })
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> anyhow::Result<()> {
+    let columns = connection
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|candidate| candidate == column) {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == format!("Bearer {expected}"))
-        .unwrap_or(false)
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn authenticated_node(
+    headers: &HeaderMap,
+    db: &Arc<Mutex<Connection>>,
+) -> Option<String> {
+    let token = bearer_token(headers)?;
+    let Ok(db) = db.lock() else {
+        return None;
+    };
+    nodes::authorized_uuid(&db, token)
+}
+
+fn authorized_any_node(headers: &HeaderMap, db: &Arc<Mutex<Connection>>) -> bool {
+    authenticated_node(headers, db).is_some()
 }
 
 fn is_retryable_sqlite_error(error: &rusqlite::Error) -> bool {
@@ -255,13 +486,10 @@ pub async fn ingest(
     headers: HeaderMap,
     Json(batch): Json<EventBatch>,
 ) -> impl IntoResponse {
-    if !authorized(&headers, &state.auth_token) {
+    let Some(node_id) = authenticated_node(&headers, &state.db) else {
         return (StatusCode::UNAUTHORIZED, Json(BatchResponse::default()));
-    }
-    if batch.schema_version != SCHEMA_VERSION
-        || batch.events.len() > 1000
-        || batch.events.iter().any(|e| e.node_id != batch.node_id)
-    {
+    };
+    if batch.schema_version != SCHEMA_VERSION || batch.events.len() > 1000 {
         return (
             StatusCode::BAD_REQUEST,
             Json(BatchResponse {
@@ -269,7 +497,7 @@ pub async fn ingest(
                     .events
                     .into_iter()
                     .map(|e| RejectedEvent {
-                        event_id: e.event_id,
+                        event_id: event_id(&node_id, &e.request_id),
                         reason: "invalid batch".into(),
                     })
                     .collect(),
@@ -279,6 +507,7 @@ pub async fn ingest(
     }
     let (response_tx, response_rx) = oneshot::channel();
     let task = WriteTask::Events {
+        node_id,
         batch,
         response: response_tx,
     };
@@ -300,7 +529,11 @@ pub async fn ingest(
     }
 }
 
-fn process_events(db: &Arc<Mutex<Connection>>, batch: EventBatch) -> (StatusCode, BatchResponse) {
+fn process_events(
+    db: &Arc<Mutex<Connection>>,
+    node_id: String,
+    batch: EventBatch,
+) -> (StatusCode, BatchResponse) {
     let mut response = BatchResponse::default();
     let now = chrono::Utc::now().timestamp();
     let Ok(db) = db.lock() else {
@@ -311,11 +544,12 @@ fn process_events(db: &Arc<Mutex<Connection>>, batch: EventBatch) -> (StatusCode
         Err(error) => return (database_error_status(&error), response),
     };
     for event in &batch.events {
+        let generated_event_id = event_id(&node_id, &event.request_id);
         let exists: Option<String> = match tx
             .query_row(
                 "SELECT event_id FROM usage_events
                  WHERE event_id = ?1 OR (node_id = ?2 AND request_id = ?3)",
-                params![event.event_id, event.node_id, event.request_id],
+                params![&generated_event_id, &node_id, &event.request_id],
                 |row| row.get(0),
             )
             .optional()
@@ -324,7 +558,7 @@ fn process_events(db: &Arc<Mutex<Connection>>, batch: EventBatch) -> (StatusCode
             Err(error) => return (database_error_status(&error), BatchResponse::default()),
         };
         if exists.is_some() {
-            response.duplicates.push(event.event_id.clone());
+            response.duplicates.push(generated_event_id);
             continue;
         }
         let result = tx.execute(
@@ -335,8 +569,8 @@ fn process_events(db: &Arc<Mutex<Connection>>, batch: EventBatch) -> (StatusCode
                  total_cost_usd,latency_ms,status_code,is_streaming,data_source,received_at
              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
-                event.event_id,
-                event.node_id,
+                &generated_event_id,
+                &node_id,
                 event.request_id,
                 event.created_at,
                 event.app_type,
@@ -358,12 +592,12 @@ fn process_events(db: &Arc<Mutex<Connection>>, batch: EventBatch) -> (StatusCode
             ],
         );
         match result {
-            Ok(_) => response.accepted.push(event.event_id.clone()),
+            Ok(_) => response.accepted.push(generated_event_id),
             Err(error) if is_retryable_sqlite_error(&error) => {
                 return (StatusCode::SERVICE_UNAVAILABLE, BatchResponse::default())
             }
             Err(error) => response.rejected.push(RejectedEvent {
-                event_id: event.event_id.clone(),
+                event_id: generated_event_id,
                 reason: error.to_string(),
             }),
         }
@@ -374,10 +608,23 @@ fn process_events(db: &Arc<Mutex<Connection>>, batch: EventBatch) -> (StatusCode
     (StatusCode::OK, response)
 }
 
-fn process_rollup(db: &Arc<Mutex<Connection>>, snapshot: RollupSnapshot) -> StatusCode {
+fn process_rollup(
+    db: &Arc<Mutex<Connection>>,
+    node_id: String,
+    snapshot: RollupSnapshot,
+) -> StatusCode {
     let Ok(db) = db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR;
     };
+    let snapshot_key = rollup_key(
+        &node_id,
+        &snapshot.date,
+        &snapshot.app_type,
+        &snapshot.provider_id,
+        &snapshot.model,
+        &snapshot.request_model,
+        &snapshot.pricing_model,
+    );
     let result = db.execute(
         "INSERT INTO usage_daily_snapshots (
              snapshot_key,node_id,date,app_type,provider_id,model,request_model,
@@ -395,8 +642,8 @@ fn process_rollup(db: &Arc<Mutex<Connection>>, snapshot: RollupSnapshot) -> Stat
              avg_latency_ms=excluded.avg_latency_ms,
              received_at=excluded.received_at",
         params![
-            snapshot.snapshot_key,
-            snapshot.node_id,
+            snapshot_key,
+            node_id,
             snapshot.date,
             snapshot.app_type,
             snapshot.provider_id,
@@ -422,6 +669,7 @@ fn process_rollup(db: &Arc<Mutex<Connection>>, snapshot: RollupSnapshot) -> Stat
 
 fn process_provider_snapshot(
     db: &Arc<Mutex<Connection>>,
+    node_id: String,
     snapshot: ProviderSnapshot,
 ) -> StatusCode {
     let Ok(db) = db.lock() else {
@@ -440,7 +688,7 @@ fn process_provider_snapshot(
                  name=excluded.name,
                  updated_at=excluded.updated_at",
             params![
-                &snapshot.node_id,
+                &node_id,
                 provider.app_type,
                 provider.provider_id,
                 provider.name,
@@ -461,11 +709,12 @@ pub async fn ingest_rollup(
     headers: HeaderMap,
     Json(snapshot): Json<RollupSnapshot>,
 ) -> impl IntoResponse {
-    if !authorized(&headers, &state.auth_token) {
+    let Some(node_id) = authenticated_node(&headers, &state.db) else {
         return StatusCode::UNAUTHORIZED;
-    }
+    };
     let (response_tx, response_rx) = oneshot::channel();
     let task = WriteTask::Rollup {
+        node_id,
         snapshot: Box::new(snapshot),
         response: response_tx,
     };
@@ -484,11 +733,10 @@ pub async fn ingest_provider_snapshot(
     headers: HeaderMap,
     Json(snapshot): Json<ProviderSnapshot>,
 ) -> impl IntoResponse {
-    if !authorized(&headers, &state.auth_token) {
+    let Some(node_id) = authenticated_node(&headers, &state.db) else {
         return StatusCode::UNAUTHORIZED;
-    }
+    };
     if snapshot.schema_version != SCHEMA_VERSION
-        || snapshot.node_id.trim().is_empty()
         || snapshot.providers.len() > 10_000
         || snapshot.providers.iter().any(|provider| {
             provider.app_type.trim().is_empty()
@@ -500,6 +748,7 @@ pub async fn ingest_provider_snapshot(
     }
     let (response_tx, response_rx) = oneshot::channel();
     let task = WriteTask::Providers {
+        node_id,
         snapshot,
         response: response_tx,
     };
@@ -518,7 +767,7 @@ pub async fn summary(
     headers: HeaderMap,
     Query(query): Query<UsageQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&headers, &state.auth_token) {
+    if !authorized_any_node(&headers, &state.db) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error":"unauthorized"})),
@@ -577,21 +826,32 @@ pub async fn summary(
     }
 }
 
+async fn v1_upgrade_required() -> impl IntoResponse {
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({
+            "error": "telemetry protocol v2 is required"
+        })),
+    )
+}
+
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route("/v1/events/batch", post(ingest))
-        .route("/v1/rollups/snapshot", post(ingest_rollup))
-        .route("/v1/providers/snapshot", post(ingest_provider_snapshot))
-        .route("/v1/usage/summary", get(summary))
+        .route("/v1/events/batch", post(v1_upgrade_required))
+        .route("/v1/rollups/snapshot", post(v1_upgrade_required))
+        .route("/v1/providers/snapshot", post(v1_upgrade_required))
+        .route("/v1/usage/summary", get(v1_upgrade_required))
         .merge(dashboard::routes())
+        .merge(admin::routes())
+        .merge(sync_v2::routes())
         .with_state(state)
 }
 
 pub async fn serve(
     db_path: PathBuf,
     listen: SocketAddr,
-    auth_token: Option<String>,
+    admin_password: Option<String>,
 ) -> anyhow::Result<()> {
     let db_path_for_queries = db_path.clone();
     let state = ServerState::new(
@@ -602,7 +862,7 @@ pub async fn serve(
             )
         })?,
         db_path_for_queries,
-        auth_token,
+        admin_password,
     );
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -637,11 +897,78 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_v2_preserves_auth_metadata_but_not_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("legacy.db");
+        let target_path = directory.path().join("v2.db");
+        let source = init_db(&source_path).unwrap();
+        let (node, _token) = nodes::create(&source, "node-a").unwrap();
+        let token_hash: String = source
+            .query_row(
+                "SELECT token_hash FROM nodes WHERE uuid=?1",
+                [&node.uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO provider_catalog(node_id,app_type,provider_id,name,updated_at)
+                 VALUES (?1,'codex','provider-a','Provider A',10)",
+                [&node.uuid],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO usage_events (
+                   event_id,node_id,request_id,created_at,app_type,provider_id,model,
+                   input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,
+                   total_cost_usd,latency_ms,status_code,is_streaming,received_at
+                 ) VALUES ('event-a',?1,'request-a',10,'codex','provider-a','gpt-5',
+                           1,1,0,0,'0',1,200,1,10)",
+                [&node.uuid],
+            )
+            .unwrap();
+        drop(source);
+
+        let summary = rebuild_v2_metadata(&source_path, &target_path).unwrap();
+        assert_eq!(
+            summary,
+            RebuildV2Summary {
+                nodes: 1,
+                providers: 1
+            }
+        );
+        let target = Connection::open(&target_path).unwrap();
+        let copied_hash: String = target
+            .query_row(
+                "SELECT token_hash FROM nodes WHERE uuid=?1",
+                [&node.uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied_hash, token_hash);
+        assert_eq!(
+            target
+                .query_row("SELECT COUNT(*) FROM provider_catalog", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            target
+                .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(rebuild_v2_metadata(&source_path, &target_path).is_err());
+    }
+
+    #[test]
     fn provider_snapshot_upserts_current_name() {
         let db = Arc::new(Mutex::new(init_db(":memory:").unwrap()));
         let snapshot = ProviderSnapshot {
             schema_version: SCHEMA_VERSION,
-            node_id: "node-a".into(),
             providers: vec![telemetry_core::ProviderEntry {
                 app_type: "codex".into(),
                 provider_id: "provider-a".into(),
@@ -649,12 +976,11 @@ mod tests {
             }],
         };
         assert_eq!(
-            process_provider_snapshot(&db, snapshot),
+            process_provider_snapshot(&db, "node-a".into(), snapshot),
             StatusCode::NO_CONTENT
         );
         let renamed = ProviderSnapshot {
             schema_version: SCHEMA_VERSION,
-            node_id: "node-a".into(),
             providers: vec![telemetry_core::ProviderEntry {
                 app_type: "codex".into(),
                 provider_id: "provider-a".into(),
@@ -662,7 +988,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            process_provider_snapshot(&db, renamed),
+            process_provider_snapshot(&db, "node-a".into(), renamed),
             StatusCode::NO_CONTENT
         );
         let name: String = db
@@ -679,61 +1005,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_snapshot_endpoint_requires_auth_and_persists_names() {
-        let state = ServerState::new(
-            init_db(":memory:").unwrap(),
-            PathBuf::from("telemetry.db"),
-            Some("secret".into()),
-        );
-        let snapshot = ProviderSnapshot {
-            schema_version: SCHEMA_VERSION,
-            node_id: "node-a".into(),
-            providers: vec![telemetry_core::ProviderEntry {
-                app_type: "codex".into(),
-                provider_id: "provider-a".into(),
-                name: "DeepSeek".into(),
-            }],
-        };
-        let payload = serde_json::to_vec(&snapshot).unwrap();
-        let unauthorized = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/providers/snapshot")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/providers/snapshot")
-                    .header("authorization", "Bearer secret")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-        let name: String = state
-            .db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT name FROM provider_catalog
-                 WHERE node_id = 'node-a' AND app_type = 'codex' AND provider_id = 'provider-a'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(name, "DeepSeek");
+    async fn v1_ingest_endpoints_require_protocol_upgrade() {
+        let db = init_db(":memory:").unwrap();
+        let state = ServerState::new(db, PathBuf::from("telemetry.db"), None);
+        for endpoint in [
+            "/v1/events/batch",
+            "/v1/rollups/snapshot",
+            "/v1/providers/snapshot",
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(endpoint)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        }
     }
 
     #[test]

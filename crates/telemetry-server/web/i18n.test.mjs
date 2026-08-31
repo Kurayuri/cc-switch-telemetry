@@ -95,7 +95,7 @@ test("token KPI owns the cache rate and spans two grid units", () => {
   assert.match(css, /\.cache-hit-inline span\s*\{[^}]*font-size:\s*14px/);
   assert.match(css, /\.cache-hit-inline span\s*\{[^}]*position:\s*absolute/);
   assert.match(css, /\.cache-hit-inline\s*\{[^}]*min-height:\s*14px/);
-  assert.match(css, /\.token-bar-row\s*\{[^}]*gap:\s*10px/);
+  assert.match(css, /\.token-bar-row\s*\{[^}]*gap:\s*30px/);
   assert.match(css, /\.cache-hit-inline\s*\{[^}]*width:\s*72px/);
   assert.match(css, /\.token-legend\s*\{[^}]*flex-wrap:\s*nowrap/);
 });
@@ -146,8 +146,8 @@ test("estimated cost exposes a dynamic top-three model list", () => {
 
 test("translations interpolate variables and formatters follow locale", () => {
   assert.equal(translate("en-US", "kpi.successCount", { count: 3 }), "3 successful");
-  assert.equal(createFormatters("en-US").moneyNumber.format(1.2), "$1.20");
-  assert.equal(createFormatters("en-US").moneyNumber.format(1.234), "$1.23");
+  assert.equal(createFormatters("en-US").moneyNumber.format(1.2), "$1.2000");
+  assert.equal(createFormatters("en-US").moneyNumber.format(1.234), "$1.2340");
   assert.match(createFormatters("zh-CN").integerNumber.format(1234), /1[,.]234/);
   const compactChinese = createFormatters("zh-CN").compactNumber.format(1_200_000);
   assert.match(compactChinese, /M/);

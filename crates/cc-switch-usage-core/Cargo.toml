@@ -1,0 +1,13 @@
+[package]
+name = "cc-switch-usage-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Tauri-free usage accounting policy shared by cc-switch and telemetry"
+
+[dependencies]
+chrono = "0.4"
+rust_decimal = "1.33"
+
+[dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }

@@ -1,106 +1,138 @@
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 use telemetry_client::usage_ledger::{self, LocalUsageConfig};
 use telemetry_client::{
-    database_fingerprint, load_cursor, save_cursor, sync_available, sync_provider_catalog,
-    ClientConfig, Cursor, DatabaseFingerprint,
+    database_fingerprint, sync_snapshot_v2_with_mode, verify_cc_switch_mirror, ClientConfig,
+    DatabaseFingerprint,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-fn client_config(database: PathBuf) -> ClientConfig {
-    ClientConfig {
+fn client_config(database: PathBuf) -> anyhow::Result<ClientConfig> {
+    let auth_token = std::env::var("TELEMETRY_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("TELEMETRY_TOKEN must be set for client uploads"))?;
+    Ok(ClientConfig {
         cc_switch_db: database,
         server_url: std::env::var("TELEMETRY_SERVER_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8787".into()),
-        node_id: std::env::var("TELEMETRY_NODE_ID").unwrap_or_else(|_| "node-1".into()),
-        auth_token: std::env::var("TELEMETRY_TOKEN").ok(),
+        auth_token,
         batch_size: 512,
         overlap_seconds: 0,
-    }
+    })
 }
 
-fn upload_state_path() -> PathBuf {
-    std::env::var_os("TELEMETRY_UPLOAD_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./data/client-upload-cursor.json"))
+fn source_database(source: &str, local: &LocalUsageConfig) -> anyhow::Result<PathBuf> {
+    let database = match source {
+        "local" => local.database.clone(),
+        "cc-switch" => std::env::var_os("CC_SWITCH_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".cc-switch/cc-switch.db")
+            }),
+        _ => anyhow::bail!("unknown source {source}; expected local or cc-switch"),
+    };
+    Ok(database)
+}
+
+fn source_config(source: &str, local: &LocalUsageConfig) -> anyhow::Result<ClientConfig> {
+    client_config(source_database(source, local)?)
+}
+
+fn selected_source(args: &[String]) -> &str {
+    args.windows(2)
+        .find(|pair| pair[0] == "--source")
+        .map(|pair| pair[1].as_str())
+        .unwrap_or("cc-switch")
 }
 
 async fn upload_ledger(
     upload_config: &ClientConfig,
     provider_config: &ClientConfig,
-    state_path: &Path,
-    cursor: &mut Cursor,
+    source: &str,
+    force_replace_all: bool,
 ) -> anyhow::Result<()> {
-    let provider_count = sync_provider_catalog(provider_config).await?;
-    if provider_count > 0 {
-        eprintln!("provider sync: {provider_count} mapped providers");
-    }
-    let summary = sync_available(upload_config, cursor).await?;
-    if summary.cursor_advanced {
-        save_cursor(state_path, cursor)?;
-    }
-    if summary.sent > 0 {
-        eprintln!(
-            "usage sync: sent={} accepted={} duplicates={} rejected={}",
-            summary.sent, summary.accepted, summary.duplicates, summary.rejected
-        );
-    }
+    let result =
+        sync_snapshot_v2_with_mode(upload_config, provider_config, source, force_replace_all)
+            .await?;
+    eprintln!(
+        "usage sync v2: inserted={} updated={} unchanged={} deleted={} rollups={} providers={}",
+        result.inserted,
+        result.updated,
+        result.unchanged,
+        result.deleted,
+        result.rollups,
+        result.providers
+    );
     Ok(())
-}
-
-fn source_config(source: &str, local: &LocalUsageConfig) -> anyhow::Result<ClientConfig> {
-    let database = match source {
-        "local" => local.database.clone(),
-        "cc-switch" => std::env::var_os("CC_SWITCH_DB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~/.cc-switch/cc-switch.db")),
-        _ => anyhow::bail!("unknown source {source}; expected local or cc-switch"),
-    };
-    Ok(client_config(database))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let local = LocalUsageConfig::from_env();
-    let rebuild = args.first().is_some_and(|arg| arg == "rebuild");
-    let upload_after_rebuild = rebuild && args.iter().skip(1).any(|arg| arg == "--upload");
-    if rebuild {
-        if args.iter().skip(1).any(|arg| arg != "--upload") {
-            anyhow::bail!("usage: telemetry-client rebuild [--upload]");
+    let source = selected_source(&args);
+    if !matches!(source, "cc-switch" | "local") {
+        anyhow::bail!("unknown source {source}; expected local or cc-switch");
+    }
+    if args.first().is_some_and(|arg| arg == "verify") {
+        if args.as_slice() != ["verify", "--source", "cc-switch"] {
+            anyhow::bail!("usage: telemetry-client verify --source cc-switch");
         }
-        let summary = usage_ledger::rebuild(&local).await?;
-        let state_path = upload_state_path();
-        if state_path.exists() {
-            std::fs::remove_file(&state_path)?;
-        }
+        let read_config = ClientConfig {
+            cc_switch_db: source_database("cc-switch", &local)?,
+            server_url: String::new(),
+            auth_token: String::new(),
+            batch_size: 512,
+            overlap_seconds: 0,
+        };
+        let report = verify_cc_switch_mirror(&read_config, &local.database)?;
         eprintln!(
-            "client ledger rebuilt: path={} imported={} skipped={}",
+            "cc-switch mirror verified: source_db={} ledger={} detail_rows={} rollup_rows={}",
+            read_config.cc_switch_db.display(),
+            local.database.display(),
+            report.detail_rows,
+            report.rollup_rows
+        );
+        return Ok(());
+    }
+    let source_config = source_config(source, &local)?;
+    let upload_config = client_config(local.database.clone())?;
+
+    if args.first().is_some_and(|arg| arg == "rebuild") {
+        let allowed = ["rebuild", "--source", source, "--replace-all", "--upload"];
+        if args.iter().any(|arg| !allowed.contains(&arg.as_str()))
+            || !args.iter().any(|arg| arg == "--replace-all")
+        {
+            anyhow::bail!(
+                "usage: telemetry-client rebuild --source local|cc-switch --replace-all [--upload]"
+            );
+        }
+        let summary = if source == "local" {
+            usage_ledger::rebuild(&local).await?
+        } else {
+            usage_ledger::rebuild_cc_switch(&source_config, &local.database)?
+        };
+        eprintln!(
+            "client ledger rebuilt: source={} path={} imported={} skipped={}",
+            source,
             local.database.display(),
             summary.imported,
             summary.skipped
         );
-        if upload_after_rebuild {
-            let upload_config = client_config(local.database.clone());
-            let mut cursor = Cursor::default();
-            eprintln!(
-                "client upload: ledger={} state={} cursor=reset",
-                local.database.display(),
-                state_path.display()
-            );
-            upload_ledger(&upload_config, &upload_config, &state_path, &mut cursor).await?;
+        if args.iter().any(|arg| arg == "--upload") {
+            let provider_config = if source == "cc-switch" {
+                &source_config
+            } else {
+                &upload_config
+            };
+            upload_ledger(&upload_config, provider_config, source, true).await?;
         }
         return Ok(());
     }
 
-    let source = args
-        .windows(2)
-        .find(|pair| pair[0] == "--source")
-        .map(|pair| pair[1].as_str())
-        .unwrap_or("cc-switch");
     if args
         .first()
         .is_some_and(|arg| arg != "run" && arg != "--source")
@@ -108,24 +140,16 @@ async fn main() -> anyhow::Result<()> {
         || (args.first().is_some_and(|arg| arg == "run") && args.len() > 1 && args[1] != "--source")
     {
         anyhow::bail!(
-            "usage: telemetry-client [rebuild [--upload] | run --source local|cc-switch]"
+            "usage: telemetry-client [verify --source cc-switch | rebuild --source local|cc-switch --replace-all [--upload] | run --source local|cc-switch]"
         );
     }
 
-    let source_config = source_config(source, &local)?;
-    let upload_config = client_config(local.database.clone());
-    let state_path = upload_state_path();
-    let mut upload_cursor = load_cursor(&state_path)?;
     eprintln!(
-        "telemetry-client starting: source={} source_db={} ledger={} upload_state={} upload_cursor=({}, {})",
+        "telemetry-client starting: protocol=v2 source={} source_db={} ledger={}",
         source,
         source_config.cc_switch_db.display(),
         local.database.display(),
-        state_path.display(),
-        upload_cursor.created_at,
-        upload_cursor.request_id,
     );
-
     let mut observed: Option<DatabaseFingerprint> = None;
     loop {
         let changed = match database_fingerprint(&source_config.cc_switch_db) {
@@ -149,14 +173,12 @@ async fn main() -> anyhow::Result<()> {
                             source, summary.imported, summary.skipped
                         );
                     }
-                    match upload_ledger(
-                        &upload_config,
-                        &source_config,
-                        &state_path,
-                        &mut upload_cursor,
-                    )
-                    .await
-                    {
+                    let provider_config = if source == "cc-switch" {
+                        &source_config
+                    } else {
+                        &upload_config
+                    };
+                    match upload_ledger(&upload_config, provider_config, source, false).await {
                         Ok(()) => observed = database_fingerprint(&source_config.cc_switch_db).ok(),
                         Err(error) => eprintln!("client upload error: {error}"),
                     }

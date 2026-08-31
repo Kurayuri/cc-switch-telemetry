@@ -1,13 +1,17 @@
 use anyhow::Context;
 use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 use telemetry_core::{
-    event_id, EventBatch, ProviderEntry, ProviderSnapshot, UsageEvent, SCHEMA_VERSION,
+    rollup_source_key, EventBatch, EventMutation, EventMutationBatch, MutationKind, ProviderEntry,
+    ProviderMutationBatch, ProviderSnapshot, RollupMutation, RollupMutationBatch, SyncBeginRequest,
+    SyncCommitRequest, SyncCommitResponse, UsageEvent, SCHEMA_VERSION,
 };
 
 pub mod usage_ledger;
@@ -19,8 +23,7 @@ const UPLOAD_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 pub struct ClientConfig {
     pub cc_switch_db: PathBuf,
     pub server_url: String,
-    pub node_id: String,
-    pub auth_token: Option<String>,
+    pub auth_token: String,
     pub batch_size: usize,
     pub overlap_seconds: i64,
 }
@@ -50,6 +53,12 @@ pub struct SyncSummary {
     pub duplicates: usize,
     pub rejected: usize,
     pub cursor_advanced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorVerification {
+    pub detail_rows: usize,
+    pub rollup_rows: usize,
 }
 
 fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
@@ -94,11 +103,9 @@ pub fn save_cursor(path: &std::path::Path, cursor: &Cursor) -> anyhow::Result<()
     Ok(())
 }
 
-fn event_from_row(row: &Row<'_>, node_id: &str) -> rusqlite::Result<UsageEvent> {
+fn event_from_row(row: &Row<'_>) -> rusqlite::Result<UsageEvent> {
     let request_id: String = row.get("request_id")?;
     Ok(UsageEvent {
-        event_id: event_id(node_id, &request_id),
-        node_id: node_id.into(),
         request_id,
         created_at: row.get("created_at")?,
         app_type: row.get("app_type")?,
@@ -152,7 +159,7 @@ pub fn read_events(config: &ClientConfig, cursor: &Cursor) -> anyhow::Result<Vec
             cursor.request_id,
             config.batch_size as i64
         ],
-        |row| event_from_row(row, &config.node_id),
+        event_from_row,
     )?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
@@ -170,9 +177,7 @@ pub fn read_provider_snapshot(config: &ClientConfig) -> anyhow::Result<ProviderS
         |row| row.get(0),
     )?;
     if !has_providers {
-        return Ok(usage_ledger::local_provider_snapshot(
-            config.node_id.clone(),
-        ));
+        return Ok(usage_ledger::local_provider_snapshot());
     }
     let mut stmt = conn.prepare(
         "SELECT id, app_type, name FROM providers
@@ -190,7 +195,6 @@ pub fn read_provider_snapshot(config: &ClientConfig) -> anyhow::Result<ProviderS
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ProviderSnapshot {
         schema_version: SCHEMA_VERSION,
-        node_id: config.node_id.clone(),
         providers,
     })
 }
@@ -205,7 +209,6 @@ pub async fn upload(
     );
     let batch = EventBatch {
         schema_version: SCHEMA_VERSION,
-        node_id: config.node_id.clone(),
         events,
     };
     let response = post_json_with_retry(config, &url, &batch).await?;
@@ -226,6 +229,304 @@ pub async fn sync_provider_catalog(config: &ClientConfig) -> anyhow::Result<usiz
     Ok(provider_count)
 }
 
+fn content_hash<T: Serialize>(value: &T) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn mutation_name(operation: &MutationKind) -> &'static str {
+    match operation {
+        MutationKind::Upsert => "upsert",
+        MutationKind::Delete => "delete",
+    }
+}
+
+fn all_events(config: &ClientConfig) -> anyhow::Result<Vec<UsageEvent>> {
+    if config.batch_size == 0 {
+        anyhow::bail!("batch_size must be greater than zero");
+    }
+    let mut cursor = Cursor::default();
+    let mut events = Vec::new();
+    loop {
+        let batch = read_events(config, &cursor)?;
+        if batch.is_empty() {
+            break;
+        }
+        let count = batch.len();
+        let last = batch.last().expect("non-empty event batch");
+        cursor = Cursor {
+            created_at: last.created_at,
+            request_id: last.request_id.clone(),
+        };
+        events.extend(batch);
+        if count < config.batch_size {
+            break;
+        }
+    }
+    Ok(events)
+}
+
+fn hashed_events(events: Vec<UsageEvent>) -> anyhow::Result<BTreeMap<String, String>> {
+    events
+        .into_iter()
+        .map(|event| Ok((event.request_id.clone(), content_hash(&event)?)))
+        .collect()
+}
+
+fn hashed_rollups(
+    rollups: Vec<telemetry_core::RollupSnapshot>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    rollups
+        .into_iter()
+        .map(|rollup| Ok((rollup_source_key(&rollup), content_hash(&rollup)?)))
+        .collect()
+}
+
+fn verify_hash_map(
+    entity: &str,
+    source: &BTreeMap<String, String>,
+    mirror: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let missing = source
+        .keys()
+        .filter(|key| !mirror.contains_key(*key))
+        .count();
+    let extra = mirror
+        .keys()
+        .filter(|key| !source.contains_key(*key))
+        .count();
+    let changed = source
+        .iter()
+        .filter(|(key, hash)| mirror.get(*key).is_some_and(|value| value != *hash))
+        .count();
+    if missing + extra + changed > 0 {
+        let first_key = source
+            .keys()
+            .chain(mirror.keys())
+            .find(|key| source.get(*key) != mirror.get(*key))
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        anyhow::bail!(
+            "{entity} mirror mismatch: missing={missing} extra={extra} changed={changed} first_key={first_key}"
+        );
+    }
+    Ok(())
+}
+
+/// Compare an exact cc-switch source with the Client-owned mirror without
+/// modifying either database. Only stable IDs and content hashes are reported.
+pub fn verify_cc_switch_mirror(
+    source_config: &ClientConfig,
+    ledger_path: &Path,
+) -> anyhow::Result<MirrorVerification> {
+    let mut ledger_config = source_config.clone();
+    ledger_config.cc_switch_db = ledger_path.to_owned();
+    let source_events = hashed_events(all_events(source_config)?)?;
+    let mirror_events = hashed_events(all_events(&ledger_config)?)?;
+    verify_hash_map("detail", &source_events, &mirror_events)?;
+    let source_rollups = hashed_rollups(usage_ledger::read_rollups(&source_config.cc_switch_db)?)?;
+    let mirror_rollups = hashed_rollups(usage_ledger::read_rollups(ledger_path)?)?;
+    verify_hash_map("rollup", &source_rollups, &mirror_rollups)?;
+    Ok(MirrorVerification {
+        detail_rows: source_events.len(),
+        rollup_rows: source_rollups.len(),
+    })
+}
+
+/// Upload ledger changes as an atomic protocol-v2 generation. The first sync
+/// to a remote is a complete replacement; later syncs use a durable content-
+/// hash baseline and send only upserts/deletes. The baseline advances only
+/// after the server commits the generation.
+pub async fn sync_snapshot_v2(
+    ledger_config: &ClientConfig,
+    provider_config: &ClientConfig,
+    source_kind: &str,
+) -> anyhow::Result<SyncCommitResponse> {
+    sync_snapshot_v2_with_mode(ledger_config, provider_config, source_kind, false).await
+}
+
+pub async fn sync_snapshot_v2_with_mode(
+    ledger_config: &ClientConfig,
+    provider_config: &ClientConfig,
+    source_kind: &str,
+    force_replace_all: bool,
+) -> anyhow::Result<SyncCommitResponse> {
+    if !matches!(source_kind, "cc-switch" | "local") {
+        anyhow::bail!("unknown source {source_kind}; expected local or cc-switch");
+    }
+    let events = all_events(ledger_config)?;
+    let rollups = usage_ledger::read_rollups(&ledger_config.cc_switch_db)?;
+    let mut providers = read_provider_snapshot(provider_config)?.providers;
+    providers.sort_by(|left, right| {
+        (&left.app_type, &left.provider_id).cmp(&(&right.app_type, &right.provider_id))
+    });
+    let generation_id = uuid::Uuid::new_v4().to_string();
+    let remote_key = content_hash(&serde_json::json!({
+        "serverUrl": ledger_config.server_url.trim_end_matches('/'),
+        "token": ledger_config.auth_token,
+        "sourceKind": source_kind,
+    }))?;
+    let baseline =
+        usage_ledger::load_upload_baseline(&ledger_config.cc_switch_db, &remote_key, source_kind)?;
+    let replace_all = force_replace_all || !baseline.initialized;
+
+    let mut current_event_hashes = BTreeMap::new();
+    let mut event_mutations = Vec::new();
+    for event in events {
+        let event_hash = content_hash(&event)?;
+        current_event_hashes.insert(event.request_id.clone(), event_hash.clone());
+        if !replace_all && baseline.event_hashes.get(&event.request_id) == Some(&event_hash) {
+            continue;
+        }
+        event_mutations.push(EventMutation {
+            operation: MutationKind::Upsert,
+            request_id: event.request_id.clone(),
+            content_hash: event_hash,
+            event: Some(event),
+        });
+    }
+    if !replace_all {
+        for (request_id, prior_hash) in &baseline.event_hashes {
+            if !current_event_hashes.contains_key(request_id) {
+                event_mutations.push(EventMutation {
+                    operation: MutationKind::Delete,
+                    request_id: request_id.clone(),
+                    content_hash: prior_hash.clone(),
+                    event: None,
+                });
+            }
+        }
+    }
+    event_mutations.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+
+    let mut current_rollup_hashes = BTreeMap::new();
+    let mut rollup_mutations = Vec::new();
+    for snapshot in rollups {
+        let snapshot_key = rollup_source_key(&snapshot);
+        let snapshot_hash = content_hash(&snapshot)?;
+        current_rollup_hashes.insert(snapshot_key.clone(), snapshot_hash.clone());
+        if !replace_all && baseline.rollup_hashes.get(&snapshot_key) == Some(&snapshot_hash) {
+            continue;
+        }
+        rollup_mutations.push(RollupMutation {
+            operation: MutationKind::Upsert,
+            snapshot_key,
+            content_hash: snapshot_hash,
+            snapshot: Some(snapshot),
+        });
+    }
+    if !replace_all {
+        for (snapshot_key, prior_hash) in &baseline.rollup_hashes {
+            if !current_rollup_hashes.contains_key(snapshot_key) {
+                rollup_mutations.push(RollupMutation {
+                    operation: MutationKind::Delete,
+                    snapshot_key: snapshot_key.clone(),
+                    content_hash: prior_hash.clone(),
+                    snapshot: None,
+                });
+            }
+        }
+    }
+    rollup_mutations.sort_by(|left, right| left.snapshot_key.cmp(&right.snapshot_key));
+    let event_manifest = event_mutations
+        .iter()
+        .map(|item| {
+            (
+                item.request_id.as_str(),
+                mutation_name(&item.operation),
+                item.content_hash.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let rollup_manifest = rollup_mutations
+        .iter()
+        .map(|item| {
+            (
+                item.snapshot_key.as_str(),
+                mutation_name(&item.operation),
+                item.content_hash.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let manifest_hash = content_hash(&(event_manifest, rollup_manifest, &providers))?;
+    let base = ledger_config.server_url.trim_end_matches('/');
+    let begin_url = format!("{base}/v2/sync/begin");
+    post_json_with_retry(
+        ledger_config,
+        &begin_url,
+        &SyncBeginRequest {
+            schema_version: SCHEMA_VERSION,
+            generation_id: generation_id.clone(),
+            source_kind: source_kind.to_owned(),
+            replace_all,
+        },
+    )
+    .await?;
+
+    for mutations in event_mutations.chunks(ledger_config.batch_size.clamp(1, 2_000)) {
+        let url = format!("{base}/v2/sync/events");
+        post_json_with_retry(
+            ledger_config,
+            &url,
+            &EventMutationBatch {
+                schema_version: SCHEMA_VERSION,
+                generation_id: generation_id.clone(),
+                mutations: mutations.to_vec(),
+            },
+        )
+        .await?;
+    }
+    for mutations in rollup_mutations.chunks(ledger_config.batch_size.clamp(1, 2_000)) {
+        let url = format!("{base}/v2/sync/rollups");
+        post_json_with_retry(
+            ledger_config,
+            &url,
+            &RollupMutationBatch {
+                schema_version: SCHEMA_VERSION,
+                generation_id: generation_id.clone(),
+                mutations: mutations.to_vec(),
+            },
+        )
+        .await?;
+    }
+    let providers_url = format!("{base}/v2/sync/providers");
+    post_json_with_retry(
+        ledger_config,
+        &providers_url,
+        &ProviderMutationBatch {
+            schema_version: SCHEMA_VERSION,
+            generation_id: generation_id.clone(),
+            providers,
+        },
+    )
+    .await?;
+
+    let commit_url = format!("{base}/v2/sync/commit");
+    let result = post_json_with_retry(
+        ledger_config,
+        &commit_url,
+        &SyncCommitRequest {
+            schema_version: SCHEMA_VERSION,
+            generation_id,
+            expected_event_mutations: event_mutations.len(),
+            expected_rollup_mutations: rollup_mutations.len(),
+            manifest_hash,
+        },
+    )
+    .await?
+    .json()
+    .await
+    .with_context(|| format!("decode protocol-v2 commit response from {commit_url}"))?;
+    usage_ledger::save_upload_baseline(
+        &ledger_config.cc_switch_db,
+        &remote_key,
+        source_kind,
+        &current_event_hashes,
+        &current_rollup_hashes,
+    )?;
+    Ok(result)
+}
+
 async fn post_json_with_retry<T: Serialize>(
     config: &ClientConfig,
     url: &str,
@@ -235,10 +536,10 @@ async fn post_json_with_retry<T: Serialize>(
         .timeout(Duration::from_secs(60))
         .build()?;
     for attempt in 0..UPLOAD_MAX_ATTEMPTS {
-        let mut request = client.post(url).json(payload);
-        if let Some(token) = &config.auth_token {
-            request = request.bearer_auth(token);
-        }
+        let request = client
+            .post(url)
+            .json(payload)
+            .bearer_auth(&config.auth_token);
 
         let response = match request.send().await {
             Ok(response) => response,
@@ -386,8 +687,7 @@ mod tests {
         let config = ClientConfig {
             cc_switch_db: path,
             server_url: "http://localhost".into(),
-            node_id: "n".into(),
-            auth_token: None,
+            auth_token: "test-token".into(),
             batch_size: 10,
             overlap_seconds: 0,
         };
@@ -421,13 +721,11 @@ mod tests {
         let config = ClientConfig {
             cc_switch_db: path,
             server_url: "http://localhost".into(),
-            node_id: "node-a".into(),
-            auth_token: None,
+            auth_token: "test-token".into(),
             batch_size: 10,
             overlap_seconds: 0,
         };
         let snapshot = read_provider_snapshot(&config).unwrap();
-        assert_eq!(snapshot.node_id, "node-a");
         assert_eq!(
             snapshot.providers,
             vec![ProviderEntry {
@@ -487,16 +785,13 @@ mod tests {
         let config = ClientConfig {
             cc_switch_db: PathBuf::from("unused.db"),
             server_url: format!("http://{address}"),
-            node_id: "node-a".into(),
-            auth_token: None,
+            auth_token: "test-token".into(),
             batch_size: 1,
             overlap_seconds: 0,
         };
         let response = upload(
             &config,
             vec![UsageEvent {
-                event_id: "node-a:request-1".into(),
-                node_id: "node-a".into(),
                 request_id: "request-1".into(),
                 created_at: 1,
                 app_type: "codex".into(),
@@ -568,15 +863,21 @@ mod tests {
 
         let server_path = directory.path().join("server.db");
         let server_connection = telemetry_server::init_db(&server_path).unwrap();
+        let (_, token) = telemetry_server::nodes::create(&server_connection, "node-a").unwrap();
         let server_state =
             telemetry_server::ServerState::new(server_connection, server_path.clone(), None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            let legacy_test_router = axum::Router::new()
+                .route(
+                    "/v1/events/batch",
+                    axum::routing::post(telemetry_server::ingest),
+                )
+                .with_state(server_state);
             axum::serve(
                 listener,
-                telemetry_server::router(server_state)
-                    .into_make_service_with_connect_info::<SocketAddr>(),
+                legacy_test_router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
             .unwrap();
@@ -585,8 +886,7 @@ mod tests {
         let config = ClientConfig {
             cc_switch_db: source_path,
             server_url: format!("http://{address}"),
-            node_id: "node-a".into(),
-            auth_token: None,
+            auth_token: token,
             batch_size: 512,
             overlap_seconds: 600,
         };
@@ -636,17 +936,22 @@ mod tests {
         transaction.commit().unwrap();
 
         let server_path = directory.path().join("server.db");
-        let state = telemetry_server::ServerState::new(
-            telemetry_server::init_db(&server_path).unwrap(),
-            server_path.clone(),
-            None,
-        );
+        let server_connection = telemetry_server::init_db(&server_path).unwrap();
+        let (_, token) = telemetry_server::nodes::create(&server_connection, "node-a").unwrap();
+        let state =
+            telemetry_server::ServerState::new(server_connection, server_path.clone(), None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            let legacy_test_router = axum::Router::new()
+                .route(
+                    "/v1/events/batch",
+                    axum::routing::post(telemetry_server::ingest),
+                )
+                .with_state(state);
             axum::serve(
                 listener,
-                telemetry_server::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                legacy_test_router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
             .unwrap();
@@ -654,8 +959,7 @@ mod tests {
         let config = ClientConfig {
             cc_switch_db: source_path,
             server_url: format!("http://{address}"),
-            node_id: "node-a".into(),
-            auth_token: None,
+            auth_token: token,
             batch_size: 512,
             overlap_seconds: 0,
         };
@@ -665,6 +969,178 @@ mod tests {
         assert_eq!(summary.accepted, 10_001);
         assert_eq!(summary.duplicates, 0);
         assert_eq!(cursor.created_at, 10_001);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn protocol_v2_reconciles_amendments_and_rollup_pruning() {
+        let directory = tempfile::tempdir().unwrap();
+        let server_path = directory.path().join("server.db");
+        let server_db = telemetry_server::init_db(&server_path).unwrap();
+        let (node, token) = telemetry_server::nodes::create(&server_db, "node-v2").unwrap();
+        let state = telemetry_server::ServerState::new(server_db, server_path.clone(), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                telemetry_server::router(state)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let ledger = directory.path().join("ledger.db");
+        usage_ledger::init_local_ledger(&ledger).unwrap();
+        let day = chrono::Local::now().date_naive();
+        let (day_start, day_end) =
+            cc_switch_usage_core::local_day_utc_bounds(&chrono::Local, day).unwrap();
+        let created_at = day_start + 60;
+        let connection = Connection::open(&ledger).unwrap();
+        connection
+            .execute(
+                "INSERT INTO proxy_request_logs (
+                     request_id,provider_id,app_type,model,input_tokens,output_tokens,
+                     cache_read_tokens,cache_creation_tokens,input_token_semantics,
+                     total_cost_usd,latency_ms,status_code,is_streaming,created_at,data_source
+                 ) VALUES ('old-row','provider','codex','gpt-5',100,20,10,0,1,
+                           '0.1',30,200,1,?1,'proxy')",
+                [created_at],
+            )
+            .unwrap();
+        drop(connection);
+        let config = ClientConfig {
+            cc_switch_db: ledger.clone(),
+            server_url: format!("http://{address}"),
+            auth_token: token,
+            batch_size: 16,
+            overlap_seconds: 0,
+        };
+
+        let first = sync_snapshot_v2(&config, &config, "local").await.unwrap();
+        assert_eq!(first.inserted, 1);
+        let connection = Connection::open(&server_path).unwrap();
+        let initial: (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),MAX(input_tokens) FROM usage_events WHERE node_id=?1",
+                [&node.uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(initial, (1, 100));
+        drop(connection);
+
+        Connection::open(&ledger)
+            .unwrap()
+            .execute(
+                "UPDATE proxy_request_logs SET input_tokens=125 WHERE request_id='old-row'",
+                [],
+            )
+            .unwrap();
+        let amended = sync_snapshot_v2(&config, &config, "local").await.unwrap();
+        assert_eq!(amended.updated, 1, "historical amendment is an upsert");
+        assert_eq!(amended.inserted, 0);
+        let amended_value: i64 = Connection::open(&server_path)
+            .unwrap()
+            .query_row(
+                "SELECT input_tokens FROM usage_events WHERE node_id=?1 AND request_id='old-row'",
+                [&node.uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(amended_value, 125);
+
+        let mut ledger_connection = Connection::open(&ledger).unwrap();
+        let transaction = ledger_connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO usage_daily_rollups (
+                     date,app_type,provider_id,model,request_model,pricing_model,
+                     request_count,success_count,input_tokens,output_tokens,cache_read_tokens,
+                     cache_creation_tokens,input_token_semantics,total_cost_usd,avg_latency_ms
+                 ) VALUES (?1,'codex','provider','gpt-5','','',1,1,115,20,10,0,2,'0.1',30)",
+                [day.format("%Y-%m-%d").to_string()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "DELETE FROM proxy_request_logs WHERE request_id='old-row'",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        let rolled = sync_snapshot_v2(&config, &config, "local").await.unwrap();
+        assert_eq!(rolled.rollups, 1);
+        assert_eq!(rolled.deleted, 1);
+        let connection = Connection::open(&server_path).unwrap();
+        let detail_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE node_id=?1",
+                [&node.uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rollup_bounds: (i64, i64) = connection
+            .query_row(
+                "SELECT day_start_utc,day_end_utc FROM usage_daily_snapshots WHERE node_id=?1",
+                [&node.uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(detail_count, 0);
+        assert_eq!(rollup_bounds, (day_start, day_end));
+
+        let bad_generation = uuid::Uuid::new_v4().to_string();
+        let http = reqwest::Client::new();
+        let begin = http
+            .post(format!("{}/v2/sync/begin", config.server_url))
+            .bearer_auth(&config.auth_token)
+            .json(&SyncBeginRequest {
+                schema_version: SCHEMA_VERSION,
+                generation_id: bad_generation.clone(),
+                source_kind: "local".into(),
+                replace_all: false,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(begin.status(), reqwest::StatusCode::CREATED);
+        let providers = http
+            .post(format!("{}/v2/sync/providers", config.server_url))
+            .bearer_auth(&config.auth_token)
+            .json(&ProviderMutationBatch {
+                schema_version: SCHEMA_VERSION,
+                generation_id: bad_generation.clone(),
+                providers: Vec::new(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(providers.status(), reqwest::StatusCode::NO_CONTENT);
+        let rejected = http
+            .post(format!("{}/v2/sync/commit", config.server_url))
+            .bearer_auth(&config.auth_token)
+            .json(&SyncCommitRequest {
+                schema_version: SCHEMA_VERSION,
+                generation_id: bad_generation.clone(),
+                expected_event_mutations: 0,
+                expected_rollup_mutations: 0,
+                manifest_hash: "not-the-staged-manifest".into(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+        let generation_status: String = Connection::open(&server_path)
+            .unwrap()
+            .query_row(
+                "SELECT status FROM sync_generations WHERE generation_id=?1",
+                [&bad_generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation_status, "open");
         server.abort();
     }
 }

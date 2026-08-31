@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/cc-switch-usage-core",
     "crates/telemetry-core",
     "crates/session-usage-core",
     "crates/telemetry-server",
@@ -15,12 +16,15 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1"
 axum = "0.7"
+cc-switch-usage-core = { path = "crates/cc-switch-usage-core" }
 chrono = "0.4"
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+rust_decimal = "1.33"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
