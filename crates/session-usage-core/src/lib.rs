@@ -5,6 +5,8 @@
 //! leave persistence, deduplication, and pricing to the caller.
 
 mod pi;
+#[cfg(test)]
+mod provenance;
 
 use anyhow::Context;
 use chrono::DateTime;
@@ -16,6 +18,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub const IMPORTER_SOURCE_COMMIT: &str = "3217f72596f2d1c0f879f0a05f83803825d9809f";
 pub const IMPORTER_REVISION: &str = "cc-switch-3217f725:session-usage-v2-six-source";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

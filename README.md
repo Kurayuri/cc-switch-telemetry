@@ -1,260 +1,214 @@
 # CC Switch Telemetry
 
-CC Switch Telemetry is an independent Rust workspace for collecting usage
-statistics from distributed cc-switch installations. Its default mode reads
-the usage data that cc-switch has already materialized in SQLite and uploads it
-to the server. An explicit local mode can instead materialize raw session
-statistics into an independent, uncompressed SQLite ledger.
+CC Switch Telemetry collects usage accounting from multiple cc-switch nodes.
+Protocol v2 treats cc-switch as the exact-data source of truth, transfers both
+retained request detail and historical daily rollups, and makes each node's
+generation visible atomically.
 
-The server is the sole writer of the central SQLite database. It provides
-authenticated ingestion, idempotent event handling, summary APIs, and an
-embedded local dashboard.
+## Current accounting contract
+
+- `--source cc-switch` is the default and exact-data mode. It mirrors the
+  materialized `proxy_request_logs`, `usage_daily_rollups`, and provider catalog
+  from cc-switch without writing to the source database.
+- This repository carries the Tauri-free `cc-switch-usage-core` policy crate
+  under `crates/cc-switch-usage-core` for fresh-input semantics, Decimal cost
+  calculation, app/model display normalization, cross-source deduplication,
+  and rollup range boundaries. A normal clone is therefore self-contained;
+  policy changes must still be reviewed against cc-switch accounting behavior.
+- `--source local` is an explicit fallback that parses raw Claude, Codex,
+  Gemini, OpenCode, Grok Build, and Pi data into an independent ledger. The
+  repository includes a byte-identical snapshot of all six cc-switch parser
+  modules at commit `3217f72596f2d1c0f879f0a05f83803825d9809f`; the
+  Tauri-free `session-usage-core` adapter owns the executable local-mode path.
+  Exact mode remains the parity authority because it also includes cc-switch's
+  application-level transactions, cursor recovery, pricing, and dedup policy.
+
+The server is the only writer of the central SQLite database. A client token
+maps to one server-managed node UUID; node identity is never accepted from an
+upload body.
 
 ## Workspace layout
 
-- `telemetry-core`: shared wire-format types and identifiers.
-- `telemetry-client`: read-only cc-switch database reader and uploader.
-- `telemetry-server`: central SQLite collector, HTTP API, and embedded dashboard.
-- `session-usage-core`: Tauri-free raw-session parsers synchronized against the
-  pinned cc-switch importer revision.
+- `cc-switch-usage-core`: repository-local, Tauri-free accounting policy shared
+  by the exact-data client and server queries.
+- `telemetry-core`: protocol-v2 request/response and mutation types.
+- `telemetry-client`: source mirror, durable local ledger, hash baseline, and
+  uploader.
+- `telemetry-server`: staged generation commit, central SQLite store, node
+  administration, and embedded Dashboard.
+- `session-usage-core`: six-source raw-session adapter and parser-provenance
+  tests used by explicit local mode.
+- `3rdparty/cc-switch`: exactly six reviewed cc-switch parser modules plus the
+  upstream MIT license; provenance and SHA-256 values are recorded in
+  `PARSER_SNAPSHOT.md`.
 
-## Quick start
-
-Build the workspace with the installed Rust toolchain:
+## Build and test
 
 ```bash
 cargo build --workspace
+cargo test --offline --workspace
+cargo fmt --all -- --check
+cargo clippy --offline --workspace --all-targets -- -D warnings
+scripts/sync-session-usage.sh
 ```
+
+The workspace has no sibling-repository path dependency. The parser snapshot
+pin describes the six vendored parser modules; it does not claim that the
+repository-local policy crate was tracked by that cc-switch commit.
+
+## Run protocol v2
 
 Start the server:
 
 ```bash
-TELEMETRY_TOKEN='replace-with-a-long-random-token' \
+ADMIN_PASSWORD='set-outside-the-repository' \
+TELEMETRY_DB='./data/telemetry-v2.db' \
+TELEMETRY_LISTEN='127.0.0.1:8787' \
   cargo run -p telemetry-server
 ```
 
-Start one client node. Use the real path to the local cc-switch database:
+Use `http://127.0.0.1:8787/admin` to create a node and obtain its one-time
+Bearer token. Start that node's exact-data client:
 
 ```bash
 CC_SWITCH_DB="$HOME/.cc-switch/cc-switch.db" \
+TELEMETRY_LOCAL_USAGE_DB='./data/local-usage.db' \
 TELEMETRY_SERVER_URL='http://127.0.0.1:8787' \
-TELEMETRY_NODE_ID='node-a' \
-TELEMETRY_TOKEN='replace-with-a-long-random-token' \
-  cargo run -p telemetry-client
+TELEMETRY_TOKEN='node-token-from-admin' \
+  cargo run -p telemetry-client -- run --source cc-switch
 ```
 
-The client also has an independent, uncompressed local usage ledger. It is
-built from raw Claude, Codex, Gemini, OpenCode, and Grok Build session data;
-it does not need to write to cc-switch and it never creates a daily rollup:
+The client watches the source database and WAL. It first reconciles the source
+into its local ledger, then opens a server generation:
+
+- A new remote binding, or an explicit rebuild, uploads a full `replaceAll`
+  snapshot.
+- Normal operation compares content hashes with the committed local baseline
+  and sends only event/rollup upserts and deletes.
+- Providers are sent as a complete catalog for each generation.
+- Staged data is invisible until commit; the local hash baseline advances only
+  after a successful server commit. Retrying after a crash is idempotent.
+
+To rebuild the client ledger and force a complete node replacement:
 
 ```bash
-# Rebuild the Client-owned ledger, then immediately upload its complete history.
-cargo run -p telemetry-client -- rebuild --upload
-
-# Continuously update that ledger and upload its detail events.
-cargo run -p telemetry-client -- run --source local
-
-# Mirror cc-switch DB/WAL changes into the same Client-owned ledger, then upload.
-cargo run -p telemetry-client -- run --source cc-switch
+cargo run -p telemetry-client -- \
+  rebuild --source cc-switch --replace-all --upload
 ```
 
-The raw-session adapter is pinned to the cc-switch checkout under
-`3rdparty/cc-switch`. Before changing importer behavior, update the pinned
-revision and review the five upstream `session_usage*.rs` files; the following
-check fails closed if either the revision or their SHA-256 manifest drifts:
+Explicit six-source raw-session mode uses the same command shape with
+`--source local`. Changing the parser revision requires rebuilding the local
+ledger so historical rows are not mixed across parser contracts.
+
+Before or after an upload, compare the exact source and local mirror read-only:
 
 ```bash
-./scripts/sync-session-usage.sh
+cargo run -p telemetry-client -- verify --source cc-switch
 ```
 
-This keeps the telemetry sink independent while making upstream importer
-updates an explicit, reviewable synchronization step.
-
-The client should use a stable, unique `TELEMETRY_NODE_ID` for each cc-switch
-installation. If `TELEMETRY_TOKEN` is set on the server, the same value must be
-set on every client.
+The verifier compares stable detail/rollup keys and content hashes and reports
+only counts plus the first mismatching key; it does not modify either database.
 
 ## Environment variables
 
-The variables below are read directly by the binaries. A variable marked
-`Server and Client` has the same meaning on both sides and should be configured
-consistently.
-
-| Variable | Used by | Default | Meaning |
+| Variable | Component | Default | Meaning |
 | --- | --- | --- | --- |
-| `TELEMETRY_TOKEN` | Server and Client | Unset | Shared bearer token. When set on the server, protected ingestion and summary endpoints require `Authorization: Bearer <token>`; the client sends this token with uploads. When unset, those endpoints do not require authentication. |
-| `TELEMETRY_DB` | Server | `./data/telemetry.db` | Path of the server's central SQLite database. The server creates the parent directory and initializes or migrates its schema on startup. |
-| `TELEMETRY_LISTEN` | Server | `127.0.0.1:8787` | Local address and TCP port on which the server listens. Use an externally reachable address, such as `0.0.0.0:8787`, only when remote clients need to upload directly. |
-| `CC_SWITCH_DB` | Client | `~/.cc-switch/cc-switch.db` | Path of the local cc-switch SQLite database. The client opens it read-only and reads `proxy_request_logs` plus the `providers` table. The binary does not expand `~`, so use an absolute path or expand it in the shell when setting this variable. |
-| `TELEMETRY_SERVER_URL` | Client | `http://127.0.0.1:8787` | Base URL of the telemetry server. The client appends `/v1/events/batch` and `/v1/providers/snapshot` when uploading data. |
-| `TELEMETRY_NODE_ID` | Client | `node-1` | Stable identity of this client node. It is included in every event and provider snapshot and participates in event idempotency. Use a different value for each source cc-switch installation. |
-| `TELEMETRY_STATE` | Legacy Client | `./data/client-cursor.json` | Legacy direct-source cursor; no longer used by current Client versions. |
-| `TELEMETRY_LOCAL_USAGE_DB` | Client local mode | `./data/local-usage.db` | Independent, uncompressed SQLite usage ledger generated from raw session files. |
-| `TELEMETRY_UPLOAD_STATE` | Client | `./data/client-upload-cursor.json` | Upload cursor for the Client-owned ledger. It is reset by `rebuild`. |
-| `TELEMETRY_MODELS_DEV_URL` | Client | `https://models.dev/api.json` | Optional models.dev endpoint override for rebuild pricing and local tests. |
-| `TELEMETRY_LOCAL_STATE` | Legacy Client local mode | `./data/client-local-cursor.json` | Legacy local upload cursor; no longer used by current Client versions. |
-| `TELEMETRY_CLAUDE_DIR`, `TELEMETRY_CODEX_DIR`, `TELEMETRY_GEMINI_DIR`, `TELEMETRY_OPENCODE_DB`, `TELEMETRY_GROK_DIR` | Client local mode | Tool-specific standard paths | Optional raw-session source overrides. |
+| `ADMIN_PASSWORD` | server | unset | Enables local administrator login; never stored in SQLite. |
+| `TELEMETRY_DB` | server | `./data/telemetry.db` | Central SQLite path. |
+| `TELEMETRY_LISTEN` | server | `127.0.0.1:8787` | Listener socket address. |
+| `TELEMETRY_TOKEN` | client | required | Node Bearer token from `/admin`. |
+| `TELEMETRY_SERVER_URL` | client | `http://127.0.0.1:8787` | Server base URL. |
+| `CC_SWITCH_DB` | exact client | `$HOME/.cc-switch/cc-switch.db` | Read-only source database path. |
+| `TELEMETRY_LOCAL_USAGE_DB` | client | `./data/local-usage.db` | Durable mirror/import ledger and upload-hash baseline. |
+| `TELEMETRY_MODELS_DEV_URL` | local client | `https://models.dev/api.json` | Raw-mode pricing endpoint override. |
+| `TELEMETRY_CLAUDE_DIR`, `TELEMETRY_CODEX_DIR`, `TELEMETRY_GEMINI_DIR`, `TELEMETRY_OPENCODE_DB`, `TELEMETRY_GROK_DIR` | local client | tool defaults | Claude, Codex, Gemini, OpenCode, and Grok raw-source overrides. |
+| `TELEMETRY_PI_SESSION_DIR` | local client | `$HOME/.pi/agent/sessions` | Pi flat or project-directory session root. |
 
-The client also follows reqwest's standard proxy discovery. These are not
-`cc-switch-telemetry`-specific variables:
+Reqwest also follows standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+`NO_PROXY` variables.
 
-- `HTTP_PROXY` / `http_proxy`: proxy for HTTP requests.
-- `HTTPS_PROXY` / `https_proxy`: proxy for HTTPS requests.
-- `ALL_PROXY` / `all_proxy`: fallback proxy for supported schemes.
-- `NO_PROXY` / `no_proxy`: comma-separated hosts or addresses that should bypass
-  the proxy.
+## Dashboard semantics
 
-The client does not hard-code a loopback bypass; proxy behavior is determined by
-reqwest and these environment variables.
+Open `http://127.0.0.1:8787/dashboard/`. Dashboard assets and APIs are
+loopback-only; use SSH port forwarding for remote viewing instead of exposing
+them through an unauthenticated proxy.
 
-## Client synchronization
+Summary, trend, and breakdown queries combine:
 
-The Client always uploads from its own durable ledger (`TELEMETRY_LOCAL_USAGE_DB`).
-`run --source local` refreshes that ledger from raw sessions; `run --source cc-switch`
-first mirrors the cc-switch detail table into it. The latter watches both the main
-database file and its `-wal` file every five seconds. A detected change triggers
-the ledger update and then upload; when there is no change, the client does not
-query SQLite.
+1. Effective retained detail after node-scoped proxy/session deduplication.
+2. A rollup only when the requested half-open range `[from, to)` fully covers
+   that source-local day using its transferred UTC bounds.
 
-Each scan:
+Fresh input, Claude Desktop folding, and effective pricing-model grouping use
+the shared cc-switch policy. Latency is request-count weighted. Request-list
+pagination remains retained-detail only because rolled-up rows no longer have
+request-level identity.
 
-- Reads up to 512 rows per batch from the Client ledger using the composite
-  cursor `(created_at, request_id)`, so multiple requests in the same second are
-  not skipped.
-- Keeps source-mirroring and upload cursors separate, so a `rebuild --upload`
-  sends the full rebuilt history regardless of legacy cursors.
-- Drains full batches continuously without sleeping between batches.
-- Sends a provider-name snapshot from cc-switch's `providers` table.
-- Retries transient connection failures and HTTP `408`, `425`, `429`, `500`,
-  `502`, `503`, and `504` responses with exponential backoff.
-- Advances the cursor only after the server acknowledges the batch. Logs report
-  `sent`, `accepted`, `duplicates`, and `rejected` counts.
+Overview responses report `dataScope=detailAndRollup`. `coverage` additionally
+reports `includesDetail`, `includesRollups`, and the latest committed
+`sourceKinds` represented by the selected node set.
 
-The server derives the event id as `node_id + ":" + request_id` and stores it
-with a uniqueness constraint. Re-uploading an already accepted event therefore
-does not count or charge it twice.
+## Protocol v2 API
 
-## Dashboard
+Authenticated node endpoints:
 
-Open the dashboard locally at:
+- `POST /v2/sync/begin`
+- `POST /v2/sync/events`
+- `POST /v2/sync/rollups`
+- `POST /v2/sync/providers`
+- `POST /v2/sync/commit`
 
-```text
-http://127.0.0.1:8787/dashboard/
-```
+Loopback-only Dashboard endpoints:
 
-The HTML, CSS, and JavaScript are embedded in the server binary. No Node.js,
-CDN, or separate frontend deployment is required.
+- `GET /v2/dashboard/overview`
+- `GET /v2/dashboard/daily`
+- `GET /v2/dashboard/filters`
+- `GET /v2/dashboard/events`
 
-The dashboard provides:
+`GET /healthz` is unauthenticated. Product `/v1/*` ingestion, summary, and
+Dashboard API routes return HTTP 426 after cutover.
 
-- Request count, token usage, estimated cost, success rate, cache hit rate, and
-  average latency.
-- Fixed or custom trend buckets, including local-calendar-day views and zero-
-  filled buckets with no events.
-- Top-10 breakdowns by node, application, provider, and model.
-- Combined time, node, application, provider, model, and data-source filters.
-- Stable cursor pagination for recent requests.
-- English and Simplified Chinese localization, with browser-language detection
-  and persisted user selection.
-- Dark and light themes with persisted user selection.
-- Automatic refresh every 30 seconds; refresh pauses while the browser tab is
-  hidden.
+## Maintenance-window cutover
 
-Dashboard HTML, assets, and `/v1/dashboard/*` APIs are restricted to loopback
-clients. This restriction is independent of `TELEMETRY_TOKEN`: remote clients
-can upload data to the server's listening address, but cannot access the
-dashboard through that address.
-
-To view the dashboard from another machine, use SSH port forwarding:
+Do not rebuild a live central database in place. The command below opens the
+old database read-only, refuses an existing target, creates a fresh v2 schema,
+and copies only node UUIDs/token hashes and current provider labels. Usage rows
+must be repopulated by v2 clients.
 
 ```bash
-ssh -L 8787:127.0.0.1:8787 user@server-host
+cargo run -p telemetry-server -- \
+  rebuild-v2 --from ./data/telemetry.db --to ./data/telemetry-v2.db
 ```
 
-Then open `http://127.0.0.1:8787/dashboard/` locally. Do not expose the
-dashboard through an unauthenticated reverse proxy. The server intentionally
-ignores `X-Forwarded-For`; a reverse proxy on the same host is still seen as a
-loopback peer.
+Recommended sequence:
 
-## Data boundaries and semantics
+1. Stop old clients and the old server; retain an immutable backup of the old
+   database and its WAL/SHM as a consistent SQLite backup.
+2. Run `rebuild-v2` to a new path and run `PRAGMA integrity_check` (the command
+   also checks it before success).
+3. Start the v2 server with `TELEMETRY_DB` pointing at the new path.
+4. On every node, use the existing token and run the client rebuild command
+   with `--replace-all --upload`.
+5. Compare node counts, source kinds, complete-day totals, and recent detail
+   against cc-switch before ending the maintenance window.
 
-- The client reuses cc-switch's materialized `proxy_request_logs` records. It
-  does not read raw provider files or session-log text.
-- `created_at` is a Unix epoch timestamp in seconds.
-- Detail events are idempotent by node and request. Daily rollup snapshots are
-  a separate ingestion path reserved for historical days whose detail rows have
-  been removed by cc-switch retention.
-- The dashboard is intentionally **detail-only**: it queries `usage_events` and
-  does not combine them with `usage_daily_snapshots`. Older data may therefore
-  have incomplete coverage; the dashboard reports the covered event range.
-- Token normalization and cache-hit calculations follow cc-switch semantics.
-  Successful requests are those with HTTP status codes from `200` through
-  `299`.
-- Displayed cost is a local estimate calculated from uploaded event pricing
-  data, not a provider invoice.
-- Provider names are synchronized per node and application type. Historical
-  dashboard rows use the current mapped name when available and fall back to the
-  provider ID when no mapping exists.
-- Uploaded data does not contain API keys, prompts, response bodies, or raw
-  session text.
-- The local ledger is detail-only and uncompressed: it has `proxy_request_logs`,
-  and `session_log_sync`, but intentionally has no
-  `usage_daily_rollups` table or retention/pruning job. It can reconstruct raw
-  session usage, not proxy requests that only cc-switch observed; use
-  `--source cc-switch` for those rows.
-- Rebuild pricing is fetched from `https://models.dev/api.json`. The client does
-  not read `model_pricing` or any other pricing table from `cc-switch.db`.
+Rollback is file-level and binary-level: stop v2 components, restore the old
+server/client binaries, and point `TELEMETRY_DB` back to the untouched old
+database. A v2 client cannot fall back to v1 because v1 routes intentionally
+return 426.
 
-## HTTP API
+No command in this repository rotates credentials, edits service definitions,
+switches live database paths, or deploys processes automatically.
 
-### Health endpoint
+## Data and security boundaries
 
-- `GET /healthz` is unauthenticated and reports server/database health.
-
-### Authenticated endpoints
-
-These endpoints use `TELEMETRY_TOKEN` when it is configured:
-
-- `POST /v1/events/batch`
-- `POST /v1/rollups/snapshot`
-- `POST /v1/providers/snapshot`
-- `GET /v1/usage/summary`
-
-### Loopback-only dashboard endpoints
-
-- `GET /dashboard/`
-- `GET /dashboard/favicon.svg`
-- `GET /dashboard/app.js`
-- `GET /dashboard/i18n.js`
-- `GET /dashboard/range.js`
-- `GET /dashboard/styles.css`
-- `GET /v1/dashboard/overview`
-- `GET /v1/dashboard/daily`
-- `GET /v1/dashboard/filters`
-- `GET /v1/dashboard/events`
-
-Dashboard query parameters include:
-
-- `from` and `to`: Unix seconds defining the half-open range `[from, to)`;
-  default is the most recent 24 hours and the maximum range is 365 days.
-- `node_id`, `app_type`, `provider_id`, `model`, and `data_source`: optional
-  exact-match filters.
-- `bucket`: for overview trends, `auto`, a fixed bucket such as `5m` or `1d`,
-  or a custom integer duration such as `10m`. `auto` selects a suitable bucket
-  and returns the resolved value in `range.bucket`.
-- `tz_offset_minutes`: timezone offset used for local-day alignment.
-- `limit`: for events, defaults to 50 and is capped at 200.
-- `before_created_at` and `before_event_id`: paired cursor parameters for
-  loading older events.
-
-The server is the only writer of the central SQLite database. Do not let
-multiple nodes open a shared network SQLite file directly.
-
-## Development checks
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-node --check crates/telemetry-server/web/app.js
-```
+- Uploaded records contain usage metadata, not API keys, prompts, response
+  bodies, or raw session text.
+- Provider labels use `(node_id, app_type, provider_id)` as the stable key; a
+  current rename changes display labels without rewriting historical usage.
+- Daily rollups use normalized fresh-input semantics version 2 and carry exact
+  source-day UTC bounds. Applying a rollup removes that node's overlapping
+  central request detail to prevent double counting.
+- Existing shell scripts in a deployment may contain local credentials. Keep
+  credentials outside source files; this implementation neither reads nor
+  migrates those script values.

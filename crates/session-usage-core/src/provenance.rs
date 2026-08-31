@@ -1,0 +1,44 @@
+use crate::IMPORTER_SOURCE_COMMIT;
+use sha2::{Digest, Sha256};
+use std::{fs, path::Path};
+
+const SNAPSHOT_FILES: [(&str, &str); 6] = [
+    (
+        "session_usage.rs",
+        "7ae348e46f259d19195d8de4f42bea48dd6963ad77441aff94d05d52c44621f9",
+    ),
+    (
+        "session_usage_codex.rs",
+        "eadb325ca4b408c9a330784d3e6e6bca86b235cf0e5ce9a4568c82596e055d03",
+    ),
+    (
+        "session_usage_gemini.rs",
+        "a5b158271a984325d29a6b3fbba99429d96a9729482c99d64cf73cbd82dbf727",
+    ),
+    (
+        "session_usage_grokbuild.rs",
+        "269f0b3250a89b5d562fa1bab41ea1c4aedb7f61f50af961712697b8a8adba55",
+    ),
+    (
+        "session_usage_opencode.rs",
+        "5b423f4deffab6f330e1dfb68852d3a72e26f6c0095417935a1db5545f4bb516",
+    ),
+    (
+        "session_usage_pi.rs",
+        "8e8065b8dcca900ebb70ea0e9d47401176a88e2145a3fe105730061e6ef019f8",
+    ),
+];
+
+#[test]
+fn vendored_parser_snapshot_matches_declared_source() {
+    assert_eq!(
+        IMPORTER_SOURCE_COMMIT,
+        "3217f72596f2d1c0f879f0a05f83803825d9809f"
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../3rdparty/cc-switch/src-tauri/src/services");
+    for (name, expected) in SNAPSHOT_FILES {
+        let bytes = fs::read(root.join(name)).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected, "{name}");
+    }
+}
