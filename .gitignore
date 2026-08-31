@@ -161,16 +161,7 @@ cython_debug/
 #.idea/
 
 # Custom
-/target/
-/data/
-*.sqlite
-*.sqlite-wal
-*.sqlite-shm
-
-# Local operator state and recovery/planning artifacts
-/telemetry-client
-/run_client.sh
-/run_server.sh
-/task_plan.md
-/findings.md
-/progress.md
+target/
+data/
+.planing/
+artifacts/
