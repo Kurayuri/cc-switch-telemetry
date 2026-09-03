@@ -24,7 +24,7 @@ fn client_config(database: PathBuf) -> anyhow::Result<ClientConfig> {
 
 fn source_database(source: &str, local: &LocalUsageConfig) -> anyhow::Result<PathBuf> {
     let database = match source {
-        "local" => local.database.clone(),
+        "local" | "local-compact" => local.database.clone(),
         "cc-switch" => std::env::var_os("CC_SWITCH_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -32,7 +32,7 @@ fn source_database(source: &str, local: &LocalUsageConfig) -> anyhow::Result<Pat
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(".cc-switch/cc-switch.db")
             }),
-        _ => anyhow::bail!("unknown source {source}; expected local or cc-switch"),
+        _ => anyhow::bail!("unknown source {source}; expected local, local-compact, or cc-switch"),
     };
     Ok(database)
 }
@@ -74,8 +74,8 @@ async fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let local = LocalUsageConfig::from_env();
     let source = selected_source(&args);
-    if !matches!(source, "cc-switch" | "local") {
-        anyhow::bail!("unknown source {source}; expected local or cc-switch");
+    if !matches!(source, "cc-switch" | "local" | "local-compact") {
+        anyhow::bail!("unknown source {source}; expected local, local-compact, or cc-switch");
     }
     if args.first().is_some_and(|arg| arg == "verify") {
         if args.as_slice() != ["verify", "--source", "cc-switch"] {
@@ -107,13 +107,14 @@ async fn main() -> anyhow::Result<()> {
             || !args.iter().any(|arg| arg == "--replace-all")
         {
             anyhow::bail!(
-                "usage: telemetry-client rebuild --source local|cc-switch --replace-all [--upload]"
+                "usage: telemetry-client rebuild --source local|local-compact|cc-switch --replace-all [--upload]"
             );
         }
-        let summary = if source == "local" {
-            usage_ledger::rebuild(&local).await?
-        } else {
-            usage_ledger::rebuild_cc_switch(&source_config, &local.database)?
+        let summary = match source {
+            "local" => usage_ledger::rebuild(&local).await?,
+            "local-compact" => usage_ledger::rebuild_compact(&local).await?,
+            "cc-switch" => usage_ledger::rebuild_cc_switch(&source_config, &local.database)?,
+            _ => unreachable!("source was validated above"),
         };
         eprintln!(
             "client ledger rebuilt: source={} path={} imported={} skipped={}",
@@ -140,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         || (args.first().is_some_and(|arg| arg == "run") && args.len() > 1 && args[1] != "--source")
     {
         anyhow::bail!(
-            "usage: telemetry-client [verify --source cc-switch | rebuild --source local|cc-switch --replace-all [--upload] | run --source local|cc-switch]"
+            "usage: telemetry-client [verify --source cc-switch | rebuild --source local|local-compact|cc-switch --replace-all [--upload] | run --source local|local-compact|cc-switch]"
         );
     }
 
@@ -160,10 +161,11 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         if changed {
-            let update = if source == "local" {
-                usage_ledger::sync_local(&local).await
-            } else {
-                usage_ledger::sync_cc_switch(&source_config, &local.database)
+            let update = match source {
+                "local" => usage_ledger::sync_local(&local).await,
+                "local-compact" => usage_ledger::sync_local_compact(&local).await,
+                "cc-switch" => usage_ledger::sync_cc_switch(&source_config, &local.database),
+                _ => unreachable!("source was validated above"),
             };
             match update {
                 Ok(summary) => {

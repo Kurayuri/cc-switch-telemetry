@@ -65,7 +65,10 @@ pub async fn begin(
     };
     if request.generation_id.trim().is_empty()
         || request.source_kind.trim().is_empty()
-        || !matches!(request.source_kind.as_str(), "cc-switch" | "local")
+        || !matches!(
+            request.source_kind.as_str(),
+            "cc-switch" | "local" | "local-compact"
+        )
     {
         return error(StatusCode::BAD_REQUEST, "invalid generation metadata");
     }

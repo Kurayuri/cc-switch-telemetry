@@ -1,9 +1,10 @@
 //! Client-owned usage ledger and source mirror.
 //!
-//! Exact mode mirrors cc-switch detail and rollups. Explicit local mode uses
-//! the vendored six-source `session-usage-core` adapters, then applies the shared
-//! accounting and retention policy. This module also owns the durable v2
-//! upload-hash baseline and synthetic provider catalog.
+//! Exact mode mirrors cc-switch detail and rollups. Explicit `local` mode uses
+//! the vendored six-source `session-usage-core` adapters and retains every
+//! imported detail row. `local-compact` applies the shared 30-day retention
+//! policy after importing. This module also owns the durable v2 upload-hash
+//! baseline and synthetic provider catalog.
 
 use crate::{read_events, ClientConfig, Cursor};
 use anyhow::Context;
@@ -436,7 +437,10 @@ pub(crate) fn save_upload_baseline(
     Ok(())
 }
 
-pub async fn rebuild(config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary> {
+async fn rebuild_with_compaction(
+    config: &LocalUsageConfig,
+    compact: bool,
+) -> anyhow::Result<RebuildSummary> {
     if let Some(parent) = config.database.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -446,7 +450,9 @@ pub async fn rebuild(config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary
     }
     init_local_ledger(&temp)?;
     let summary = sync_into(&temp, config).await?;
-    rollup_local(&temp, 30)?;
+    if compact {
+        rollup_local(&temp, 30)?;
+    }
     let integrity: String = Connection::open(&temp)?
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .context("validate rebuilt local usage ledger")?;
@@ -455,6 +461,14 @@ pub async fn rebuild(config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary
     }
     fs::rename(&temp, &config.database)?;
     Ok(summary)
+}
+
+pub async fn rebuild(config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary> {
+    rebuild_with_compaction(config, false).await
+}
+
+pub async fn rebuild_compact(config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary> {
+    rebuild_with_compaction(config, true).await
 }
 
 pub fn rebuild_cc_switch(
@@ -484,7 +498,11 @@ pub async fn sync_local(config: &LocalUsageConfig) -> anyhow::Result<RebuildSumm
     let connection = Connection::open(&config.database)?;
     bind_source(&connection, "local")?;
     drop(connection);
-    let summary = sync_into(&config.database, config).await?;
+    sync_into(&config.database, config).await
+}
+
+pub async fn sync_local_compact(config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary> {
+    let summary = sync_local(config).await?;
     rollup_local(&config.database, 30)?;
     Ok(summary)
 }
@@ -1112,11 +1130,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_materializes_codex_usage_and_replaces_target() {
+    async fn rebuild_modes_keep_or_compact_old_codex_usage() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("codex/sessions/2026/07/30");
         fs::create_dir_all(&sessions).unwrap();
-        let timestamp = chrono::Utc::now().to_rfc3339();
+        let timestamp = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
         let fixture = r#"{"type":"session_meta","timestamp":"TIMESTAMP","payload":{"id":"019c6e27-e55b-73d1-87d8-4e01f1f75043"}}
 {"type":"turn_context","payload":{"model":"gpt-5"}}
 {"type":"event_msg","timestamp":"TIMESTAMP","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"output_tokens":3,"cached_input_tokens":2}}}}"#
@@ -1129,9 +1147,29 @@ mod tests {
         let local = config(dir.path());
         let summary = rebuild(&local).await.unwrap();
         assert_eq!(summary.imported, 1);
-        let conn = Connection::open(local.database).unwrap();
+        let conn = Connection::open(&local.database).unwrap();
         let row: (String, i64, i64, i64) = conn.query_row("SELECT app_type,input_tokens,output_tokens,cache_read_tokens FROM proxy_request_logs", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
         assert_eq!(row, ("codex".into(), 12, 3, 2));
+        let rollups: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_daily_rollups", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rollups, 0, "local rebuild must retain old detail");
+        drop(conn);
+
+        let compact = rebuild_compact(&local).await.unwrap();
+        assert_eq!(compact.imported, 1);
+        let conn = Connection::open(&local.database).unwrap();
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM proxy_request_logs),
+                        (SELECT COUNT(*) FROM usage_daily_rollups)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 1), "local-compact rebuild must roll old detail");
     }
 
     #[tokio::test]
@@ -1143,6 +1181,50 @@ mod tests {
         let local = config(dir.path());
         rebuild(&local).await.unwrap();
         assert_eq!(sync_local(&local).await.unwrap().imported, 0);
+    }
+
+    #[tokio::test]
+    async fn local_compaction_requires_the_explicit_compact_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = config(dir.path());
+        init_local_ledger(&local.database).unwrap();
+        let old_timestamp = chrono::Utc::now().timestamp() - 40 * 86_400;
+        Connection::open(&local.database)
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_request_logs (
+                   request_id,provider_id,app_type,model,input_tokens,output_tokens,
+                   cache_read_tokens,cache_creation_tokens,input_token_semantics,
+                   total_cost_usd,latency_ms,status_code,is_streaming,created_at,data_source
+                 ) VALUES ('old-detail','provider','codex','gpt-5',100,50,10,2,1,
+                           '0.25',200,200,1,?1,'session_log')",
+                [old_timestamp],
+            )
+            .unwrap();
+
+        sync_local(&local).await.unwrap();
+        let after_local: (i64, i64) = Connection::open(&local.database)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM proxy_request_logs),
+                        (SELECT COUNT(*) FROM usage_daily_rollups)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after_local, (1, 0));
+
+        sync_local_compact(&local).await.unwrap();
+        let after_compact: (i64, i64) = Connection::open(&local.database)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM proxy_request_logs),
+                        (SELECT COUNT(*) FROM usage_daily_rollups)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after_compact, (0, 1));
     }
 
     #[test]

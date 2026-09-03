@@ -351,8 +351,8 @@ pub async fn sync_snapshot_v2_with_mode(
     source_kind: &str,
     force_replace_all: bool,
 ) -> anyhow::Result<SyncCommitResponse> {
-    if !matches!(source_kind, "cc-switch" | "local") {
-        anyhow::bail!("unknown source {source_kind}; expected local or cc-switch");
+    if !matches!(source_kind, "cc-switch" | "local" | "local-compact") {
+        anyhow::bail!("unknown source {source_kind}; expected local, local-compact, or cc-switch");
     }
     let events = all_events(ledger_config)?;
     let rollups = usage_ledger::read_rollups(&ledger_config.cc_switch_db)?;
@@ -973,7 +973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_v2_reconciles_amendments_and_rollup_pruning() {
+    async fn protocol_v2_retains_old_detail_until_client_rollup_replaces_day() {
         let directory = tempfile::tempdir().unwrap();
         let server_path = directory.path().join("server.db");
         let server_db = telemetry_server::init_db(&server_path).unwrap();
@@ -993,7 +993,7 @@ mod tests {
 
         let ledger = directory.path().join("ledger.db");
         usage_ledger::init_local_ledger(&ledger).unwrap();
-        let day = chrono::Local::now().date_naive();
+        let day = chrono::Local::now().date_naive() - chrono::Duration::days(40);
         let (day_start, day_end) =
             cc_switch_usage_core::local_day_utc_bounds(&chrono::Local, day).unwrap();
         let created_at = day_start + 60;
@@ -1018,7 +1018,9 @@ mod tests {
             overlap_seconds: 0,
         };
 
-        let first = sync_snapshot_v2(&config, &config, "local").await.unwrap();
+        let first = sync_snapshot_v2(&config, &config, "local-compact")
+            .await
+            .unwrap();
         assert_eq!(first.inserted, 1);
         let connection = Connection::open(&server_path).unwrap();
         let initial: (i64, i64) = connection
@@ -1038,7 +1040,9 @@ mod tests {
                 [],
             )
             .unwrap();
-        let amended = sync_snapshot_v2(&config, &config, "local").await.unwrap();
+        let amended = sync_snapshot_v2(&config, &config, "local-compact")
+            .await
+            .unwrap();
         assert_eq!(amended.updated, 1, "historical amendment is an upsert");
         assert_eq!(amended.inserted, 0);
         let amended_value: i64 = Connection::open(&server_path)
@@ -1070,7 +1074,9 @@ mod tests {
             )
             .unwrap();
         transaction.commit().unwrap();
-        let rolled = sync_snapshot_v2(&config, &config, "local").await.unwrap();
+        let rolled = sync_snapshot_v2(&config, &config, "local-compact")
+            .await
+            .unwrap();
         assert_eq!(rolled.rollups, 1);
         assert_eq!(rolled.deleted, 1);
         let connection = Connection::open(&server_path).unwrap();
@@ -1099,7 +1105,7 @@ mod tests {
             .json(&SyncBeginRequest {
                 schema_version: SCHEMA_VERSION,
                 generation_id: bad_generation.clone(),
-                source_kind: "local".into(),
+                source_kind: "local-compact".into(),
                 replace_all: false,
             })
             .send()

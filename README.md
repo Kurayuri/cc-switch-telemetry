@@ -16,8 +16,14 @@ generation visible atomically.
   and rollup range boundaries. A normal clone is therefore self-contained;
   policy changes must still be reviewed against cc-switch accounting behavior.
 - `--source local` is an explicit fallback that parses raw Claude, Codex,
-  Gemini, OpenCode, Grok Build, and Pi data into an independent ledger. The
-  repository includes a byte-identical snapshot of all six cc-switch parser
+  Gemini, OpenCode, Grok Build, and Pi data into an independent ledger and
+  retains every imported request-detail row. It never performs age-based
+  compaction.
+- `--source local-compact` uses the same raw parsers but aggregates complete
+  source-local days older than 30 days into `usage_daily_rollups` and deletes
+  only the corresponding `proxy_request_logs`. The two tables together remain
+  the complete local history.
+- The repository includes a byte-identical snapshot of all six cc-switch parser
   modules at commit `3217f72596f2d1c0f879f0a05f83803825d9809f`; the
   Tauri-free `session-usage-core` adapter owns the executable local-mode path.
   Exact mode remains the parity authority because it also includes cc-switch's
@@ -97,8 +103,16 @@ cargo run -p telemetry-client -- \
 ```
 
 Explicit six-source raw-session mode uses the same command shape with
-`--source local`. Changing the parser revision requires rebuilding the local
-ledger so historical rows are not mixed across parser contracts.
+`--source local` to keep all request detail, or `--source local-compact` to
+apply the 30-day daily-rollup policy. Changing the parser revision requires
+rebuilding the local ledger so historical rows are not mixed across parser
+contracts. Returning from compacted history to full detail also requires an
+explicit full rebuild so old raw sessions are parsed again:
+
+```bash
+cargo run -p telemetry-client -- \
+  rebuild --source local --replace-all --upload
+```
 
 Before or after an upload, compare the exact source and local mirror read-only:
 
@@ -143,6 +157,13 @@ Fresh input, Claude Desktop folding, and effective pricing-model grouping use
 the shared cc-switch policy. Latency is request-count weighted. Request-list
 pagination remains retained-detail only because rolled-up rows no longer have
 request-level identity.
+
+The server never performs scheduled or age-based compaction. It retains every
+uploaded detail event unless the client supplies a daily rollup for that exact
+complete source-local day. Applying that client rollup replaces only the
+overlapping central detail, so central `usage_events` plus
+`usage_daily_snapshots` represents the same complete, non-overlapping history
+as client `proxy_request_logs` plus `usage_daily_rollups`.
 
 Overview responses report `dataScope=detailAndRollup`. `coverage` additionally
 reports `includesDetail`, `includesRollups`, and the latest committed
@@ -197,8 +218,36 @@ server/client binaries, and point `TELEMETRY_DB` back to the untouched old
 database. A v2 client cannot fall back to v1 because v1 routes intentionally
 return 426.
 
-No command in this repository rotates credentials, edits service definitions,
-switches live database paths, or deploys processes automatically.
+## User systemd services
+
+Install automatically creates the deployment launcher and service unit under
+`artifacts/`. The launcher is copied from its matching `scripts/run_*.sh`
+template only when it does not already exist, so rerunning install never
+overwrites local credentials. The generated artifact unit is linked into
+`~/.config/systemd/user/`. Artifact files are ignored by Git because launchers
+may contain credentials.
+
+On a first install, replace `xxxxx` in the generated launcher and rerun the
+installer. A launcher that still contains the placeholder is linked but is not
+enabled or started. Install or remove the release-mode user services explicitly:
+
+```bash
+./scripts/install-server-service.sh
+./scripts/install-client-service.sh
+
+./scripts/uninstall-client-service.sh
+./scripts/uninstall-server-service.sh
+```
+
+Install scripts build the selected release binary, render the artifact unit,
+link it into the user systemd directory, enable it, restart it, and verify that
+it is active. Uninstall scripts stop the service and remove the systemd link
+plus generated artifact unit; they preserve project data, release binaries,
+and credential-bearing artifact launchers.
+
+No command in this repository rotates credentials or switches live database
+paths automatically. Service deployment occurs only when an install or
+uninstall script above is invoked explicitly.
 
 ## Data and security boundaries
 
@@ -207,8 +256,9 @@ switches live database paths, or deploys processes automatically.
 - Provider labels use `(node_id, app_type, provider_id)` as the stable key; a
   current rename changes display labels without rewriting historical usage.
 - Daily rollups use normalized fresh-input semantics version 2 and carry exact
-  source-day UTC bounds. Applying a rollup removes that node's overlapping
-  central request detail to prevent double counting.
+  source-day UTC bounds. The server does not generate rollups; applying a
+  client-supplied rollup removes only that node's overlapping central request
+  detail to prevent double counting.
 - Existing shell scripts in a deployment may contain local credentials. Keep
   credentials outside source files; this implementation neither reads nor
   migrates those script values.
