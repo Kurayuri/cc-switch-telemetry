@@ -836,7 +836,8 @@ fn mirror_rollups(source_config: &ClientConfig, ledger: &Connection) -> anyhow::
             "SELECT date,app_type,provider_id,model,request_model,pricing_model,
                     request_count,success_count,input_tokens,output_tokens,
                     cache_read_tokens,cache_creation_tokens,{semantics},total_cost_usd,
-                    avg_latency_ms FROM usage_daily_rollups"
+                    CAST(avg_latency_ms AS INTEGER) AS avg_latency_ms
+             FROM usage_daily_rollups"
         );
         let mut statement = source.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
@@ -951,7 +952,8 @@ pub fn read_rollups(path: &Path) -> anyhow::Result<Vec<RollupSnapshot>> {
     let mut statement = connection.prepare(
         "SELECT date,app_type,provider_id,model,request_model,pricing_model,
                 request_count,success_count,input_tokens,output_tokens,cache_read_tokens,
-                cache_creation_tokens,input_token_semantics,total_cost_usd,avg_latency_ms
+                cache_creation_tokens,input_token_semantics,total_cost_usd,
+                CAST(avg_latency_ms AS INTEGER) AS avg_latency_ms
          FROM usage_daily_rollups ORDER BY date,app_type,provider_id,model,request_model,pricing_model",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1332,9 +1334,31 @@ mod tests {
                 );
                 INSERT INTO proxy_request_logs VALUES
                     ('request-a', 10, 'codex', 'provider', 'model', '', '', 1, 2, 0, 0, 1, '0', 3, 200, 1, 'proxy'),
-                    ('request-b', 11, 'codex', 'provider', 'model', '', '', 4, 5, 0, 0, 1, '0', 6, 200, 1, 'proxy');",
+                    ('request-b', 11, 'codex', 'provider', 'model', '', '', 4, 5, 0, 0, 1, '0', 6, 200, 1, 'proxy');
+                CREATE TABLE usage_daily_rollups (
+                    date TEXT, app_type TEXT, provider_id TEXT, model TEXT,
+                    request_model TEXT, pricing_model TEXT, request_count INTEGER,
+                    success_count INTEGER, input_tokens INTEGER, output_tokens INTEGER,
+                    cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
+                    input_token_semantics INTEGER, total_cost_usd TEXT,
+                    avg_latency_ms INTEGER
+                );
+                INSERT INTO usage_daily_rollups VALUES
+                    ('2026-07-21', 'codex', 'provider', 'model', '', '',
+                     3, 3, 30, 6, 0, 0, 2, '0.3', 4183.38333333333),
+                    ('2026-07-22', 'codex', 'provider', 'model', '', '',
+                     2, 2, 20, 4, 0, 0, 2, '0.2', 100);",
             )
             .unwrap();
+        let source_latency_type: String = source_conn
+            .query_row(
+                "SELECT typeof(avg_latency_ms) FROM usage_daily_rollups
+                 WHERE date='2026-07-21'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_latency_type, "real");
         let local = config(dir.path());
         let source_config = ClientConfig {
             cc_switch_db: source,
@@ -1356,9 +1380,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 2);
+        let mirrored_latency: (i64, String) = Connection::open(&local.database)
+            .unwrap()
+            .query_row(
+                "SELECT avg_latency_ms,typeof(avg_latency_ms)
+                 FROM usage_daily_rollups WHERE date='2026-07-21'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mirrored_latency, (4183, "integer".into()));
         let verified = crate::verify_cc_switch_mirror(&source_config, &local.database).unwrap();
         assert_eq!(verified.detail_rows, 2);
-        assert_eq!(verified.rollup_rows, 0);
+        assert_eq!(verified.rollup_rows, 2);
         source_conn
             .execute(
                 "UPDATE proxy_request_logs SET input_tokens=99 WHERE request_id='request-a'",
