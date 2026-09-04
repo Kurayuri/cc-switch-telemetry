@@ -1,24 +1,31 @@
 # CC Switch Telemetry
 
 CC Switch Telemetry collects usage accounting from multiple cc-switch nodes.
-Protocol v2 treats cc-switch as the exact-data source of truth, transfers both
-retained request detail and historical daily rollups, and makes each node's
-generation visible atomically.
+Protocol v3 uses one Client-owned usage ledger as the source of truth, transfers
+retained request detail and historical daily rollups atomically, and keeps
+cross-`data_source` adjudication out of the Server.
 
 ## Current accounting contract
 
-- `--source cc-switch` is the default and exact-data mode. It mirrors the
-  materialized `proxy_request_logs`, `usage_daily_rollups`, and provider catalog
-  from cc-switch without writing to the source database.
+- `--source cc-switch` is the default and exact-data collector. It reconciles
+  cc-switch `proxy_request_logs`, `usage_daily_rollups`, and provider catalog
+  from `CC_SWITCH_DB` (default `~/.cc-switch/cc-switch.db`) into the shared
+  Client ledger without writing to the source database. Stored request costs,
+  token semantics, and fractional rollup latency are preserved; they are not
+  recalculated by telemetry.
 - This repository carries the Tauri-free `cc-switch-usage-core` policy crate
   under `crates/cc-switch-usage-core` for fresh-input semantics, Decimal cost
   calculation, app/model display normalization, cross-source deduplication,
   and rollup range boundaries. A normal clone is therefore self-contained;
   policy changes must still be reviewed against cc-switch accounting behavior.
 - `--source local` is an explicit fallback that parses raw Claude, Codex,
-  Gemini, OpenCode, Grok Build, and Pi data into an independent ledger and
-  retains every imported request-detail row. It never performs age-based
-  compaction.
+  Gemini, OpenCode, Grok Build, and Pi data into the same Client ledger and
+  retains every imported request-detail row. Run only one collector mode in a
+  Client process. Exact `(app_type, request_id)` conflicts are owned by the
+  active collector; collector-scoped cleanup does not erase another
+  collector's unrelated rows. Local mode scans those tools' session stores
+  directly and prices reconstructed usage from models.dev, so its history and
+  costs are not expected to equal cc-switch's persisted accounting.
 - `--source local-compact` uses the same raw parsers but aggregates complete
   source-local days older than 30 days into `usage_daily_rollups` and deletes
   only the corresponding `proxy_request_logs`. The two tables together remain
@@ -27,7 +34,14 @@ generation visible atomically.
   modules at commit `3217f72596f2d1c0f879f0a05f83803825d9809f`; the
   Tauri-free `session-usage-core` adapter owns the executable local-mode path.
   Exact mode remains the parity authority because it also includes cc-switch's
-  application-level transactions, cursor recovery, pricing, and dedup policy.
+  application-level transactions, cursor recovery, pricing, and source
+  adjudication policy.
+
+The Client suppresses proxy/session duplicates before they enter its ledger.
+The Server stores exactly what the Client sends and never applies a second
+cross-source heuristic. A request row is identified by
+`(server-derived node_id, raw app_type, request_id)`; `provider_id` is mutable
+metadata and can be corrected without creating another logical request.
 
 The server is the only writer of the central SQLite database. A client token
 maps to one server-managed node UUID; node identity is never accepted from an
@@ -37,7 +51,7 @@ upload body.
 
 - `cc-switch-usage-core`: repository-local, Tauri-free accounting policy shared
   by the exact-data client and server queries.
-- `telemetry-core`: protocol-v2 request/response and mutation types.
+- `telemetry-core`: protocol-v3 request/response and mutation types.
 - `telemetry-client`: source mirror, durable local ledger, hash baseline, and
   uploader, plus the independent Codex quota collector/history ledger.
 - `telemetry-server`: staged generation commit, central SQLite store, node
@@ -62,13 +76,13 @@ The workspace has no sibling-repository path dependency. The parser snapshot
 pin describes the six vendored parser modules; it does not claim that the
 repository-local policy crate was tracked by that cc-switch commit.
 
-## Run protocol v2
+## Run protocol v3
 
 Start the server:
 
 ```bash
 ADMIN_PASSWORD='set-outside-the-repository' \
-TELEMETRY_DB='./data/telemetry-v2.db' \
+TELEMETRY_DB='./data/telemetry.db' \
 TELEMETRY_LISTEN='127.0.0.1:8787' \
   cargo run -p telemetry-server
 ```
@@ -110,6 +124,9 @@ apply the 30-day daily-rollup policy. Changing the parser revision requires
 rebuilding the local ledger so historical rows are not mixed across parser
 contracts. Returning from compacted history to full detail also requires an
 explicit full rebuild so old raw sessions are parsed again:
+
+Do not use either local mode to reconcile the Server against cc-switch. For
+that operation, `--source cc-switch` is the only authoritative source.
 
 ```bash
 cargo run -p telemetry-client -- \
@@ -182,11 +199,24 @@ Open `http://127.0.0.1:8787/dashboard/`. Dashboard assets and APIs are
 loopback-only; use SSH port forwarding for remote viewing instead of exposing
 them through an unauthenticated proxy.
 
+Trend, quota, and daily calendar visualizations use the self-hosted Apache
+ECharts 6.1.0 ESM bundle in `crates/telemetry-server/web/vendor/`; no CDN or
+frontend build step is required. The bundle, license, notice, version, and
+integrity metadata are packaged with the server source.
+
 Summary, trend, and breakdown queries combine:
 
-1. Effective retained detail after node-scoped proxy/session deduplication.
+1. Client-adjudicated retained detail, with every Server row counted exactly
+   once and no additional Server-side proxy/session deduplication.
 2. A rollup only when the requested half-open range `[from, to)` fully covers
    that source-local day using its transferred UTC bounds.
+
+The Server builds disposable, dimension-complete hourly aggregates in the
+background when its shared writer is idle. Only completed UTC hours marked
+`clean` are read from cache. Dirty hours, partial range edges, and trend buckets
+that cannot be represented exactly fall back to `usage_events`, so cache work
+never changes query results. Client-authored `usage_daily_snapshots` remain
+authoritative retained history and are not part of this derived cache.
 
 Fresh input, Claude Desktop folding, and effective pricing-model grouping use
 the shared cc-switch policy. Latency is request-count weighted. Request-list
@@ -204,67 +234,81 @@ Explicit utilization and balances derivable from `used / total` or
 without a usable total use the right amount axis; their native unit remains in
 the legend.
 
-The server never performs scheduled or age-based compaction. It retains every
-uploaded detail event unless the client supplies a daily rollup for that exact
-complete source-local day. Applying that client rollup replaces only the
+The Server never performs scheduled retention compaction. It retains every
+uploaded detail event unless the Client supplies a daily rollup for that exact
+complete source-local day. Applying that Client rollup replaces only the
 overlapping central detail, so central `usage_events` plus
 `usage_daily_snapshots` represents the same complete, non-overlapping history
-as client `proxy_request_logs` plus `usage_daily_rollups`.
+as Client `proxy_request_logs` plus `usage_daily_rollups`.
 
 Overview responses report `dataScope=detailAndRollup`. `coverage` additionally
-reports `includesDetail`, `includesRollups`, and the latest committed
-`sourceKinds` represented by the selected node set.
+reports `includesDetail` and `includesRollups`.
 
-## Protocol v2 API
+## Protocol v3 API
 
 Authenticated node endpoints:
 
-- `POST /v2/sync/begin`
-- `POST /v2/sync/events`
-- `POST /v2/sync/rollups`
-- `POST /v2/sync/providers`
-- `POST /v2/sync/commit`
-- `POST /v2/quota/observations`
+- `POST /v3/sync/begin`
+- `POST /v3/sync/events`
+- `POST /v3/sync/rollups`
+- `POST /v3/sync/providers`
+- `POST /v3/sync/commit`
+- `POST /v3/quota/observations`
 
 Loopback-only Dashboard endpoints:
 
-- `GET /v2/dashboard/overview`
-- `GET /v2/dashboard/daily`
-- `GET /v2/dashboard/filters`
-- `GET /v2/dashboard/events`
-- `GET /v2/dashboard/quota?from=&to=&bucket=&node_id=&provider_id=`
+- `GET /v3/dashboard/overview`
+- `GET /v3/dashboard/daily`
+- `GET /v3/dashboard/filters`
+- `GET /v3/dashboard/events`
+- `GET /v3/dashboard/quota?from=&to=&bucket=&node_id=&provider_id=`
 
-`GET /healthz` is unauthenticated. Product `/v1/*` ingestion, summary, and
-Dashboard API routes return HTTP 426 after cutover.
+Authenticated Admin log lifecycle endpoints:
+
+- `GET /admin/api/logs/preview?kind=request|quota&node_id=`
+- `POST /admin/api/logs/purge`
+
+The Admin UI requires previewing the exact affected tables and typing the
+Server-provided confirmation string before deletion. Request and quota deletion
+are separate operations and may target all nodes or one node. Request deletion
+also removes derived cache and synchronization staging, but preserves the node,
+its token, and provider labels. Deleted request history is not automatically
+replayed from an unchanged Client baseline; use an explicit Client rebuild with
+`--replace-all --upload` when restoration is intended.
+
+`GET /healthz` is unauthenticated. Product `/v1/*` and protocol `/v2/*` routes
+return HTTP 426 after cutover.
 
 ## Maintenance-window cutover
 
-Do not rebuild a live central database in place. The command below opens the
-old database read-only, refuses an existing target, creates a fresh v2 schema,
-and copies only node UUIDs/token hashes and current provider labels. Usage rows
-must be repopulated by v2 clients.
-
-```bash
-cargo run -p telemetry-server -- \
-  rebuild-v2 --from ./data/telemetry.db --to ./data/telemetry-v2.db
-```
+Starting the v3 Server migrates an existing v2 database transactionally. It
+rebuilds request identity and synchronization tables, preserves request detail,
+daily rollups, quota history, nodes, tokens, and provider labels, discards only
+incompatible uncommitted generation/staging state, and runs a foreign-key
+check. Do not perform the first migration while old clients or the old Server
+are still writing.
 
 Recommended sequence:
 
 1. Stop old clients and the old server; retain an immutable backup of the old
    database and its WAL/SHM as a consistent SQLite backup.
-2. Run `rebuild-v2` to a new path and run `PRAGMA integrity_check` (the command
-   also checks it before success).
-3. Start the v2 server with `TELEMETRY_DB` pointing at the new path.
-4. On every node, use the existing token and run the client rebuild command
-   with `--replace-all --upload`.
-5. Compare node counts, source kinds, complete-day totals, and recent detail
-   against cc-switch before ending the maintenance window.
+2. Start the v3 Server once with `TELEMETRY_DB` pointing at the backed-up
+   database, then verify `/healthz`, `PRAGMA integrity_check`, and
+   `PRAGMA foreign_key_check`.
+3. On every node, install the v3 Client and rebuild its local ledger. The v3
+   schema revision intentionally rejects an old source-bound ledger:
 
-Rollback is file-level and binary-level: stop v2 components, restore the old
-server/client binaries, and point `TELEMETRY_DB` back to the untouched old
-database. A v2 client cannot fall back to v1 because v1 routes intentionally
-return 426.
+   ```bash
+   cargo run -p telemetry-client -- \
+     rebuild --source cc-switch --replace-all --upload
+   ```
+
+4. Compare per-node request counts, complete-day totals, quota history, and
+   recent detail against the source before ending the maintenance window.
+
+Rollback is file-level and binary-level: stop v3 components, restore the
+consistent v2 database backup and old binaries, then restart the old services.
+A v2 Client cannot upload to v3 because all v2 routes intentionally return 426.
 
 ## User systemd services
 

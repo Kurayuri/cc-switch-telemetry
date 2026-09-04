@@ -178,7 +178,7 @@ fn content_hash(observation: &QuotaObservation) -> Result<String, serde_json::Er
 
 fn validate_batch(batch: &QuotaUploadBatch) -> Result<(), &'static str> {
     if batch.schema_version != SCHEMA_VERSION {
-        return Err("telemetry protocol v2 is required");
+        return Err("telemetry protocol v3 is required");
     }
     let metric_count = batch
         .observations
@@ -399,7 +399,9 @@ pub async fn ingest(
 }
 
 pub fn ingest_routes() -> Router<ServerState> {
-    Router::new().route("/v2/quota/observations", post(ingest))
+    Router::new()
+        .route("/v3/quota/observations", post(ingest))
+        .route("/v2/quota/observations", post(super::upgrade_required))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -975,7 +977,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v2/quota/observations")
+                    .uri("/v3/quota/observations")
                     .header("content-type", "application/json")
                     .body(Body::from(body.clone()))
                     .unwrap(),
@@ -988,7 +990,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v2/quota/observations")
+                    .uri("/v3/quota/observations")
                     .header("content-type", "application/json")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::from(body))
@@ -1013,7 +1015,7 @@ mod tests {
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
             .oneshot(
                 Request::builder()
-                    .uri("/v2/dashboard/quota?from=1799999900&to=1800000100&bucket=1m")
+                    .uri("/v3/dashboard/quota?from=1799999900&to=1800000100&bucket=1m")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -1,3 +1,10 @@
+import * as echarts from "./vendor/echarts.esm.min.mjs";
+import {
+  buildDailyOption,
+  buildQuotaOption,
+  buildTrendOption,
+  tooltipMarkup,
+} from "./charts.js";
 import { createFormatters, resolveLocale, translate } from "./i18n.js";
 import {
   DAY_SECONDS,
@@ -26,7 +33,6 @@ import {
 } from "./quota-view.js";
 
 const $ = (id) => document.getElementById(id);
-const svgNs = "http://www.w3.org/2000/svg";
 const localeStorageKey = "cc-switch-telemetry.locale";
 const themeStorageKey = "cc-switch-telemetry.theme";
 
@@ -103,7 +109,6 @@ const elements = {
   resolvedBucket: $("resolvedBucket"),
   trendChart: $("trendChart"),
   trendEmpty: $("trendEmpty"),
-  trendTooltip: $("trendTooltip"),
   coverageText: $("coverageText"),
   quotaNodeFilter: $("quotaNodeFilter"),
   quotaProviderFilter: $("quotaProviderFilter"),
@@ -111,7 +116,6 @@ const elements = {
   quotaCards: $("quotaCards"),
   quotaEmpty: $("quotaEmpty"),
   quotaChart: $("quotaChart"),
-  quotaLegend: $("quotaLegend"),
   quotaBucket: $("quotaBucket"),
   kpiInputTotal: $("kpiInputTotal"),
   kpiOutputTotal: $("kpiOutputTotal"),
@@ -131,9 +135,7 @@ const elements = {
   loadMore: $("loadMore"),
   dailyMetric: $("dailyMetric"),
   dailyEmpty: $("dailyEmpty"),
-  dailyPanel: $("dailyPanel"),
   dailyHeatmap: $("dailyHeatmap"),
-  dailyTooltip: $("dailyTooltip"),
 };
 
 const state = {
@@ -156,6 +158,61 @@ const state = {
   trendBucket: "auto",
   connection: { status: "", key: "status.connecting" },
 };
+
+const chartInstances = {
+  trend: null,
+  quota: null,
+  daily: null,
+};
+
+function reducedMotion() {
+  return typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+function cssColor(name, fallback) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+}
+
+function chartPalette() {
+  return {
+    text: cssColor("--text", "#f3f7fb"),
+    muted: cssColor("--muted", "#94a2ba"),
+    faint: cssColor("--faint", "#63708a"),
+    border: cssColor("--border", "rgba(148, 163, 184, 0.16)"),
+    borderStrong: cssColor("--border-strong", "rgba(148, 163, 184, 0.3)"),
+    surfaceSolid: cssColor("--surface-solid", "#111827"),
+    surfaceRaised: cssColor("--surface-raised", "#182237"),
+    accent: cssColor("--accent", "#62e6d1"),
+    accentArea: cssColor("--accent-soft", "rgba(45, 212, 191, 0.12)"),
+    accentShadow: "rgba(45, 212, 191, 0.28)",
+    transparent: "rgba(0, 0, 0, 0)",
+  };
+}
+
+function ensureChart(name, element) {
+  if (!chartInstances[name]) {
+    chartInstances[name] = echarts.init(element, null, { renderer: "canvas" });
+  }
+  return chartInstances[name];
+}
+
+function updateChart(name, element, option) {
+  element.hidden = false;
+  const chart = ensureChart(name, element);
+  chart.resize();
+  chart.setOption(option, { replaceMerge: ["series"], lazyUpdate: false });
+}
+
+function clearChart(name, element) {
+  chartInstances[name]?.clear();
+  element.hidden = true;
+}
+
+function resizeCharts() {
+  for (const chart of Object.values(chartInstances)) chart?.resize();
+  if (state.daily) renderDaily();
+}
 
 function selectedRange() {
   const range = resolvePresetRange(state.rangePreset, Date.now(), state.customRange);
@@ -270,7 +327,7 @@ function setSelectOptions(select, values, allLabel) {
 
 async function refreshFilters(signal) {
   const params = baseParams(false);
-  const filters = await fetchJson(`/v2/dashboard/filters?${params}`, signal);
+  const filters = await fetchJson(`/v3/dashboard/filters?${params}`, signal);
   setSelectOptions(elements.nodeFilter, filters.nodes, t("filters.allNodes"));
   setSelectOptions(elements.appFilter, filters.apps, t("filters.allApps"));
   setSelectOptions(elements.providerFilter, filters.providers, t("filters.allProviders"));
@@ -389,17 +446,6 @@ function renderCostTopModels(items) {
   }
 }
 
-function createSvg(name, attributes = {}, text = "") {
-  const element = document.createElementNS(svgNs, name);
-  for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
-  if (text) element.textContent = text;
-  return element;
-}
-
-function trendValue(point, metric) {
-  return Number(point[metric] || 0);
-}
-
 function trendValueLabel(value, metric) {
   if (metric === "totalCostUsd") return formatters.moneyNumber.format(value);
   if (metric === "avgLatencyMs") return formatLatency(value);
@@ -419,111 +465,73 @@ function formatTrendAxis(timestamp, spanSeconds) {
 
 function renderTrend() {
   const points = state.overview?.trend || [];
-  elements.trendTooltip.hidden = true;
-  elements.trendChart.replaceChildren();
   elements.trendEmpty.hidden = points.length > 0;
-  elements.trendChart.hidden = points.length === 0;
   if (state.overview?.range?.bucket) {
     elements.resolvedBucket.textContent = t("trend.resolvedBucket", {
       bucket: state.overview.range.bucket,
     });
   }
-  if (!points.length) return;
+  if (!points.length) {
+    clearChart("trend", elements.trendChart);
+    return;
+  }
 
   const metric = elements.trendMetric.value;
-  const width = 900;
-  const height = 280;
-  const padding = { left: 64, right: 22, top: 20, bottom: 42 };
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const values = points.map((point) => trendValue(point, metric));
-  const maximum = Math.max(...values, 1);
-  const rangeFrom = Number(state.overview.range.from);
-  const rangeTo = Math.max(Number(state.overview.range.to), rangeFrom + 1);
-  const rangeSpan = rangeTo - rangeFrom;
-  const x = (timestamp) => padding.left + Math.max(0, Math.min(1, (timestamp - rangeFrom) / rangeSpan)) * plotWidth;
-  const y = (value) => padding.top + plotHeight - value / maximum * plotHeight;
-
-  for (let index = 0; index <= 4; index += 1) {
-    const gridY = padding.top + index * plotHeight / 4;
-    elements.trendChart.append(createSvg("line", { x1: padding.left, x2: width - padding.right, y1: gridY, y2: gridY, class: "grid" }));
-    const labelValue = maximum * (1 - index / 4);
-    elements.trendChart.append(createSvg("text", { x: padding.left - 10, y: gridY + 4, "text-anchor": "end", class: "axis-label" }, trendValueLabel(labelValue, metric)));
-  }
-
-  const coordinates = points.map((point, index) => [x(point.bucketStart), y(values[index])]);
-  const linePath = coordinates.map(([cx, cy], index) => `${index ? "L" : "M"} ${cx} ${cy}`).join(" ");
-  const areaPath = `${linePath} L ${coordinates.at(-1)[0]} ${padding.top + plotHeight} L ${coordinates[0][0]} ${padding.top + plotHeight} Z`;
-  elements.trendChart.append(createSvg("path", { d: areaPath, class: "area" }));
-  elements.trendChart.append(createSvg("path", { d: linePath, class: "line", pathLength: 1 }));
-
-  points.forEach((point, index) => {
-    const [cx, cy] = coordinates[index];
-    const circle = createSvg("circle", { cx, cy, r: 4, class: "point" });
-    circle.addEventListener("pointerenter", (event) => showTrendTooltip(point, event));
-    circle.addEventListener("pointermove", (event) => showTrendTooltip(point, event));
-    circle.addEventListener("pointerleave", () => { elements.trendTooltip.hidden = true; });
-    elements.trendChart.append(circle);
-  });
-
-  const axisLabels = [rangeFrom, rangeFrom + rangeSpan / 2, rangeTo];
-  axisLabels.forEach((timestamp, index) => {
-    elements.trendChart.append(createSvg("text", {
-      x: x(timestamp),
-      y: height - 13,
-      "text-anchor": index === 0 ? "start" : index === axisLabels.length - 1 ? "end" : "middle",
-      class: "axis-label",
-    }, formatTrendAxis(timestamp, rangeSpan)));
-  });
+  const range = state.overview.range;
+  const spanSeconds = Math.max(1, Number(range.to) - Number(range.from));
+  const palette = chartPalette();
+  updateChart("trend", elements.trendChart, buildTrendOption({
+    points,
+    metric,
+    range,
+    palette,
+    formatAxis: (timestampMs) => formatTrendAxis(timestampMs / 1_000, spanSeconds),
+    formatValue: (value) => trendValueLabel(value, metric),
+    formatTooltip: (point) => usageTooltip(
+      point,
+      formatters.dateTime.format(point.bucketStart * 1_000),
+    ),
+    ariaDescription: t("trend.chartAria"),
+    reducedMotion: reducedMotion(),
+  }));
 }
 
-function showUsageTooltip(tooltip, panel, point, titleText, event) {
-  tooltip.replaceChildren();
-  const title = document.createElement("strong");
-  title.textContent = titleText;
-  tooltip.append(title);
+function usageTooltip(point, titleText) {
   const lines = [
-    ["trend.tooltipInput", formatTokens(point.inputTokens)],
-    ["trend.tooltipFreshInput", formatTokens(point.freshInputTokens)],
-    ["trend.tooltipCacheCreation", formatTokens(point.cacheCreationTokens)],
-    ["trend.tooltipCacheRead", formatTokens(point.cacheReadTokens)],
-    ["trend.tooltipOutput", formatTokens(point.outputTokens)],
-    ["trend.tooltipRequests", formatters.integerNumber.format(point.totalRequests)],
-    ["trend.tooltipSuccess", formatPercent(point.successRate)],
-    ["trend.tooltipCost", formatters.moneyNumber.format(point.totalCostUsd)],
-    ["trend.tooltipLatency", formatLatency(point.avgLatencyMs)],
+    ["", t("trend.tooltipInput", { value: formatTokens(point.inputTokens) })],
+    ["", t("trend.tooltipFreshInput", { value: formatTokens(point.freshInputTokens) })],
+    ["", t("trend.tooltipCacheCreation", { value: formatTokens(point.cacheCreationTokens) })],
+    ["", t("trend.tooltipCacheRead", { value: formatTokens(point.cacheReadTokens) })],
+    ["", t("trend.tooltipOutput", { value: formatTokens(point.outputTokens) })],
+    ["", t("trend.tooltipRequests", { value: formatters.integerNumber.format(point.totalRequests) })],
+    ["", t("trend.tooltipSuccess", { value: formatPercent(point.successRate) })],
+    ["", t("trend.tooltipCost", { value: formatters.moneyNumber.format(point.totalCostUsd) })],
+    ["", t("trend.tooltipLatency", { value: formatLatency(point.avgLatencyMs) })],
   ];
-  for (const [key, value] of lines) {
-    const line = document.createElement("span");
-    line.textContent = t(key, { value });
-    tooltip.append(line);
-  }
-  tooltip.hidden = false;
-  const panelRect = panel.getBoundingClientRect();
-  const targetX = event.clientX - panelRect.left + 14;
-  const targetY = event.clientY - panelRect.top - tooltip.offsetHeight - 14;
-  const maxLeft = panel.clientWidth - tooltip.offsetWidth - 12;
-  tooltip.style.left = `${Math.max(12, Math.min(targetX, maxLeft))}px`;
-  tooltip.style.top = `${Math.max(12, targetY)}px`;
+  return tooltipMarkup(titleText, lines);
 }
 
-function showTrendTooltip(point, event) {
-  showUsageTooltip(
-    elements.trendTooltip,
-    elements.trendChart.parentElement,
-    point,
-    formatters.dateTime.format(point.bucketStart * 1000),
-    event,
-  );
+function quotaTooltip(params) {
+  const items = (Array.isArray(params) ? params : [params])
+    .filter((item) => item?.data?.source && Number.isFinite(Number(item.value?.[1])));
+  if (!items.length) return "";
+  const title = formatters.dateTime.format(Number(items[0].value[0]));
+  const lines = items.map((item) => [
+    item.seriesName,
+    item.data.axis === "amount"
+      ? formatters.compactNumber.format(Number(item.value[1]))
+      : `${Number(item.value[1]).toFixed(1)}%`,
+  ]);
+  return tooltipMarkup(title, lines);
 }
 
-function showDailyTooltip(point, date, event) {
-  showUsageTooltip(
-    elements.dailyTooltip,
-    elements.dailyPanel,
+function dailyTooltip(params) {
+  const point = params?.data?.source;
+  if (!point) return "";
+  const date = new Date(`${params.data.value[0]}T00:00:00`);
+  return usageTooltip(
     point,
     new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(date),
-    event,
   );
 }
 
@@ -565,7 +573,6 @@ function renderCoverage(coverage) {
     from: formatters.dateTime.format(coverage.firstEventAt * 1000),
     to: formatters.dateTime.format(coverage.lastEventAt * 1000),
     scope,
-    sources: coverage.sourceKinds?.join(", ") || "—",
   });
 }
 
@@ -716,107 +723,63 @@ function renderQuotaChart(providers) {
     }
     return plots;
   });
-  elements.quotaChart.replaceChildren();
-  elements.quotaLegend.replaceChildren();
-  elements.quotaChart.hidden = plottedSeries.length === 0;
-  if (!plottedSeries.length) return;
+  if (!plottedSeries.length) {
+    clearChart("quota", elements.quotaChart);
+    return;
+  }
 
-  const width = 900;
-  const height = 300;
-  const padding = { left: 64, right: 72, top: 28, bottom: 42 };
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const rangeFrom = Number(state.quota.range.from);
-  const rangeTo = Math.max(Number(state.quota.range.to), rangeFrom + 1);
-  const rangeSpan = rangeTo - rangeFrom;
   const amountValues = plottedSeries
     .filter((item) => item.axis === "amount")
     .flatMap((item) => item.points.map(item.value))
     .filter(Number.isFinite);
-  const {
-    minimum: amountMinimum,
-    maximum: amountMaximum,
-    span: amountSpan,
-  } = quotaAmountRange(amountValues);
-  const x = (timestamp) => padding.left + (timestamp - rangeFrom) / rangeSpan * plotWidth;
-  const percentY = (value) => padding.top + plotHeight - value / 100 * plotHeight;
-  const amountY = (value) => padding.top
-    + (amountMaximum - value) / amountSpan * plotHeight;
-
-  elements.quotaChart.append(createSvg("text", {
-    x: padding.left,
-    y: 14,
-    "text-anchor": "start",
-    class: "axis-label quota-axis-title",
-  }, t("quota.percentAxis")));
-  if (amountValues.length) {
-    elements.quotaChart.append(createSvg("text", {
-      x: width - padding.right,
-      y: 14,
-      "text-anchor": "end",
-      class: "axis-label quota-axis-title",
-    }, t("quota.amountAxis")));
-  }
-
-  for (let index = 0; index <= 4; index += 1) {
-    const gridY = padding.top + index * plotHeight / 4;
-    elements.quotaChart.append(createSvg("line", {
-      x1: padding.left,
-      x2: width - padding.right,
-      y1: gridY,
-      y2: gridY,
-      class: "grid",
-    }));
-    elements.quotaChart.append(createSvg("text", {
-      x: padding.left - 10,
-      y: gridY + 4,
-      "text-anchor": "end",
-      class: "axis-label",
-    }, `${100 - index * 25}%`));
-    if (amountValues.length) {
-      elements.quotaChart.append(createSvg("text", {
-        x: width - padding.right + 10,
-        y: gridY + 4,
-        "text-anchor": "start",
-        class: "axis-label",
-      }, formatters.compactNumber.format(amountMaximum - amountSpan * index / 4)));
-    }
-  }
-
-  plottedSeries.forEach((item) => {
-    const y = item.axis === "percent" ? percentY : amountY;
-    for (const segment of splitQuotaPoints(
-      item.points,
-      state.quota.range.bucketSeconds,
-      item.value,
-    )) {
-      const path = segment
-        .map((point, index) => `${index ? "L" : "M"} ${x(point.sampledAt)} ${y(item.value(point))}`)
-        .join(" ");
-      elements.quotaChart.append(createSvg("path", {
-        d: path,
-        class: `quota-series quota-series-${item.seriesIndex % 8}${item.axis === "amount" ? " quota-amount-series" : ""}`,
-      }));
-    }
-
-    const legend = document.createElement("span");
-    const dot = document.createElement("i");
-    dot.className = `quota-legend-dot quota-series-${item.seriesIndex % 8}${item.axis === "amount" ? " quota-amount-series" : ""}`;
-    const text = document.createElement("span");
+  const palette = chartPalette();
+  const colors = [
+    palette.accent,
+    cssColor("--violet", "#a78bfa"),
+    cssColor("--blue", "#60a5fa"),
+    cssColor("--orange", "#fbbf24"),
+    cssColor("--success", "#54e39a"),
+    cssColor("--danger", "#fb7185"),
+    "#38bdf8",
+    "#f472b6",
+  ];
+  const range = state.quota.range;
+  const spanSeconds = Math.max(1, Number(range.to) - Number(range.from));
+  const plots = plottedSeries.map((item) => {
     const axisLabel = item.axis === "percent" ? "%" : item.unit || t("quota.amountAxis");
-    text.textContent = `${item.provider.nodeName} / ${item.provider.providerName} / ${item.label} · ${axisLabel}`;
-    legend.append(dot, text);
-    elements.quotaLegend.append(legend);
+    return {
+      id: JSON.stringify([
+        item.provider.nodeId,
+        item.provider.providerId,
+        item.key,
+        item.kind,
+        item.unit,
+        item.axis,
+      ]),
+      name: `${item.provider.nodeName || item.provider.nodeId} / ${item.provider.providerName || item.provider.providerId} / ${item.label || item.key} · ${axisLabel}`,
+      axis: item.axis,
+      color: colors[item.seriesIndex % colors.length],
+      value: item.value,
+      segments: splitQuotaPoints(
+        item.points,
+        state.quota.range.bucketSeconds,
+        item.value,
+      ),
+    };
   });
-
-  [rangeFrom, rangeFrom + rangeSpan / 2, rangeTo].forEach((timestamp, index, labels) => {
-    elements.quotaChart.append(createSvg("text", {
-      x: x(timestamp),
-      y: height - 13,
-      "text-anchor": index === 0 ? "start" : index === labels.length - 1 ? "end" : "middle",
-      class: "axis-label",
-    }, formatTrendAxis(timestamp, rangeSpan)));
-  });
+  updateChart("quota", elements.quotaChart, buildQuotaOption({
+    plots,
+    range,
+    amountRange: quotaAmountRange(amountValues),
+    palette,
+    formatAxis: (timestampMs) => formatTrendAxis(timestampMs / 1_000, spanSeconds),
+    formatAmount: (value) => formatters.compactNumber.format(value),
+    formatTooltip: quotaTooltip,
+    percentAxisName: t("quota.percentAxis"),
+    amountAxisName: t("quota.amountAxis"),
+    ariaDescription: t("quota.chartAria"),
+    reducedMotion: reducedMotion(),
+  }));
 }
 
 function renderQuota() {
@@ -832,12 +795,6 @@ function renderQuota() {
 
 function dailyMetricValue(point, metric) {
   return Number(point?.[metric] || 0);
-}
-
-function dailyMetricLabel(value, metric) {
-  if (metric === "totalCostUsd") return formatters.moneyNumber.format(value);
-  if (metric === "totalRequests") return formatters.integerNumber.format(value);
-  return formatTokens(value);
 }
 
 function localDateKey(date) {
@@ -859,26 +816,16 @@ function syncBrandMarkSize() {
 function renderDaily() {
   const points = state.daily?.days || [];
   const metric = elements.dailyMetric.value;
-  elements.dailyTooltip.hidden = true;
-  elements.dailyHeatmap.replaceChildren();
   elements.dailyEmpty.hidden = points.length > 0;
-  elements.dailyHeatmap.hidden = points.length === 0;
-  if (!points.length) return;
-
-  const byDay = new Map();
-  for (const point of points) {
-    byDay.set(localDateKey(new Date(point.bucketStart * 1000)), point);
+  if (!points.length) {
+    clearChart("daily", elements.dailyHeatmap);
+    return;
   }
+
   const first = new Date(points[0].bucketStart * 1000);
   const last = new Date(points.at(-1).bucketStart * 1000);
   first.setHours(0, 0, 0, 0);
   last.setHours(0, 0, 0, 0);
-  const gridStart = new Date(first);
-  gridStart.setDate(gridStart.getDate() - gridStart.getDay());
-  const gridEnd = new Date(last);
-  gridEnd.setDate(gridEnd.getDate() + (6 - gridEnd.getDay()));
-  const weekCount = Math.floor((gridEnd - gridStart) / (7 * DAY_SECONDS * 1000)) + 1;
-  elements.dailyHeatmap.style.gridTemplateColumns = `30px repeat(${weekCount}, 13px)`;
 
   const values = points.map((point) => dailyMetricValue(point, metric)).filter((value) => value > 0).sort((a, b) => a - b);
   const maxValue = values.at(-1) || 0;
@@ -889,52 +836,39 @@ function renderDaily() {
     return Math.max(1, Math.min(4, Math.ceil((rank + 1) / values.length * 4)));
   };
   const weekdayFormatter = new Intl.DateTimeFormat(locale, { weekday: "short" });
-  for (let weekday = 0; weekday < 7; weekday += 1) {
-    const label = document.createElement("span");
-    label.className = "daily-weekday";
-    label.style.gridRow = String(weekday + 2);
-    label.textContent = weekdayFormatter.format(new Date(2024, 0, weekday));
-    elements.dailyHeatmap.append(label);
-  }
   const monthFormatter = new Intl.DateTimeFormat(locale, { month: "short" });
-  let previousMonth = -1;
-  for (let week = 0; week < weekCount; week += 1) {
-    const weekDate = new Date(gridStart);
-    weekDate.setDate(gridStart.getDate() + week * 7);
-    if (weekDate.getMonth() !== previousMonth) {
-      const label = document.createElement("span");
-      label.className = "daily-month";
-      label.style.gridColumn = String(week + 2);
-      label.style.gridRow = "1";
-      label.textContent = monthFormatter.format(weekDate);
-      elements.dailyHeatmap.append(label);
-      previousMonth = weekDate.getMonth();
-    }
-    for (let weekday = 0; weekday < 7; weekday += 1) {
-      const date = new Date(weekDate);
-      date.setDate(weekDate.getDate() + weekday);
-      const tile = document.createElement("span");
-      tile.className = "daily-tile";
-      tile.style.gridColumn = String(week + 2);
-      tile.style.gridRow = String(weekday + 2);
-      const point = byDay.get(localDateKey(date));
-      const value = dailyMetricValue(point, metric);
-      tile.classList.add(`daily-level-${levelFor(value)}`);
-      if (point) {
-        const dateLabel = new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(date);
-        const tooltip = `${dateLabel}: ${dailyMetricLabel(value, metric)}`;
-        tile.setAttribute("aria-label", tooltip);
-        tile.setAttribute("role", "gridcell");
-        tile.addEventListener("pointerenter", (event) => showDailyTooltip(point, date, event));
-        tile.addEventListener("pointermove", (event) => showDailyTooltip(point, date, event));
-        tile.addEventListener("pointerleave", () => { elements.dailyTooltip.hidden = true; });
-      } else {
-        tile.classList.add("empty");
-        tile.setAttribute("aria-hidden", "true");
-      }
-      elements.dailyHeatmap.append(tile);
-    }
-  }
+  const chartPoints = points.map((point) => {
+    const value = dailyMetricValue(point, metric);
+    return {
+      date: localDateKey(new Date(point.bucketStart * 1_000)),
+      value,
+      level: levelFor(value),
+      source: point,
+    };
+  });
+  const palette = chartPalette();
+  updateChart("daily", elements.dailyHeatmap, buildDailyOption({
+    points: chartPoints,
+    range: [localDateKey(first), localDateKey(last)],
+    chartWidth: elements.dailyHeatmap.clientWidth,
+    palette,
+    colors: [
+      palette.surfaceRaised,
+      "rgba(45, 212, 191, 0.24)",
+      "rgba(45, 212, 191, 0.45)",
+      "rgba(45, 212, 191, 0.68)",
+      cssColor("--accent-strong", "#2dd4bf"),
+    ],
+    dayNames: Array.from({ length: 7 }, (_, weekday) => (
+      weekdayFormatter.format(new Date(2024, 0, weekday))
+    )),
+    monthNames: Array.from({ length: 12 }, (_, month) => (
+      monthFormatter.format(new Date(2024, month, 1))
+    )),
+    formatTooltip: dailyTooltip,
+    ariaDescription: t("daily.chartAria"),
+    reducedMotion: reducedMotion(),
+  }));
 }
 
 function eventStatus(statusCode) {
@@ -978,7 +912,7 @@ async function loadEvents({ append = false, signal = undefined } = {}) {
       params.set("before_created_at", String(state.eventCursor.beforeCreatedAt));
       params.set("before_event_id", state.eventCursor.beforeEventId);
     }
-    const response = await fetchJson(`/v2/dashboard/events?${params}`, signal);
+    const response = await fetchJson(`/v3/dashboard/events?${params}`, signal);
     if (generation !== state.eventsGeneration) return;
     state.events = append ? [...state.events, ...response.items] : response.items;
     renderEventRows(state.events, false);
@@ -1007,9 +941,9 @@ async function refreshAll({ reloadFilters = false } = {}) {
     const quotaParams = baseParams(false);
     quotaParams.set("bucket", "auto");
     const [overview, dailyResponse, quotaResponse] = await Promise.all([
-      fetchJson(`/v2/dashboard/overview?${params}`, controller.signal),
-      fetchJson(`/v2/dashboard/daily?${daily}`, controller.signal),
-      fetchJson(`/v2/dashboard/quota?${quotaParams}`, controller.signal),
+      fetchJson(`/v3/dashboard/overview?${params}`, controller.signal),
+      fetchJson(`/v3/dashboard/daily?${daily}`, controller.signal),
+      fetchJson(`/v3/dashboard/quota?${quotaParams}`, controller.signal),
       loadEvents({ append: false, signal: controller.signal }),
     ]);
     renderOverview(overview);
@@ -1273,6 +1207,9 @@ elements.themeToggle.addEventListener("click", () => {
     // The theme still changes for this page when persistent storage is unavailable.
   }
   applyTheme();
+  if (state.overview) renderTrend();
+  if (state.quota) renderQuota();
+  if (state.daily) renderDaily();
 });
 
 elements.languageToggle.addEventListener("click", () => {
@@ -1405,8 +1342,17 @@ applyTheme();
 applyTranslations();
 if (typeof ResizeObserver === "function") {
   new ResizeObserver(syncBrandMarkSize).observe(elements.brandLockup);
+  const chartResizeObserver = new ResizeObserver(() => {
+    requestAnimationFrame(resizeCharts);
+  });
+  for (const element of [elements.trendChart, elements.quotaChart, elements.dailyHeatmap]) {
+    chartResizeObserver.observe(element);
+  }
 }
-window.addEventListener("resize", syncBrandMarkSize);
+window.addEventListener("resize", () => {
+  syncBrandMarkSize();
+  resizeCharts();
+});
 syncBrandMarkSize();
 refreshAll({ reloadFilters: true });
 setInterval(() => {

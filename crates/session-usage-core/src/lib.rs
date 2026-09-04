@@ -19,7 +19,7 @@ use std::{
 };
 
 pub const IMPORTER_SOURCE_COMMIT: &str = "3217f72596f2d1c0f879f0a05f83803825d9809f";
-pub const IMPORTER_REVISION: &str = "cc-switch-3217f725:session-usage-v2-six-source";
+pub const IMPORTER_REVISION: &str = "cc-switch-3217f725:session-usage-v3-six-source";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageIdentity {
@@ -705,10 +705,10 @@ fn parse_codex_file(path: &Path, thread_id: &str) -> anyhow::Result<Vec<UsageRec
                 {
                     model = normalize_codex_model(next);
                 }
-                let (current, cumulative) = if let Some(total) = info.get("total_token_usage") {
-                    (total, true)
-                } else if let Some(last) = info.get("last_token_usage") {
+                let (current, cumulative) = if let Some(last) = info.get("last_token_usage") {
                     (last, false)
+                } else if let Some(total) = info.get("total_token_usage") {
+                    (total, true)
                 } else {
                     continue;
                 };
@@ -719,10 +719,21 @@ fn parse_codex_file(path: &Path, thread_id: &str) -> anyhow::Result<Vec<UsageRec
                 };
                 let delta = if cumulative {
                     let value = if has_previous {
-                        Counters {
-                            input: counters.input.saturating_sub(previous.input),
-                            cached: counters.cached.saturating_sub(previous.cached),
-                            output: counters.output.saturating_sub(previous.output),
+                        if counters.input < previous.input
+                            || counters.cached < previous.cached
+                            || counters.output < previous.output
+                        {
+                            // Codex can restart cumulative counters when a session is resumed
+                            // or compacted. The new counters represent the first request after
+                            // that reset; subtracting the old baseline would create negative
+                            // usage and lose the real request.
+                            counters
+                        } else {
+                            Counters {
+                                input: counters.input - previous.input,
+                                cached: counters.cached - previous.cached,
+                                output: counters.output - previous.output,
+                            }
                         }
                     } else {
                         counters
@@ -732,6 +743,11 @@ fn parse_codex_file(path: &Path, thread_id: &str) -> anyhow::Result<Vec<UsageRec
                     value
                 } else {
                     counters
+                };
+                let delta = Counters {
+                    input: delta.input.max(0),
+                    cached: delta.cached.max(0),
+                    output: delta.output.max(0),
                 };
                 if delta.input + delta.cached + delta.output == 0 {
                     continue;
@@ -1004,6 +1020,50 @@ mod tests {
             vec![10, 5]
         );
         assert_eq!(records[1].cache_read_tokens, 2);
+    }
+
+    #[test]
+    fn codex_prefers_last_usage_over_reset_cumulative_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let thread = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
+        fs::write(&path, format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-30T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3}},\"total_token_usage\":{{\"input_tokens\":5000000,\"cached_input_tokens\":4900000,\"output_tokens\":30000}}}}}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-31T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":25,\"cached_input_tokens\":4,\"output_tokens\":5}},\"total_token_usage\":{{\"input_tokens\":25,\"cached_input_tokens\":4,\"output_tokens\":5}}}}}}}}"
+        )).unwrap();
+        let records = parse_codex_file(&path, thread).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.input_tokens,
+                    record.cache_read_tokens,
+                    record.output_tokens
+                ))
+                .collect::<Vec<_>>(),
+            vec![(10, 2, 3), (25, 4, 5)]
+        );
+    }
+
+    #[test]
+    fn codex_cumulative_fallback_treats_counter_decrease_as_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let thread = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
+        fs::write(&path, format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-30T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":100,\"cached_input_tokens\":80,\"output_tokens\":10}}}}}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-31T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":25,\"cached_input_tokens\":4,\"output_tokens\":5}}}}}}}}"
+        )).unwrap();
+        let records = parse_codex_file(&path, thread).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.input_tokens,
+                    record.cache_read_tokens,
+                    record.output_tokens
+                ))
+                .collect::<Vec<_>>(),
+            vec![(100, 80, 10), (25, 4, 5)]
+        );
     }
 
     #[test]

@@ -187,7 +187,7 @@ pub mod sql {
             .unwrap_or_default();
         format!(
             "NOT (\n\
-                {source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session')\n\
+                {source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session', 'grok_session', 'pi_session')\n\
                 AND EXISTS (\n\
                     SELECT 1\n\
                     FROM {table} proxy_dedup\n\
@@ -202,7 +202,7 @@ pub mod sql {
                           proxy_dedup.cache_creation_tokens = {alias}.cache_creation_tokens\n\
                           OR (\n\
                               {alias}.cache_creation_tokens = 0\n\
-                              AND {source} IN ('codex_session', 'gemini_session', 'opencode_session')\n\
+                              AND {source} IN ('codex_session', 'gemini_session', 'opencode_session', 'grok_session', 'pi_session')\n\
                           )\n\
                       )\n\
                       AND proxy_dedup.created_at BETWEEN\n\

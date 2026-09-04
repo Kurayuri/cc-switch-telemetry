@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +41,7 @@ pub enum MutationKind {
 #[serde(rename_all = "camelCase")]
 pub struct EventMutation {
     pub operation: MutationKind,
+    pub app_type: String,
     pub request_id: String,
     #[serde(default)]
     pub content_hash: String,
@@ -86,7 +87,6 @@ pub struct BatchResponse {
 pub struct SyncBeginRequest {
     pub schema_version: u32,
     pub generation_id: String,
-    pub source_kind: String,
     pub replace_all: bool,
 }
 
@@ -113,7 +113,7 @@ pub struct RejectedEvent {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct RollupSnapshot {
@@ -132,7 +132,7 @@ pub struct RollupSnapshot {
     pub cache_creation_tokens: i64,
     pub input_token_semantics: i64,
     pub total_cost_usd: String,
-    pub avg_latency_ms: i64,
+    pub avg_latency_ms: f64,
     pub day_start_utc: i64,
     pub day_end_utc: i64,
 }
@@ -280,8 +280,27 @@ pub struct QuotaBatchResponse {
     pub provider_states: usize,
 }
 
-pub fn event_id(node_id: &str, request_id: &str) -> String {
-    format!("{node_id}:{request_id}")
+pub fn event_id(node_id: &str, app_type: &str, request_id: &str) -> String {
+    format!(
+        "{}:{node_id}:{}:{app_type}:{request_id}",
+        node_id.len(),
+        app_type.len()
+    )
+}
+
+pub fn event_source_key(app_type: &str, request_id: &str) -> String {
+    format!("{}:{app_type}:{request_id}", app_type.len())
+}
+
+pub fn split_event_source_key(key: &str) -> Option<(&str, &str)> {
+    let (length, remainder) = key.split_once(':')?;
+    let length = length.parse::<usize>().ok()?;
+    if length == 0 || remainder.len() <= length || !remainder.is_char_boundary(length) {
+        return None;
+    }
+    let (app_type, request_id) = remainder.split_at(length);
+    let request_id = request_id.strip_prefix(':')?;
+    (!app_type.is_empty() && !request_id.is_empty()).then_some((app_type, request_id))
 }
 
 pub fn rollup_key(
@@ -323,7 +342,11 @@ mod tests {
 
     #[test]
     fn ids_are_stable() {
-        assert_eq!(event_id("n", "r"), "n:r");
+        assert_eq!(event_id("n", "a", "r"), "1:n:1:a:r");
+        assert_eq!(event_source_key("a", "r"), "1:a:r");
+        assert_eq!(split_event_source_key("1:a:r|2"), Some(("a", "r|2")));
+        assert_eq!(split_event_source_key("3:a:b:c"), Some(("a:b", "c")));
+        assert_eq!(split_event_source_key("3:猫:r"), Some(("猫", "r")));
         assert_eq!(
             rollup_key("n", "2026-01-01", "a", "p", "m", "", ""),
             "n|2026-01-01|a|p|m||"

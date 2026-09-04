@@ -57,28 +57,33 @@ test("dashboard defaults to dark and exposes a theme toggle", () => {
 test("trend exposes metric and granularity controls with rich tooltip support", () => {
   const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const charts = readFileSync(new URL("./charts.js", import.meta.url), "utf8");
   assert.match(html, /id="trendMetric"/);
   assert.match(html, /id="trendBucketTrigger"/);
   assert.match(html, /data-bucket="auto"/);
   assert.match(html, /data-bucket="15m"/);
   assert.match(html, /id="customBucketAmount"/);
-  assert.match(html, /id="trendTooltip"/);
+  assert.match(html, /id="trendChart"[^>]*class="[^"]*echarts-chart/);
   assert.match(app, /params\.set\("bucket", state\.trendBucket\)/);
   assert.match(app, /trend\.tooltipCacheCreation/);
+  assert.match(charts, /className: "echarts-tooltip"/);
 });
 
 test("dashboard exposes compact KPI details, custom range dialog, and directional animations", () => {
   const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
   const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const charts = readFileSync(new URL("./charts.js", import.meta.url), "utf8");
   assert.match(html, /class="kpi-heading"/);
   assert.match(html, /id="tokenComposition"/);
   assert.match(html, /id="rangePickerDialog"/);
   assert.match(html, /id="rangePickerForm"/);
   assert.match(app, /rangePickerDialog/);
-  assert.match(app, /pathLength: 1/);
+  assert.match(app, /buildTrendOption/);
   assert.match(app, /requestAnimationFrame/);
-  assert.match(css, /stroke-dasharray: 1/);
+  assert.match(charts, /universalTransition: true/);
+  assert.match(charts, /animationDurationUpdate/);
+  assert.match(css, /\.echarts-chart\s*\{/);
   assert.doesNotMatch(css, /@keyframes value-update\s*\{[^}]*transform:/s);
 });
 
@@ -104,21 +109,23 @@ test("dashboard exposes calendar-aligned presets, anchored pickers, and a GitHub
   const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const charts = readFileSync(new URL("./charts.js", import.meta.url), "utf8");
   assert.match(html, /data-range-preset="today"/);
   assert.match(html, /data-range-preset="14d"/);
   assert.match(html, /id="customFromDate"/);
   assert.match(html, /id="customFromTime"/);
   assert.match(html, /id="dailyPanel"/);
   assert.match(html, /id="dailyHeatmap"/);
-  assert.match(html, /id="dailyTooltip"/);
   assert.match(html, /id="brandMark"/);
   assert.match(html, /class="daily-controls"/);
   assert.match(app, /defaultCustomRange/);
   assert.match(app, /startOfLocalDayMs/);
   assert.match(app, /renderDaily/);
-  assert.match(app, /function showDailyTooltip/);
+  assert.match(app, /function dailyTooltip/);
   assert.match(app, /weekday: "short"/);
-  assert.match(app, /weekday < 7/);
+  assert.match(app, /buildDailyOption/);
+  assert.match(charts, /type: "heatmap"/);
+  assert.match(charts, /coordinateSystem: "calendar"/);
   assert.match(app, /function syncBrandMarkSize/);
   assert.match(app, /new ResizeObserver\(syncBrandMarkSize\)/);
   assert.match(app, /function positionDialog/);
@@ -128,10 +135,21 @@ test("dashboard exposes calendar-aligned presets, anchored pickers, and a GitHub
   assert.match(css, /\.brand-mark\s*\{[^}]*aspect-ratio:\s*1/s);
   assert.match(css, /\.brand-mark\s*\{[^}]*width:\s*var\(--brand-mark-size/s);
   assert.match(css, /\.picker-trigger > span\s*\{[^}]*margin:\s*0/s);
-  assert.match(css, /\.daily-heatmap\s*\{/);
+  assert.match(css, /\.daily-heatmap\s*\{[^}]*width:\s*100%[^}]*max-width:\s*840px[^}]*min-width:\s*0/s);
   assert.match(css, /\.daily-controls\s*\{[^}]*align-items:\s*center/s);
-  assert.match(css, /\.daily-scroll\s*\{[^}]*justify-content:\s*center/s);
+  assert.match(css, /\.daily-scroll\s*\{[^}]*overflow:\s*hidden/s);
   assert.match(css, /\.daily-legend\s*\{[^}]*margin:\s*0/s);
+});
+
+test("dashboard self-hosts the pinned ECharts module", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const vendorReadme = readFileSync(new URL("./vendor/README.md", import.meta.url), "utf8");
+  assert.doesNotMatch(html, /<svg id="(?:trendChart|quotaChart)"/);
+  assert.match(app, /\.\/vendor\/echarts\.esm\.min\.mjs/);
+  assert.match(app, /echarts\.init\(element, null, \{ renderer: "canvas" \}\)/);
+  assert.match(vendorReadme, /Version: `6\.1\.0`/);
+  assert.match(vendorReadme, /Apache-2\.0/);
 });
 
 test("estimated cost exposes a dynamic top-three model list", () => {

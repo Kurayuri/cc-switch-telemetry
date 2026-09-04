@@ -14,7 +14,19 @@ const elements = {
   tokenValue: document.getElementById("tokenValue"),
   closeTokenButton: document.getElementById("closeTokenButton"),
   copyTokenButton: document.getElementById("copyTokenButton"),
+  logPreviewForm: document.getElementById("logPreviewForm"),
+  logKindInput: document.getElementById("logKindInput"),
+  logNodeInput: document.getElementById("logNodeInput"),
+  logMessage: document.getElementById("logMessage"),
+  logPreviewPanel: document.getElementById("logPreviewPanel"),
+  logWarning: document.getElementById("logWarning"),
+  logCountList: document.getElementById("logCountList"),
+  logConfirmationValue: document.getElementById("logConfirmationValue"),
+  logConfirmationInput: document.getElementById("logConfirmationInput"),
+  purgeLogsButton: document.getElementById("purgeLogsButton"),
 };
+
+let lastLogPreview = null;
 
 async function api(url, options = {}) {
   const headers = { Accept: "application/json", ...(options.headers || {}) };
@@ -94,6 +106,36 @@ function renderNodes(nodes) {
     row.append(actions);
     elements.nodeRows.append(row);
   }
+  const selectedNode = elements.logNodeInput.value;
+  elements.logNodeInput.replaceChildren(new Option("全部节点", ""));
+  for (const node of nodes) {
+    elements.logNodeInput.append(new Option(`${node.nodeName} (${node.uuid})`, node.uuid));
+  }
+  elements.logNodeInput.value = nodes.some((node) => node.uuid === selectedNode) ? selectedNode : "";
+}
+
+function resetLogPreview() {
+  lastLogPreview = null;
+  elements.logPreviewPanel.hidden = true;
+  elements.logConfirmationInput.value = "";
+  elements.purgeLogsButton.disabled = true;
+}
+
+function renderLogPreview(preview) {
+  lastLogPreview = preview;
+  elements.logWarning.textContent = preview.warning;
+  elements.logCountList.replaceChildren();
+  for (const [table, count] of Object.entries(preview.counts)) {
+    const item = document.createElement("li");
+    const name = document.createElement("code");
+    name.textContent = table;
+    item.append(name, `: ${count}`);
+    elements.logCountList.append(item);
+  }
+  elements.logConfirmationValue.textContent = preview.confirmation;
+  elements.logConfirmationInput.value = "";
+  elements.purgeLogsButton.disabled = true;
+  elements.logPreviewPanel.hidden = false;
 }
 
 async function loadNodes() {
@@ -175,6 +217,42 @@ async function revokeToken(node) {
   }
 }
 
+async function previewLogs(event) {
+  event.preventDefault();
+  resetLogPreview();
+  const parameters = new URLSearchParams({ kind: elements.logKindInput.value });
+  if (elements.logNodeInput.value) parameters.set("node_id", elements.logNodeInput.value);
+  try {
+    const preview = await api(`/admin/api/logs/preview?${parameters}`);
+    renderLogPreview(preview);
+    showMessage(elements.logMessage, `将删除 ${preview.totalRows} 行（含缓存与同步状态）。`, "ok");
+  } catch (error) {
+    if (error.status === 401) return showLogin("登录已过期，请重新登录。");
+    showMessage(elements.logMessage, error.message);
+  }
+}
+
+async function purgeLogs() {
+  if (!lastLogPreview || elements.logConfirmationInput.value !== lastLogPreview.confirmation) return;
+  const scope = lastLogPreview.nodeId || "全部节点";
+  if (!window.confirm(`永久删除 ${scope} 的${lastLogPreview.kind === "request" ? "请求" : "Quota"}日志？`)) return;
+  try {
+    const result = await api("/admin/api/logs/purge", {
+      method: "POST",
+      body: JSON.stringify({
+        kind: lastLogPreview.kind,
+        nodeId: lastLogPreview.nodeId,
+        confirmation: elements.logConfirmationInput.value,
+      }),
+    });
+    resetLogPreview();
+    showMessage(elements.logMessage, `已删除 ${result.totalRows} 行。${result.warning}`, "ok");
+  } catch (error) {
+    if (error.status === 401) return showLogin("登录已过期，请重新登录。");
+    showMessage(elements.logMessage, error.message);
+  }
+}
+
 async function logout() {
   await api("/admin/logout", { method: "POST" }).catch(() => {});
   showLogin();
@@ -193,6 +271,14 @@ async function boot() {
 
 elements.loginForm.addEventListener("submit", login);
 elements.createForm.addEventListener("submit", createNode);
+elements.logPreviewForm.addEventListener("submit", previewLogs);
+elements.logKindInput.addEventListener("change", resetLogPreview);
+elements.logNodeInput.addEventListener("change", resetLogPreview);
+elements.logConfirmationInput.addEventListener("input", () => {
+  elements.purgeLogsButton.disabled = !lastLogPreview
+    || elements.logConfirmationInput.value !== lastLogPreview.confirmation;
+});
+elements.purgeLogsButton.addEventListener("click", purgeLogs);
 elements.logoutButton.addEventListener("click", logout);
 elements.closeTokenButton.addEventListener("click", () => { elements.tokenPanel.hidden = true; });
 elements.copyTokenButton.addEventListener("click", async () => {

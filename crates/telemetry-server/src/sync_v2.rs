@@ -1,4 +1,4 @@
-use crate::{authenticated_node, ServerState};
+use crate::{authenticated_node, usage_cache, ServerState};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -57,19 +57,13 @@ pub async fn begin(
     if !valid_schema(request.schema_version) {
         return error(
             StatusCode::UPGRADE_REQUIRED,
-            "telemetry protocol v2 is required",
+            "telemetry protocol v3 is required",
         );
     }
     let Some(node_id) = authenticated(&headers, &state) else {
         return error(StatusCode::UNAUTHORIZED, "invalid node token");
     };
-    if request.generation_id.trim().is_empty()
-        || request.source_kind.trim().is_empty()
-        || !matches!(
-            request.source_kind.as_str(),
-            "cc-switch" | "local" | "local-compact"
-        )
-    {
+    if request.generation_id.trim().is_empty() {
         return error(StatusCode::BAD_REQUEST, "invalid generation metadata");
     }
     let Ok(connection) = state.db.lock() else {
@@ -77,15 +71,14 @@ pub async fn begin(
     };
     let existing = connection
         .query_row(
-            "SELECT node_id,source_kind,replace_all,status FROM sync_generations
+            "SELECT node_id,replace_all,status FROM sync_generations
              WHERE generation_id=?1",
             [&request.generation_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, bool>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, String>(2)?,
                 ))
             },
         )
@@ -94,12 +87,8 @@ pub async fn begin(
         Ok(value) => value,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "database query failed"),
     };
-    if let Some((owner, source, replace_all, status)) = existing {
-        if owner != node_id
-            || source != request.source_kind
-            || replace_all != request.replace_all
-            || status != "open"
-        {
+    if let Some((owner, replace_all, status)) = existing {
+        if owner != node_id || replace_all != request.replace_all || status != "open" {
             return error(StatusCode::CONFLICT, "generation cannot be resumed");
         }
         return (
@@ -114,12 +103,11 @@ pub async fn begin(
     if connection
         .execute(
             "INSERT INTO sync_generations
-             (generation_id,node_id,source_kind,replace_all,status,created_at)
-             VALUES (?1,?2,?3,?4,'open',?5)",
+             (generation_id,node_id,replace_all,status,created_at)
+             VALUES (?1,?2,?3,'open',?4)",
             params![
                 request.generation_id,
                 node_id,
-                request.source_kind,
                 request.replace_all,
                 chrono::Utc::now().timestamp()
             ],
@@ -142,12 +130,16 @@ pub async fn begin(
 }
 
 fn validate_event_mutation(mutation: &EventMutation) -> bool {
-    if mutation.request_id.trim().is_empty() || mutation.content_hash.trim().is_empty() {
+    if mutation.app_type.trim().is_empty()
+        || mutation.request_id.trim().is_empty()
+        || mutation.content_hash.trim().is_empty()
+    {
         return false;
     }
     match (&mutation.operation, &mutation.event) {
         (MutationKind::Upsert, Some(event)) => {
-            event.request_id == mutation.request_id
+            event.app_type == mutation.app_type
+                && event.request_id == mutation.request_id
                 && !event.app_type.trim().is_empty()
                 && !event.model.trim().is_empty()
         }
@@ -164,7 +156,7 @@ pub async fn stage_events(
     if !valid_schema(batch.schema_version) {
         return error(
             StatusCode::UPGRADE_REQUIRED,
-            "telemetry protocol v2 is required",
+            "telemetry protocol v3 is required",
         );
     }
     let Some(node_id) = authenticated(&headers, &state) else {
@@ -201,14 +193,15 @@ pub async fn stage_events(
         if transaction
             .execute(
                 "INSERT INTO staged_event_mutations
-                 (generation_id,request_id,operation,content_hash,payload_json)
-                 VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(generation_id,request_id) DO UPDATE SET
+                 (generation_id,app_type,request_id,operation,content_hash,payload_json)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(generation_id,app_type,request_id) DO UPDATE SET
                     operation=excluded.operation,
                     content_hash=excluded.content_hash,
                     payload_json=excluded.payload_json",
                 params![
                     batch.generation_id,
+                    mutation.app_type,
                     mutation.request_id,
                     match mutation.operation {
                         MutationKind::Upsert => "upsert",
@@ -239,6 +232,8 @@ fn validate_rollup_mutation(mutation: &RollupMutation) -> bool {
                 && snapshot.input_token_semantics
                     == cc_switch_usage_core::INPUT_TOKEN_SEMANTICS_FRESH
                 && snapshot.day_start_utc < snapshot.day_end_utc
+                && snapshot.avg_latency_ms.is_finite()
+                && snapshot.avg_latency_ms >= 0.0
                 && !snapshot.date.trim().is_empty()
         }
         (MutationKind::Delete, None) => true,
@@ -254,7 +249,7 @@ pub async fn stage_rollups(
     if !valid_schema(batch.schema_version) {
         return error(
             StatusCode::UPGRADE_REQUIRED,
-            "telemetry protocol v2 is required",
+            "telemetry protocol v3 is required",
         );
     }
     let Some(node_id) = authenticated(&headers, &state) else {
@@ -327,7 +322,7 @@ pub async fn stage_providers(
     if !valid_schema(batch.schema_version) {
         return error(
             StatusCode::UPGRADE_REQUIRED,
-            "telemetry protocol v2 is required",
+            "telemetry protocol v3 is required",
         );
     }
     let Some(node_id) = authenticated(&headers, &state) else {
@@ -388,15 +383,23 @@ fn upsert_event(
 ) -> rusqlite::Result<()> {
     let existing = transaction
         .query_row(
-            "SELECT content_hash FROM usage_events WHERE node_id=?1 AND request_id=?2",
-            params![node_id, event.request_id],
-            |row| row.get::<_, String>(0),
+            "SELECT content_hash,created_at FROM usage_events
+             WHERE node_id=?1 AND app_type=?2 AND request_id=?3",
+            params![node_id, event.app_type, event.request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
-    if existing.as_deref() == Some(content_hash) {
+    if existing
+        .as_ref()
+        .is_some_and(|(hash, _)| hash == content_hash)
+    {
         result.unchanged += 1;
         return Ok(());
     }
+    if let Some((_, created_at)) = &existing {
+        usage_cache::mark_event_dirty(transaction, node_id, *created_at)?;
+    }
+    usage_cache::mark_event_dirty(transaction, node_id, event.created_at)?;
     transaction.execute(
         "INSERT INTO usage_events (
              event_id,node_id,request_id,created_at,app_type,provider_id,model,
@@ -404,7 +407,7 @@ fn upsert_event(
              cache_creation_tokens,input_token_semantics,total_cost_usd,latency_ms,
              status_code,is_streaming,data_source,content_hash,received_at
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
-         ON CONFLICT(node_id,request_id) DO UPDATE SET
+         ON CONFLICT(node_id,app_type,request_id) DO UPDATE SET
              event_id=excluded.event_id,
              created_at=excluded.created_at,
              app_type=excluded.app_type,
@@ -425,7 +428,7 @@ fn upsert_event(
              content_hash=excluded.content_hash,
              received_at=excluded.received_at",
         params![
-            event_id(node_id, &event.request_id),
+            event_id(node_id, &event.app_type, &event.request_id),
             node_id,
             event.request_id,
             event.created_at,
@@ -471,6 +474,12 @@ fn upsert_rollup(
         &snapshot.request_model,
         &snapshot.pricing_model,
     );
+    usage_cache::mark_range_dirty(
+        transaction,
+        node_id,
+        snapshot.day_start_utc,
+        snapshot.day_end_utc,
+    )?;
     transaction.execute(
         "INSERT INTO usage_daily_snapshots (
              snapshot_key,node_id,date,app_type,provider_id,model,request_model,
@@ -534,7 +543,7 @@ pub async fn commit(
     if !valid_schema(request.schema_version) {
         return error(
             StatusCode::UPGRADE_REQUIRED,
-            "telemetry protocol v2 is required",
+            "telemetry protocol v3 is required",
         );
     }
     let Some(node_id) = authenticated(&headers, &state) else {
@@ -597,8 +606,9 @@ pub async fn commit(
 
     let event_rows = {
         let mut statement = match connection.prepare(
-            "SELECT request_id,operation,content_hash,payload_json
-             FROM staged_event_mutations WHERE generation_id=?1 ORDER BY request_id",
+            "SELECT app_type,request_id,operation,content_hash,payload_json
+             FROM staged_event_mutations
+             WHERE generation_id=?1 ORDER BY app_type,request_id",
         ) {
             Ok(value) => value,
             Err(_) => {
@@ -613,7 +623,8 @@ pub async fn commit(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         });
         match mapped {
@@ -714,8 +725,9 @@ pub async fn commit(
 
     let event_manifest = event_rows
         .iter()
-        .map(|(request_id, operation, content_hash, _)| {
+        .map(|(app_type, request_id, operation, content_hash, _)| {
             (
+                app_type.as_str(),
                 request_id.as_str(),
                 operation.as_str(),
                 content_hash.as_str(),
@@ -750,6 +762,9 @@ pub async fn commit(
         }
     };
     let mut result = SyncCommitResponse::default();
+    if replace_all && usage_cache::mark_node_dirty(&transaction, &node_id).is_err() {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "dirty node cache failed");
+    }
     if replace_all
         && transaction
             .execute("DELETE FROM usage_events WHERE node_id=?1", [&node_id])
@@ -766,11 +781,30 @@ pub async fn commit(
             "clear node snapshot failed",
         );
     }
-    for (request_id, operation, content_hash, payload) in event_rows {
+    for (app_type, request_id, operation, content_hash, payload) in event_rows {
         if operation == "delete" {
+            let created_at = transaction
+                .query_row(
+                    "SELECT created_at FROM usage_events
+                     WHERE node_id=?1 AND app_type=?2 AND request_id=?3",
+                    params![node_id, app_type, request_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if let Some(created_at) = created_at {
+                if usage_cache::mark_event_dirty(&transaction, &node_id, created_at).is_err() {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "dirty event cache failed",
+                    );
+                }
+            }
             match transaction.execute(
-                "DELETE FROM usage_events WHERE node_id=?1 AND request_id=?2",
-                params![node_id, request_id],
+                "DELETE FROM usage_events
+                 WHERE node_id=?1 AND app_type=?2 AND request_id=?3",
+                params![node_id, app_type, request_id],
             ) {
                 Ok(count) => result.deleted += count,
                 Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "delete event failed"),
@@ -784,6 +818,9 @@ pub async fn commit(
             Ok(value) => value,
             Err(_) => return error(StatusCode::BAD_REQUEST, "staged event payload invalid"),
         };
+        if event.app_type != app_type || event.request_id != request_id {
+            return error(StatusCode::BAD_REQUEST, "staged event identity mismatch");
+        }
         if upsert_event(&transaction, &node_id, &event, &content_hash, &mut result).is_err() {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "upsert event failed");
         }
@@ -867,6 +904,24 @@ pub async fn commit(
     {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "seal generation failed");
     }
+    for table in [
+        "staged_event_mutations",
+        "staged_rollup_mutations",
+        "staged_providers",
+    ] {
+        if transaction
+            .execute(
+                &format!("DELETE FROM {table} WHERE generation_id=?1"),
+                [&request.generation_id],
+            )
+            .is_err()
+        {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "clear staged generation failed",
+            );
+        }
+    }
     match transaction.commit() {
         Ok(()) => (StatusCode::OK, Json(result)).into_response(),
         Err(_) => error(
@@ -878,9 +933,94 @@ pub async fn commit(
 
 pub fn routes() -> Router<ServerState> {
     Router::new()
-        .route("/v2/sync/begin", post(begin))
-        .route("/v2/sync/events", post(stage_events))
-        .route("/v2/sync/rollups", post(stage_rollups))
-        .route("/v2/sync/providers", post(stage_providers))
-        .route("/v2/sync/commit", post(commit))
+        .route("/v3/sync/begin", post(begin))
+        .route("/v3/sync/events", post(stage_events))
+        .route("/v3/sync/rollups", post(stage_rollups))
+        .route("/v3/sync/providers", post(stage_providers))
+        .route("/v3/sync/commit", post(commit))
+        .route("/v2/sync/begin", post(super::upgrade_required))
+        .route("/v2/sync/events", post(super::upgrade_required))
+        .route("/v2/sync/rollups", post(super::upgrade_required))
+        .route("/v2/sync/providers", post(super::upgrade_required))
+        .route("/v2/sync/commit", post(super::upgrade_required))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(app_type: &str, provider_id: &str) -> UsageEvent {
+        UsageEvent {
+            request_id: "shared-request".to_owned(),
+            created_at: 100,
+            app_type: app_type.to_owned(),
+            provider_id: provider_id.to_owned(),
+            model: "model".to_owned(),
+            request_model: None,
+            pricing_model: None,
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_tokens: 1,
+            cache_creation_tokens: 0,
+            input_token_semantics: 2,
+            total_cost_usd: "0.1".to_owned(),
+            latency_ms: 20,
+            status_code: 200,
+            is_streaming: true,
+            data_source: "proxy".to_owned(),
+        }
+    }
+
+    #[test]
+    fn request_identity_uses_app_not_mutable_provider() {
+        let mut connection = crate::init_db(":memory:").unwrap();
+        let transaction = connection.transaction().unwrap();
+        let mut result = SyncCommitResponse::default();
+
+        upsert_event(
+            &transaction,
+            "node-a",
+            &event("codex", "provider-old"),
+            "hash-1",
+            &mut result,
+        )
+        .unwrap();
+        upsert_event(
+            &transaction,
+            "node-a",
+            &event("codex", "provider-corrected"),
+            "hash-2",
+            &mut result,
+        )
+        .unwrap();
+        upsert_event(
+            &transaction,
+            "node-a",
+            &event("claude", "provider-old"),
+            "hash-3",
+            &mut result,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        assert_eq!(result.inserted, 2);
+        assert_eq!(result.updated, 1);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let corrected: (String, String) = connection
+            .query_row(
+                "SELECT event_id,provider_id FROM usage_events
+                 WHERE node_id='node-a' AND app_type='codex' AND request_id='shared-request'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(corrected.0, event_id("node-a", "codex", "shared-request"));
+        assert_eq!(corrected.1, "provider-corrected");
+    }
 }

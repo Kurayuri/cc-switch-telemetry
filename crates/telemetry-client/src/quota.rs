@@ -865,7 +865,7 @@ pub async fn upload_pending(
         reset_cursor(&quota.quota_db, &remote)?;
     }
     let url = format!(
-        "{}/v2/quota/observations",
+        "{}/v3/quota/observations",
         client.server_url.trim_end_matches('/')
     );
     let mut accepted = 0;
@@ -1227,7 +1227,6 @@ mod tests {
             server_url: format!("http://{address}"),
             auth_token: token,
             batch_size: 512,
-            overlap_seconds: 0,
         };
         let quota = QuotaConfig {
             cc_switch_db: directory.path().join("unused-cc-switch.db"),

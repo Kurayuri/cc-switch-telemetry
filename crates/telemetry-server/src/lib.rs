@@ -3,6 +3,7 @@ mod dashboard;
 pub mod nodes;
 mod quota;
 mod sync_v2;
+mod usage_cache;
 
 use axum::{
     extract::{Query, State},
@@ -62,6 +63,7 @@ impl ServerState {
         let db = Arc::new(Mutex::new(db));
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
         spawn_write_worker(Arc::clone(&db), write_rx);
+        usage_cache::spawn_worker(Arc::clone(&db));
         Self {
             db,
             db_path,
@@ -142,7 +144,7 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -169,7 +171,7 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
              data_source TEXT NOT NULL DEFAULT '',
              content_hash TEXT NOT NULL DEFAULT '',
              received_at INTEGER NOT NULL,
-             UNIQUE(node_id, request_id)
+             UNIQUE(node_id, app_type, request_id)
          );
          CREATE INDEX IF NOT EXISTS idx_usage_events_created
              ON usage_events(created_at);
@@ -211,7 +213,6 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
          CREATE TABLE IF NOT EXISTS sync_generations (
              generation_id TEXT PRIMARY KEY,
              node_id TEXT NOT NULL,
-             source_kind TEXT NOT NULL,
              replace_all INTEGER NOT NULL,
              status TEXT NOT NULL,
              manifest_hash TEXT NOT NULL DEFAULT '',
@@ -221,11 +222,12 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
          );
          CREATE TABLE IF NOT EXISTS staged_event_mutations (
              generation_id TEXT NOT NULL,
+             app_type TEXT NOT NULL,
              request_id TEXT NOT NULL,
              operation TEXT NOT NULL,
              content_hash TEXT NOT NULL,
              payload_json TEXT,
-             PRIMARY KEY (generation_id, request_id),
+             PRIMARY KEY (generation_id, app_type, request_id),
              FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
                  ON DELETE CASCADE
          );
@@ -299,110 +301,153 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
         "content_hash",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    migrate_v3_schema(&mut conn)?;
     nodes::ensure_schema(&conn)?;
     quota::ensure_schema(&conn)?;
+    usage_cache::ensure_schema(&conn)?;
     Ok(conn)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RebuildV2Summary {
-    pub nodes: usize,
-    pub providers: usize,
+fn normalized_table_sql(connection: &Connection, table: &str) -> anyhow::Result<String> {
+    let sql: String = connection.query_row(
+        "SELECT COALESCE(sql,'') FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(sql
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect())
 }
 
-/// Build a fresh protocol-v2 central database while preserving only node
-/// identities/token hashes and current provider labels. Usage is deliberately
-/// omitted: each node must repopulate it with a forced v2 replacement.
-pub fn rebuild_v2_metadata(
-    source_path: impl AsRef<Path>,
-    target_path: impl AsRef<Path>,
-) -> anyhow::Result<RebuildV2Summary> {
-    let source_path = source_path.as_ref();
-    let target_path = target_path.as_ref();
-    if source_path == target_path {
-        anyhow::bail!("source and target database paths must differ");
-    }
-    if target_path.exists() {
-        anyhow::bail!("target database already exists: {}", target_path.display());
-    }
-    let source = Connection::open_with_flags(
-        source_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )?;
-    let has_nodes: bool = source.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_nodes {
-        anyhow::bail!("source database has no nodes table");
-    }
-    let node_rows = {
-        let mut statement = source.prepare(
-            "SELECT uuid,node_name,token_hash,created_at,updated_at FROM nodes ORDER BY uuid",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
-    let has_providers: bool = source.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_catalog'
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    let provider_rows = if has_providers {
-        let mut statement = source.prepare(
-            "SELECT node_id,app_type,provider_id,name,updated_at
-             FROM provider_catalog ORDER BY node_id,app_type,provider_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    } else {
-        Vec::new()
-    };
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    Ok(connection
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|candidate| candidate == column))
+}
 
-    let mut target = init_db(target_path)?;
-    let transaction = target.transaction()?;
-    for row in &node_rows {
-        transaction.execute(
-            "INSERT INTO nodes(uuid,node_name,token_hash,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5)",
-            params![row.0, row.1, row.2, row.3, row.4],
-        )?;
+fn migrate_v3_schema(connection: &mut Connection) -> anyhow::Result<()> {
+    let usage_is_v3 = normalized_table_sql(connection, "usage_events")?
+        .contains("UNIQUE(node_id,app_type,request_id)");
+    let generations_are_v3 = !table_has_column(connection, "sync_generations", "source_kind")?;
+    let staged_events_are_v3 = table_has_column(connection, "staged_event_mutations", "app_type")?;
+    if usage_is_v3 && generations_are_v3 && staged_events_are_v3 {
+        return Ok(());
     }
-    for row in &provider_rows {
-        transaction.execute(
-            "INSERT INTO provider_catalog(node_id,app_type,provider_id,name,updated_at)
-             VALUES (?1,?2,?3,?4,?5)",
-            params![row.0, row.1, row.2, row.3, row.4],
-        )?;
+
+    connection.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let migration = (|| -> anyhow::Result<()> {
+        let transaction = connection.transaction()?;
+        if !usage_is_v3 {
+            transaction.execute_batch(
+                "ALTER TABLE usage_events RENAME TO usage_events_v2;
+                 CREATE TABLE usage_events (
+                   event_id TEXT PRIMARY KEY,
+                   node_id TEXT NOT NULL,
+                   request_id TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   app_type TEXT NOT NULL,
+                   provider_id TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   request_model TEXT NOT NULL DEFAULT '',
+                   pricing_model TEXT NOT NULL DEFAULT '',
+                   input_tokens INTEGER NOT NULL,
+                   output_tokens INTEGER NOT NULL,
+                   cache_read_tokens INTEGER NOT NULL,
+                   cache_creation_tokens INTEGER NOT NULL,
+                   input_token_semantics INTEGER NOT NULL DEFAULT 0,
+                   total_cost_usd TEXT NOT NULL,
+                   latency_ms INTEGER NOT NULL,
+                   status_code INTEGER NOT NULL,
+                   is_streaming INTEGER NOT NULL,
+                   data_source TEXT NOT NULL DEFAULT '',
+                   content_hash TEXT NOT NULL DEFAULT '',
+                   received_at INTEGER NOT NULL,
+                   UNIQUE(node_id,app_type,request_id)
+                 );
+                 INSERT INTO usage_events (
+                   event_id,node_id,request_id,created_at,app_type,provider_id,model,
+                   request_model,pricing_model,input_tokens,output_tokens,cache_read_tokens,
+                   cache_creation_tokens,input_token_semantics,total_cost_usd,latency_ms,
+                   status_code,is_streaming,data_source,content_hash,received_at
+                 )
+                 SELECT length(CAST(node_id AS BLOB)) || ':' || node_id || ':' ||
+                        length(CAST(app_type AS BLOB)) || ':' || app_type || ':' || request_id,
+                        node_id,request_id,created_at,app_type,provider_id,model,
+                        request_model,pricing_model,input_tokens,output_tokens,cache_read_tokens,
+                        cache_creation_tokens,input_token_semantics,total_cost_usd,latency_ms,
+                        status_code,is_streaming,data_source,content_hash,received_at
+                 FROM usage_events_v2;
+                 DROP TABLE usage_events_v2;
+                 CREATE INDEX idx_usage_events_created ON usage_events(created_at);
+                 CREATE INDEX idx_usage_events_node ON usage_events(node_id,created_at);",
+            )?;
+        }
+        if !generations_are_v3 || !staged_events_are_v3 {
+            transaction.execute_batch(
+                "DROP TABLE IF EXISTS staged_event_mutations;
+                 DROP TABLE IF EXISTS staged_rollup_mutations;
+                 DROP TABLE IF EXISTS staged_providers;
+                 DROP TABLE IF EXISTS sync_generations;
+                 CREATE TABLE sync_generations (
+                   generation_id TEXT PRIMARY KEY,
+                   node_id TEXT NOT NULL,
+                   replace_all INTEGER NOT NULL,
+                   status TEXT NOT NULL,
+                   manifest_hash TEXT NOT NULL DEFAULT '',
+                   result_json TEXT,
+                   created_at INTEGER NOT NULL,
+                   committed_at INTEGER
+                 );
+                 CREATE TABLE staged_event_mutations (
+                   generation_id TEXT NOT NULL,
+                   app_type TEXT NOT NULL,
+                   request_id TEXT NOT NULL,
+                   operation TEXT NOT NULL,
+                   content_hash TEXT NOT NULL,
+                   payload_json TEXT,
+                   PRIMARY KEY (generation_id,app_type,request_id),
+                   FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                     ON DELETE CASCADE
+                 );
+                 CREATE TABLE staged_rollup_mutations (
+                   generation_id TEXT NOT NULL,
+                   snapshot_key TEXT NOT NULL,
+                   operation TEXT NOT NULL,
+                   content_hash TEXT NOT NULL,
+                   payload_json TEXT,
+                   PRIMARY KEY (generation_id,snapshot_key),
+                   FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                     ON DELETE CASCADE
+                 );
+                 CREATE TABLE staged_providers (
+                   generation_id TEXT NOT NULL,
+                   app_type TEXT NOT NULL,
+                   provider_id TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   PRIMARY KEY (generation_id,app_type,provider_id),
+                   FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                     ON DELETE CASCADE
+                 );",
+            )?;
+        }
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+    migration?;
+    let violations: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        anyhow::bail!("protocol-v3 migration introduced {violations} foreign-key violations");
     }
-    transaction.commit()?;
-    let integrity: String = target.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        anyhow::bail!("rebuilt v2 database failed integrity_check: {integrity}");
-    }
-    Ok(RebuildV2Summary {
-        nodes: node_rows.len(),
-        providers: provider_rows.len(),
-    })
+    Ok(())
 }
 
 fn ensure_column(
@@ -499,7 +544,7 @@ pub async fn ingest(
                     .events
                     .into_iter()
                     .map(|e| RejectedEvent {
-                        event_id: event_id(&node_id, &e.request_id),
+                        event_id: event_id(&node_id, &e.app_type, &e.request_id),
                         reason: "invalid batch".into(),
                     })
                     .collect(),
@@ -546,12 +591,18 @@ fn process_events(
         Err(error) => return (database_error_status(&error), response),
     };
     for event in &batch.events {
-        let generated_event_id = event_id(&node_id, &event.request_id);
+        let generated_event_id = event_id(&node_id, &event.app_type, &event.request_id);
         let exists: Option<String> = match tx
             .query_row(
                 "SELECT event_id FROM usage_events
-                 WHERE event_id = ?1 OR (node_id = ?2 AND request_id = ?3)",
-                params![&generated_event_id, &node_id, &event.request_id],
+                 WHERE event_id = ?1
+                    OR (node_id = ?2 AND app_type = ?3 AND request_id = ?4)",
+                params![
+                    &generated_event_id,
+                    &node_id,
+                    &event.app_type,
+                    &event.request_id
+                ],
                 |row| row.get(0),
             )
             .optional()
@@ -594,7 +645,12 @@ fn process_events(
             ],
         );
         match result {
-            Ok(_) => response.accepted.push(generated_event_id),
+            Ok(_) => {
+                if let Err(error) = usage_cache::mark_event_dirty(&tx, &node_id, event.created_at) {
+                    return (database_error_status(&error), BatchResponse::default());
+                }
+                response.accepted.push(generated_event_id);
+            }
             Err(error) if is_retryable_sqlite_error(&error) => {
                 return (StatusCode::SERVICE_UNAVAILABLE, BatchResponse::default())
             }
@@ -828,11 +884,11 @@ pub async fn summary(
     }
 }
 
-async fn v1_upgrade_required() -> impl IntoResponse {
+async fn upgrade_required() -> impl IntoResponse {
     (
         StatusCode::UPGRADE_REQUIRED,
         Json(serde_json::json!({
-            "error": "telemetry protocol v2 is required"
+            "error": "telemetry protocol v3 is required"
         })),
     )
 }
@@ -840,10 +896,10 @@ async fn v1_upgrade_required() -> impl IntoResponse {
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route("/v1/events/batch", post(v1_upgrade_required))
-        .route("/v1/rollups/snapshot", post(v1_upgrade_required))
-        .route("/v1/providers/snapshot", post(v1_upgrade_required))
-        .route("/v1/usage/summary", get(v1_upgrade_required))
+        .route("/v1/events/batch", post(upgrade_required))
+        .route("/v1/rollups/snapshot", post(upgrade_required))
+        .route("/v1/providers/snapshot", post(upgrade_required))
+        .route("/v1/usage/summary", get(upgrade_required))
         .merge(dashboard::routes())
         .merge(admin::routes())
         .merge(quota::ingest_routes())
@@ -882,7 +938,7 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, extract::connect_info::MockConnectInfo, http::Request};
     use tower::ServiceExt;
 
     #[test]
@@ -897,74 +953,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(providers, 0);
-    }
-
-    #[test]
-    fn rebuild_v2_preserves_auth_metadata_but_not_usage() {
-        let directory = tempfile::tempdir().unwrap();
-        let source_path = directory.path().join("legacy.db");
-        let target_path = directory.path().join("v2.db");
-        let source = init_db(&source_path).unwrap();
-        let (node, _token) = nodes::create(&source, "node-a").unwrap();
-        let token_hash: String = source
-            .query_row(
-                "SELECT token_hash FROM nodes WHERE uuid=?1",
-                [&node.uuid],
-                |row| row.get(0),
-            )
-            .unwrap();
-        source
-            .execute(
-                "INSERT INTO provider_catalog(node_id,app_type,provider_id,name,updated_at)
-                 VALUES (?1,'codex','provider-a','Provider A',10)",
-                [&node.uuid],
-            )
-            .unwrap();
-        source
-            .execute(
-                "INSERT INTO usage_events (
-                   event_id,node_id,request_id,created_at,app_type,provider_id,model,
-                   input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,
-                   total_cost_usd,latency_ms,status_code,is_streaming,received_at
-                 ) VALUES ('event-a',?1,'request-a',10,'codex','provider-a','gpt-5',
-                           1,1,0,0,'0',1,200,1,10)",
-                [&node.uuid],
-            )
-            .unwrap();
-        drop(source);
-
-        let summary = rebuild_v2_metadata(&source_path, &target_path).unwrap();
-        assert_eq!(
-            summary,
-            RebuildV2Summary {
-                nodes: 1,
-                providers: 1
-            }
-        );
-        let target = Connection::open(&target_path).unwrap();
-        let copied_hash: String = target
-            .query_row(
-                "SELECT token_hash FROM nodes WHERE uuid=?1",
-                [&node.uuid],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(copied_hash, token_hash);
-        assert_eq!(
-            target
-                .query_row("SELECT COUNT(*) FROM provider_catalog", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            target
-                .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert!(rebuild_v2_metadata(&source_path, &target_path).is_err());
     }
 
     #[test]
@@ -1008,13 +996,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v1_ingest_endpoints_require_protocol_upgrade() {
+    async fn old_protocol_endpoints_require_v3_upgrade() {
         let db = init_db(":memory:").unwrap();
         let state = ServerState::new(db, PathBuf::from("telemetry.db"), None);
         for endpoint in [
             "/v1/events/batch",
             "/v1/rollups/snapshot",
             "/v1/providers/snapshot",
+            "/v2/sync/begin",
+            "/v2/sync/events",
+            "/v2/quota/observations",
         ] {
             let response = router(state.clone())
                 .oneshot(
@@ -1029,6 +1020,17 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
         }
+        let dashboard = router(state)
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/dashboard/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dashboard.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
     #[test]
@@ -1073,6 +1075,209 @@ mod tests {
             )
             .unwrap();
         assert_eq!(semantics, 1);
+    }
+
+    #[test]
+    fn v2_migration_preserves_request_rollup_and_quota_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let connection = init_db(&path).unwrap();
+        let (node, _) = nodes::create(&connection, "migration-node").unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_events (
+                   event_id,node_id,request_id,created_at,app_type,provider_id,model,
+                   request_model,pricing_model,input_tokens,output_tokens,cache_read_tokens,
+                   cache_creation_tokens,input_token_semantics,total_cost_usd,latency_ms,
+                   status_code,is_streaming,data_source,content_hash,received_at
+                 ) VALUES ('legacy-event',?1,'request-a',100,'codex','provider-corrected',
+                           'model','','',10,2,1,0,2,'0.1',20,200,1,'proxy','hash',100)",
+                [&node.uuid],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_daily_snapshots (
+                   snapshot_key,node_id,date,app_type,provider_id,model,request_model,
+                   pricing_model,request_count,success_count,input_tokens,output_tokens,
+                   cache_read_tokens,cache_creation_tokens,input_token_semantics,
+                   total_cost_usd,avg_latency_ms,day_start_utc,day_end_utc,content_hash,received_at
+                 ) VALUES ('rollup-a',?1,'1970-01-01','codex','provider','model','','',
+                           2,2,20,4,2,0,2,'0.2',20,0,86400,'rollup-hash',100)",
+                [&node.uuid],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_provider_states (
+                   node_id,app_type,provider_id,provider_name,status,target_kind,
+                   checked_at,last_success_at,received_at
+                 ) VALUES (?1,'codex','provider','Provider','ok',NULL,100,100,100)",
+                [&node.uuid],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_observations (
+                   node_id,observation_id,content_hash,app_type,provider_id,sampled_at,received_at
+                 ) VALUES (?1,'observation-a','quota-hash','codex','provider',100,100)",
+                [&node.uuid],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_metrics (
+                   node_id,observation_id,metric_key,metric_label,metric_kind,
+                   utilization_percent,used,remaining,total,unit,resets_at
+                 ) VALUES (?1,'observation-a','five_hour','5h','utilizationPercent',
+                           50,NULL,NULL,NULL,NULL,NULL)",
+                [&node.uuid],
+            )
+            .unwrap();
+
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TABLE staged_event_mutations;
+                 DROP TABLE staged_rollup_mutations;
+                 DROP TABLE staged_providers;
+                 DROP TABLE sync_generations;
+                 ALTER TABLE usage_events RENAME TO usage_events_v3_fixture;
+                 CREATE TABLE usage_events (
+                   event_id TEXT PRIMARY KEY,
+                   node_id TEXT NOT NULL,
+                   request_id TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   app_type TEXT NOT NULL,
+                   provider_id TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   request_model TEXT NOT NULL DEFAULT '',
+                   pricing_model TEXT NOT NULL DEFAULT '',
+                   input_tokens INTEGER NOT NULL,
+                   output_tokens INTEGER NOT NULL,
+                   cache_read_tokens INTEGER NOT NULL,
+                   cache_creation_tokens INTEGER NOT NULL,
+                   input_token_semantics INTEGER NOT NULL DEFAULT 0,
+                   total_cost_usd TEXT NOT NULL,
+                   latency_ms INTEGER NOT NULL,
+                   status_code INTEGER NOT NULL,
+                   is_streaming INTEGER NOT NULL,
+                   data_source TEXT NOT NULL DEFAULT '',
+                   content_hash TEXT NOT NULL DEFAULT '',
+                   received_at INTEGER NOT NULL,
+                   UNIQUE(node_id,request_id)
+                 );
+                 INSERT INTO usage_events SELECT * FROM usage_events_v3_fixture;
+                 DROP TABLE usage_events_v3_fixture;
+                 CREATE TABLE sync_generations (
+                   generation_id TEXT PRIMARY KEY,
+                   node_id TEXT NOT NULL,
+                   source_kind TEXT NOT NULL,
+                   replace_all INTEGER NOT NULL,
+                   status TEXT NOT NULL,
+                   manifest_hash TEXT NOT NULL DEFAULT '',
+                   result_json TEXT,
+                   created_at INTEGER NOT NULL,
+                   committed_at INTEGER
+                 );
+                 CREATE TABLE staged_event_mutations (
+                   generation_id TEXT NOT NULL,
+                   request_id TEXT NOT NULL,
+                   operation TEXT NOT NULL,
+                   content_hash TEXT NOT NULL,
+                   payload_json TEXT,
+                   PRIMARY KEY (generation_id,request_id),
+                   FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                     ON DELETE CASCADE
+                 );
+                 CREATE TABLE staged_rollup_mutations (
+                   generation_id TEXT NOT NULL,
+                   snapshot_key TEXT NOT NULL,
+                   operation TEXT NOT NULL,
+                   content_hash TEXT NOT NULL,
+                   payload_json TEXT,
+                   PRIMARY KEY (generation_id,snapshot_key),
+                   FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                     ON DELETE CASCADE
+                 );
+                 CREATE TABLE staged_providers (
+                   generation_id TEXT NOT NULL,
+                   app_type TEXT NOT NULL,
+                   provider_id TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   PRIMARY KEY (generation_id,app_type,provider_id),
+                   FOREIGN KEY (generation_id) REFERENCES sync_generations(generation_id)
+                     ON DELETE CASCADE
+                 );
+                 INSERT INTO sync_generations (
+                   generation_id,node_id,source_kind,replace_all,status,created_at
+                 ) VALUES ('open-v2-generation','legacy-node','cc-switch',0,'open',100);
+                 INSERT INTO staged_event_mutations (
+                   generation_id,request_id,operation,content_hash,payload_json
+                 ) VALUES ('open-v2-generation','staged-request','delete','hash',NULL);
+                 PRAGMA user_version=2;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = init_db(&path).unwrap();
+        let event: (String, String) = migrated
+            .query_row(
+                "SELECT event_id,provider_id FROM usage_events
+                 WHERE node_id=?1 AND app_type='codex' AND request_id='request-a'",
+                [&node.uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event.0, event_id(&node.uuid, "codex", "request-a"));
+        assert_eq!(event.1, "provider-corrected");
+        for table in [
+            "usage_daily_snapshots",
+            "quota_provider_states",
+            "quota_observations",
+            "quota_metrics",
+        ] {
+            assert_eq!(
+                migrated
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1,
+                "{table} history must survive migration"
+            );
+        }
+        for table in [
+            "sync_generations",
+            "staged_event_mutations",
+            "staged_rollup_mutations",
+            "staged_providers",
+        ] {
+            assert_eq!(
+                migrated
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "{table} is incompatible transient v2 state"
+            );
+        }
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            i64::from(SCHEMA_VERSION)
+        );
+        assert_eq!(
+            migrated
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

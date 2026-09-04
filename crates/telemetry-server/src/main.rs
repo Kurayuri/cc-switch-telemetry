@@ -3,18 +3,8 @@ use std::{net::SocketAddr, path::PathBuf};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if let [command, from_flag, from, to_flag, to] = args.as_slice() {
-        if command == "rebuild-v2" && from_flag == "--from" && to_flag == "--to" {
-            let summary = telemetry_server::rebuild_v2_metadata(from, to)?;
-            eprintln!(
-                "rebuilt protocol-v2 metadata database: target={} nodes={} providers={}",
-                to, summary.nodes, summary.providers
-            );
-            return Ok(());
-        }
-    }
     if !args.is_empty() {
-        anyhow::bail!("usage: telemetry-server [rebuild-v2 --from OLD_DB --to NEW_DB]");
+        anyhow::bail!("usage: telemetry-server");
     }
     let db = std::env::var_os("TELEMETRY_DB")
         .map(PathBuf::from)

@@ -22,9 +22,11 @@ const DASHBOARD_HTML: &str = include_str!("../web/index.html");
 const DASHBOARD_CSS: &str = include_str!("../web/styles.css");
 const DASHBOARD_FAVICON: &str = include_str!("../web/favicon.svg");
 const DASHBOARD_JS: &str = include_str!("../web/app.js");
+const DASHBOARD_CHARTS_JS: &str = include_str!("../web/charts.js");
 const DASHBOARD_I18N_JS: &str = include_str!("../web/i18n.js");
 const DASHBOARD_RANGE_JS: &str = include_str!("../web/range.js");
 const DASHBOARD_QUOTA_JS: &str = include_str!("../web/quota-view.js");
+const ECHARTS_JS: &str = include_str!("../web/vendor/echarts.esm.min.mjs");
 const MAX_RANGE_DAYS: i64 = 720;
 const MAX_RANGE_SECONDS: i64 = MAX_RANGE_DAYS * 24 * 60 * 60;
 const MAX_TREND_POINTS: i64 = 20_000;
@@ -193,7 +195,6 @@ pub struct CoverageResponse {
     pub last_event_at: Option<i64>,
     pub includes_detail: bool,
     pub includes_rollups: bool,
-    pub source_kinds: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -482,16 +483,11 @@ fn fresh_input_sql(alias: &str) -> String {
     cc_switch_usage_core::sql::fresh_input(alias)
 }
 
-fn accounting_source(include_rollups: bool) -> String {
-    let effective = cc_switch_usage_core::sql::effective_usage_log_filter_for_table(
-        "d",
-        "usage_events",
-        Some("proxy_dedup.node_id = d.node_id"),
-    );
+fn accounting_source(query: &ResolvedQuery, include_rollups: bool, use_cache: bool) -> String {
     let fresh = cc_switch_usage_core::sql::fresh_input("d");
     let app = cc_switch_usage_core::sql::folded_app_type("d.app_type");
     let model = cc_switch_usage_core::sql::effective_model("d");
-    let detail = format!(
+    let detail_projection = format!(
         "SELECT d.node_id,d.created_at,{app} AS app_type,d.app_type AS provider_app_type,
                 d.provider_id,{model} AS model,d.request_model,d.pricing_model,
                 {fresh} AS input_tokens,d.output_tokens,d.cache_read_tokens,
@@ -500,16 +496,79 @@ fn accounting_source(include_rollups: bool) -> String {
                 1 AS request_count,
                 CASE WHEN d.status_code>=200 AND d.status_code<300 THEN 1 ELSE 0 END AS success_count,
                 CAST(d.latency_ms AS REAL) AS latency_total_ms,
-                d.created_at + 1 AS day_end_utc,0 AS is_rollup
-         FROM usage_events d WHERE {effective}"
+                d.created_at + 1 AS day_end_utc,0 AS source_class,
+                d.created_at AS first_event_at,d.created_at AS last_event_at"
     );
+    let full_start = if query.from.rem_euclid(crate::usage_cache::HOUR_SECONDS) == 0 {
+        query.from
+    } else {
+        crate::usage_cache::hour_start(query.from) + crate::usage_cache::HOUR_SECONDS
+    };
+    let full_end = crate::usage_cache::hour_start(query.to);
+    let detail = if use_cache && full_start < full_end {
+        let mut sources = Vec::new();
+        if query.from < full_start {
+            sources.push(format!(
+                "{detail_projection} FROM usage_events d
+                 WHERE d.created_at>={} AND d.created_at<{}",
+                query.from, full_start
+            ));
+        }
+        sources.push(format!(
+            "{detail_projection}
+             FROM usage_cache_partitions AS cache_partition
+                  INDEXED BY idx_usage_cache_partitions_state
+             JOIN usage_events AS d INDEXED BY idx_usage_events_node
+               ON d.node_id=cache_partition.node_id
+              AND d.created_at>=cache_partition.hour_start
+              AND d.created_at<cache_partition.hour_start+3600
+             WHERE cache_partition.state='dirty'
+               AND cache_partition.hour_start>={full_start}
+               AND cache_partition.hour_start<{full_end}"
+        ));
+        if full_end < query.to {
+            sources.push(format!(
+                "{detail_projection} FROM usage_events d
+                 WHERE d.created_at>={full_end} AND d.created_at<{}",
+                query.to
+            ));
+        }
+        sources.join(" UNION ALL ")
+    } else {
+        format!(
+            "{detail_projection} FROM usage_events d
+             WHERE d.created_at>={} AND d.created_at<{}",
+            query.from, query.to
+        )
+    };
+    let cache = if use_cache {
+        format!(
+            " UNION ALL
+              SELECT c.node_id,c.hour_start,c.app_type,c.provider_app_type,c.provider_id,
+                     c.model,c.request_model,c.pricing_model,c.input_tokens,c.output_tokens,
+                     c.cache_read_tokens,c.cache_creation_tokens,2,c.total_cost_usd,
+                     CASE WHEN c.request_count>0
+                          THEN c.latency_total_ms/c.request_count ELSE 0 END,
+                     200,0,c.data_source,c.request_count,c.success_count,c.latency_total_ms,
+                     c.hour_start+3600,2,c.first_event_at,c.last_event_at
+              FROM usage_cache_partitions AS cache_partition
+                   INDEXED BY idx_usage_cache_partitions_state
+              JOIN usage_hourly_cache AS c
+                ON cache_partition.node_id=c.node_id
+               AND cache_partition.hour_start=c.hour_start
+               AND cache_partition.state='clean'
+              WHERE c.hour_start>={full_start} AND c.hour_start<{full_end} "
+        )
+    } else {
+        String::new()
+    };
     if !include_rollups {
-        return format!("({detail})");
+        return format!("({detail}{cache})");
     }
     let rollup_app = cc_switch_usage_core::sql::folded_app_type("r.app_type");
     let rollup_model = cc_switch_usage_core::sql::effective_model("r");
     format!(
-        "({detail}
+        "({detail}{cache}
          UNION ALL
          SELECT r.node_id,r.day_start_utc,{rollup_app} AS app_type,
                 r.app_type AS provider_app_type,r.provider_id,{rollup_model} AS model,
@@ -517,14 +576,14 @@ fn accounting_source(include_rollups: bool) -> String {
                 r.cache_read_tokens,r.cache_creation_tokens,r.input_token_semantics,
                 r.total_cost_usd,r.avg_latency_ms,200,0,'rollup',r.request_count,
                 r.success_count,CAST(r.avg_latency_ms AS REAL)*r.request_count,
-                r.day_end_utc,1
+                r.day_end_utc,1,r.day_start_utc,r.day_end_utc-1
          FROM usage_daily_snapshots r)"
     )
 }
 
 fn where_clause(query: &ResolvedQuery) -> (String, Vec<Value>) {
-    let mut conditions = vec!["((l.is_rollup=0 AND l.created_at>=? AND l.created_at<?)
-          OR (l.is_rollup=1 AND l.created_at>=? AND l.day_end_utc<=?))"
+    let mut conditions = vec!["((l.source_class=0 AND l.created_at>=? AND l.created_at<?)
+          OR (l.source_class<>0 AND l.created_at>=? AND l.day_end_utc<=?))"
         .to_owned()];
     let mut values = vec![
         Value::Integer(query.from),
@@ -551,11 +610,6 @@ fn detail_where_clause(query: &ResolvedQuery) -> (String, Vec<Value>) {
     let mut conditions = vec![
         "l.created_at >= ?".to_owned(),
         "l.created_at < ?".to_owned(),
-        cc_switch_usage_core::sql::effective_usage_log_filter_for_table(
-            "l",
-            "usage_events",
-            Some("proxy_dedup.node_id = l.node_id"),
-        ),
     ];
     let mut values = vec![Value::Integer(query.from), Value::Integer(query.to)];
     if let Some(value) = &query.node_id {
@@ -617,35 +671,8 @@ fn summary_from_row(
             last_event_at: row.get(10)?,
             includes_detail: row.get::<_, i64>(11)? != 0,
             includes_rollups: row.get::<_, i64>(12)? != 0,
-            source_kinds: Vec::new(),
         },
     ))
-}
-
-fn current_source_kinds(
-    connection: &Connection,
-    node_id: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
-    let mut sql = "SELECT DISTINCT g.source_kind
-                   FROM sync_generations g
-                   WHERE g.status='committed'
-                     AND g.rowid=(
-                       SELECT latest.rowid FROM sync_generations latest
-                       WHERE latest.node_id=g.node_id AND latest.status='committed'
-                       ORDER BY latest.committed_at DESC,latest.rowid DESC LIMIT 1
-                     )"
-    .to_owned();
-    let mut values = Vec::new();
-    if let Some(node_id) = node_id {
-        sql.push_str(" AND g.node_id=?");
-        values.push(Value::Text(node_id.to_owned()));
-    }
-    sql.push_str(" ORDER BY g.source_kind");
-    let mut statement = connection.prepare(&sql)?;
-    let source_kinds = statement
-        .query_map(params_from_iter(values.iter()), |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(source_kinds)
 }
 
 fn percentage(numerator: i64, denominator: i64) -> f64 {
@@ -671,7 +698,7 @@ fn query_overview(path: &Path, query: ResolvedQuery) -> anyhow::Result<OverviewR
         "({fresh_input} + l.output_tokens + l.cache_creation_tokens + l.cache_read_tokens)"
     );
     let (where_sql, values) = where_clause(&query);
-    let source = accounting_source(true);
+    let source = accounting_source(&query, true, true);
     let summary_sql = format!(
         "SELECT COALESCE(SUM(l.request_count),0),
                 COALESCE(SUM(l.success_count),0),
@@ -684,18 +711,17 @@ fn query_overview(path: &Path, query: ResolvedQuery) -> anyhow::Result<OverviewR
                 CASE WHEN COALESCE(SUM(l.request_count),0)>0
                      THEN COALESCE(SUM(l.latency_total_ms),0.0)/SUM(l.request_count)
                      ELSE 0.0 END,
-                MIN(l.created_at),
-                MAX(CASE WHEN l.is_rollup=1 THEN l.day_end_utc-1 ELSE l.created_at END),
-                COALESCE(MAX(CASE WHEN l.is_rollup=0 THEN 1 ELSE 0 END),0),
-                COALESCE(MAX(CASE WHEN l.is_rollup=1 THEN 1 ELSE 0 END),0)
+                MIN(l.first_event_at),
+                MAX(l.last_event_at),
+                COALESCE(MAX(CASE WHEN l.source_class IN (0,2) THEN 1 ELSE 0 END),0),
+                COALESCE(MAX(CASE WHEN l.source_class=1 THEN 1 ELSE 0 END),0)
          FROM {source} l WHERE {where_sql}"
     );
-    let (summary, mut coverage) = connection.query_row(
+    let (summary, coverage) = connection.query_row(
         &summary_sql,
         params_from_iter(values.iter()),
         summary_from_row,
     )?;
-    coverage.source_kinds = current_source_kinds(&connection, query.node_id.as_deref())?;
 
     let trend = query_trend(&connection, &query, &fresh_input)?;
     let breakdowns = BreakdownsResponse {
@@ -754,7 +780,9 @@ fn query_trend(
         format!("(((l.created_at + {offset}) / {seconds}) * {seconds}) - {offset}")
     };
     let (where_sql, values) = where_clause(query);
-    let source = accounting_source(true);
+    let use_cache = !is_month && seconds >= 3600 && seconds % 3600 == 0 && offset % 3600 == 0
+        || is_month && offset % 3600 == 0;
+    let source = accounting_source(query, true, use_cache);
     let sql = format!(
         "SELECT {bucket_start},
                 COALESCE(SUM(l.request_count),0),
@@ -850,7 +878,7 @@ fn query_breakdown(
 ) -> anyhow::Result<Vec<BreakdownItem>> {
     debug_assert!(matches!(dimension, "node_id" | "app_type" | "model"));
     let (where_sql, values) = where_clause(query);
-    let source = accounting_source(true);
+    let source = accounting_source(query, true, true);
     let label_expression = if dimension == "node_id" {
         "COALESCE(NULLIF(n.node_name, ''), l.node_id)".to_owned()
     } else {
@@ -895,7 +923,7 @@ fn query_provider_breakdown(
     real_total: &str,
 ) -> anyhow::Result<Vec<BreakdownItem>> {
     let (where_sql, values) = where_clause(query);
-    let source = accounting_source(true);
+    let source = accounting_source(query, true, true);
     let sql = format!(
         "SELECT l.provider_id,
                 COALESCE(NULLIF(p.name, ''), l.provider_id),
@@ -933,7 +961,7 @@ fn query_provider_breakdown(
 fn query_filters(path: &Path, query: ResolvedQuery) -> anyhow::Result<FiltersResponse> {
     let connection = open_read_connection(path)?;
     let (where_sql, values) = where_clause(&query);
-    let source = accounting_source(true);
+    let source = accounting_source(&query, true, true);
     let sql = format!(
         "SELECT l.node_id, COALESCE(NULLIF(n.node_name, ''), l.node_id),
                 l.app_type, l.provider_id, l.model, l.data_source,
@@ -1201,6 +1229,10 @@ async fn script() -> Response {
     static_response("text/javascript; charset=utf-8", DASHBOARD_JS)
 }
 
+async fn charts_script() -> Response {
+    static_response("text/javascript; charset=utf-8", DASHBOARD_CHARTS_JS)
+}
+
 async fn i18n_script() -> Response {
     static_response("text/javascript; charset=utf-8", DASHBOARD_I18N_JS)
 }
@@ -1211,6 +1243,10 @@ async fn range_script() -> Response {
 
 async fn quota_script() -> Response {
     static_response("text/javascript; charset=utf-8", DASHBOARD_QUOTA_JS)
+}
+
+async fn echarts_script() -> Response {
+    static_response("text/javascript; charset=utf-8", ECHARTS_JS)
 }
 
 async fn root() -> Redirect {
@@ -1225,18 +1261,25 @@ pub fn routes() -> Router<ServerState> {
         .route("/dashboard/styles.css", get(styles))
         .route("/dashboard/favicon.svg", get(favicon))
         .route("/dashboard/app.js", get(script))
+        .route("/dashboard/charts.js", get(charts_script))
         .route("/dashboard/i18n.js", get(i18n_script))
         .route("/dashboard/range.js", get(range_script))
         .route("/dashboard/quota-view.js", get(quota_script))
-        .route("/v2/dashboard/overview", get(overview))
-        .route("/v2/dashboard/daily", get(daily))
-        .route("/v2/dashboard/filters", get(filters))
-        .route("/v2/dashboard/events", get(events))
-        .route("/v2/dashboard/quota", get(crate::quota::dashboard))
-        .route("/v1/dashboard/overview", get(super::v1_upgrade_required))
-        .route("/v1/dashboard/daily", get(super::v1_upgrade_required))
-        .route("/v1/dashboard/filters", get(super::v1_upgrade_required))
-        .route("/v1/dashboard/events", get(super::v1_upgrade_required))
+        .route("/dashboard/vendor/echarts.esm.min.mjs", get(echarts_script))
+        .route("/v3/dashboard/overview", get(overview))
+        .route("/v3/dashboard/daily", get(daily))
+        .route("/v3/dashboard/filters", get(filters))
+        .route("/v3/dashboard/events", get(events))
+        .route("/v3/dashboard/quota", get(crate::quota::dashboard))
+        .route("/v2/dashboard/overview", get(super::upgrade_required))
+        .route("/v2/dashboard/daily", get(super::upgrade_required))
+        .route("/v2/dashboard/filters", get(super::upgrade_required))
+        .route("/v2/dashboard/events", get(super::upgrade_required))
+        .route("/v2/dashboard/quota", get(super::upgrade_required))
+        .route("/v1/dashboard/overview", get(super::upgrade_required))
+        .route("/v1/dashboard/daily", get(super::upgrade_required))
+        .route("/v1/dashboard/filters", get(super::upgrade_required))
+        .route("/v1/dashboard/events", get(super::upgrade_required))
         .route_layer(middleware::from_fn(local_only))
 }
 
@@ -1515,6 +1558,137 @@ mod tests {
     }
 
     #[test]
+    fn clean_hour_cache_matches_raw_and_dirty_partitions_fall_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let connection = init_db(&path).unwrap();
+        insert_event(
+            &connection,
+            "first",
+            100,
+            TestUsage {
+                app_type: "codex",
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_read_tokens: 40,
+                cache_creation_tokens: 10,
+                input_token_semantics: 1,
+                status_code: 200,
+            },
+        );
+        crate::usage_cache::mark_event_dirty(&connection, "node-a", 100).unwrap();
+        let query = resolve_query(DashboardQuery {
+            from: Some(0),
+            to: Some(3_600),
+            bucket: Some("1h".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        let raw = query_overview(&path, query.clone()).unwrap();
+
+        assert!(crate::usage_cache::rebuild_one(&connection).unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM usage_cache_partitions
+                     WHERE node_id='node-a' AND hour_start=0",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "clean"
+        );
+        let cached = query_overview(&path, query.clone()).unwrap();
+        assert_eq!(cached.summary.total_requests, raw.summary.total_requests);
+        assert_eq!(
+            cached.summary.real_total_tokens,
+            raw.summary.real_total_tokens
+        );
+        assert_eq!(cached.summary.total_cost_usd, raw.summary.total_cost_usd);
+        assert_eq!(cached.summary.avg_latency_ms, raw.summary.avg_latency_ms);
+        assert_eq!(cached.coverage.first_event_at, raw.coverage.first_event_at);
+        assert_eq!(cached.coverage.last_event_at, raw.coverage.last_event_at);
+        assert_eq!(cached.breakdowns.nodes[0].total_requests, 1);
+        let source = accounting_source(&query, false, true);
+        let (where_sql, values) = where_clause(&query);
+        let plan_sql = format!(
+            "EXPLAIN QUERY PLAN
+             SELECT COALESCE(SUM(l.request_count),0) FROM {source} l WHERE {where_sql}"
+        );
+        let mut plan_statement = connection.prepare(&plan_sql).unwrap();
+        let plan = plan_statement
+            .query_map(params_from_iter(values.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_usage_cache_partitions_state")),
+            "cache partition index missing from plan: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step.contains("usage_hourly_cache")),
+            "hourly cache missing from plan: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN d")),
+            "clean-hour plan must not scan raw details: {plan:?}"
+        );
+        drop(plan_statement);
+
+        insert_event(
+            &connection,
+            "second",
+            200,
+            TestUsage {
+                app_type: "codex",
+                input_tokens: 50,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                input_token_semantics: 2,
+                status_code: 500,
+            },
+        );
+        crate::usage_cache::mark_event_dirty(&connection, "node-a", 200).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_hourly_cache
+                     WHERE node_id='node-a' AND hour_start=0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let dirty_fallback = query_overview(&path, query.clone()).unwrap();
+        assert_eq!(dirty_fallback.summary.total_requests, 2);
+        assert_eq!(dirty_fallback.summary.successful_requests, 1);
+
+        assert!(crate::usage_cache::rebuild_one(&connection).unwrap());
+        let rebuilt = query_overview(&path, query).unwrap();
+        assert_eq!(
+            rebuilt.summary.total_requests,
+            dirty_fallback.summary.total_requests
+        );
+        assert_eq!(
+            rebuilt.summary.real_total_tokens,
+            dirty_fallback.summary.real_total_tokens
+        );
+        assert_eq!(
+            rebuilt.summary.total_cost_usd,
+            dirty_fallback.summary.total_cost_usd
+        );
+        assert_eq!(
+            rebuilt.summary.avg_latency_ms,
+            dirty_fallback.summary.avg_latency_ms
+        );
+    }
+
+    #[test]
     fn overview_includes_only_fully_covered_rollup_days() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("telemetry.db");
@@ -1532,14 +1706,6 @@ mod tests {
                      'codex','provider-a','gpt-5','','',3,2,50,20,30,10,2,
                      '0.25',40,100,200,'rollup-hash',200
                  )",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO sync_generations (
-                   generation_id,node_id,source_kind,replace_all,status,created_at,committed_at
-                 ) VALUES ('generation-a','node-a','cc-switch',1,'committed',90,90)",
                 [],
             )
             .unwrap();
@@ -1563,7 +1729,6 @@ mod tests {
         assert_eq!(full.summary.avg_latency_ms, 40.0);
         assert!(!full.coverage.includes_detail);
         assert!(full.coverage.includes_rollups);
-        assert_eq!(full.coverage.source_kinds, ["cc-switch"]);
 
         let partial = query_overview(
             &path,
@@ -1580,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_source_dedup_is_partitioned_by_node() {
+    fn dashboard_counts_every_row_without_cross_source_deduplication() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("telemetry.db");
         let connection = init_db(&path).unwrap();
@@ -1609,7 +1774,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "UPDATE usage_events SET node_id='node-b',event_id='node-b:cross'
+                "UPDATE usage_events SET node_id='node-b',event_id='node-b:codex:cross'
                  WHERE request_id='cross'",
                 [],
             )
@@ -1626,7 +1791,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(overview.summary.total_requests, 2);
+        assert_eq!(overview.summary.total_requests, 3);
         assert_eq!(overview.breakdowns.nodes.len(), 2);
     }
 
@@ -1791,6 +1956,49 @@ mod tests {
             "text/javascript; charset=utf-8"
         );
 
+        let charts = router(state.clone()).layer(MockConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = charts
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/charts.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+
+        let echarts = router(state.clone()).layer(MockConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = echarts
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/vendor/echarts.esm.min.mjs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(body.len() > 1_000_000);
+        assert!(body
+            .windows("Licensed to the Apache Software Foundation".len())
+            .any(|window| window == "Licensed to the Apache Software Foundation".as_bytes()));
+
         let remote = router(state.clone()).layer(MockConnectInfo(
             "192.0.2.1:12345".parse::<SocketAddr>().unwrap(),
         ));
@@ -1811,7 +2019,7 @@ mod tests {
         let response = api
             .oneshot(
                 Request::builder()
-                    .uri("/v2/dashboard/overview?from=1&to=2")
+                    .uri("/v3/dashboard/overview?from=1&to=2")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1828,7 +2036,7 @@ mod tests {
         let response = events_api
             .oneshot(
                 Request::builder()
-                    .uri("/v2/dashboard/events?from=1&to=2&limit=2")
+                    .uri("/v3/dashboard/events?from=1&to=2&limit=2")
                     .body(Body::empty())
                     .unwrap(),
             )

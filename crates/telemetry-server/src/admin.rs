@@ -1,14 +1,18 @@
 use crate::{nodes, ServerState};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, patch, post},
     Json, Router,
 };
-use serde::Deserialize;
+use rusqlite::{Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "telemetry_admin_session";
@@ -26,6 +30,39 @@ pub struct LoginRequest {
 #[serde(rename_all = "camelCase")]
 pub struct NodeNameRequest {
     pub node_name: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogKind {
+    Request,
+    Quota,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogPreviewQuery {
+    pub kind: LogKind,
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogPurgeRequest {
+    pub kind: LogKind,
+    pub node_id: Option<String>,
+    pub confirmation: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogOperationResponse {
+    pub kind: LogKind,
+    pub node_id: Option<String>,
+    pub confirmation: String,
+    pub counts: BTreeMap<String, u64>,
+    pub total_rows: u64,
+    pub purged: bool,
+    pub warning: &'static str,
 }
 
 fn json_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
@@ -125,6 +162,245 @@ fn database_error(error: impl std::fmt::Display) -> Response {
         "database_unavailable",
         error.to_string(),
     )
+}
+
+fn normalize_log_node_id(node_id: Option<String>) -> Result<Option<String>, Box<Response>> {
+    let Some(node_id) = node_id else {
+        return Ok(None);
+    };
+    let node_id = node_id.trim().to_owned();
+    if node_id.is_empty() || node_id.len() > 128 || node_id.chars().any(char::is_control) {
+        return Err(Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_node_id",
+            "node_id must identify one existing node",
+        )));
+    }
+    Ok(Some(node_id))
+}
+
+fn require_existing_node(
+    connection: &Connection,
+    node_id: Option<&str>,
+) -> Result<(), Box<Response>> {
+    let Some(node_id) = node_id else {
+        return Ok(());
+    };
+    let exists = connection
+        .query_row("SELECT 1 FROM nodes WHERE uuid=?1", [node_id], |_| Ok(()))
+        .optional()
+        .map_err(|error| Box::new(database_error(error)))?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(Box::new(json_error(
+            StatusCode::NOT_FOUND,
+            "node_not_found",
+            "node not found",
+        )))
+    }
+}
+
+fn log_confirmation(kind: LogKind, node_id: Option<&str>) -> String {
+    let kind = match kind {
+        LogKind::Request => "REQUEST",
+        LogKind::Quota => "QUOTA",
+    };
+    format!("DELETE {kind} LOGS {}", node_id.unwrap_or("ALL"))
+}
+
+fn log_warning(kind: LogKind) -> &'static str {
+    match kind {
+        LogKind::Request => {
+            "Server deletion does not change the client baseline. Deleted rows return only after a deliberate full re-upload; active clients can still upload new logs."
+        }
+        LogKind::Quota => {
+            "Quota deletion is server-local. Active clients can publish new samples and current provider state again."
+        }
+    }
+}
+
+fn direct_count(
+    connection: &Connection,
+    table: &str,
+    node_id: Option<&str>,
+) -> rusqlite::Result<u64> {
+    let sql = if node_id.is_some() {
+        format!("SELECT COUNT(*) FROM {table} WHERE node_id=?1")
+    } else {
+        format!("SELECT COUNT(*) FROM {table}")
+    };
+    match node_id {
+        Some(node_id) => connection.query_row(&sql, [node_id], |row| row.get(0)),
+        None => connection.query_row(&sql, [], |row| row.get(0)),
+    }
+}
+
+fn staged_count(
+    connection: &Connection,
+    table: &str,
+    node_id: Option<&str>,
+) -> rusqlite::Result<u64> {
+    let sql = if node_id.is_some() {
+        format!(
+            "SELECT COUNT(*) FROM {table} s
+             JOIN sync_generations g ON g.generation_id=s.generation_id
+             WHERE g.node_id=?1"
+        )
+    } else {
+        format!("SELECT COUNT(*) FROM {table}")
+    };
+    match node_id {
+        Some(node_id) => connection.query_row(&sql, [node_id], |row| row.get(0)),
+        None => connection.query_row(&sql, [], |row| row.get(0)),
+    }
+}
+
+fn collect_log_counts(
+    connection: &Connection,
+    kind: LogKind,
+    node_id: Option<&str>,
+) -> rusqlite::Result<BTreeMap<String, u64>> {
+    let mut counts = BTreeMap::new();
+    match kind {
+        LogKind::Request => {
+            for table in [
+                "usage_events",
+                "usage_daily_snapshots",
+                "usage_hourly_cache",
+                "usage_cache_partitions",
+                "sync_generations",
+                "ingest_batches",
+            ] {
+                counts.insert(table.to_owned(), direct_count(connection, table, node_id)?);
+            }
+            for table in [
+                "staged_event_mutations",
+                "staged_rollup_mutations",
+                "staged_providers",
+            ] {
+                counts.insert(table.to_owned(), staged_count(connection, table, node_id)?);
+            }
+        }
+        LogKind::Quota => {
+            for table in [
+                "quota_metrics",
+                "quota_observations",
+                "quota_provider_states",
+            ] {
+                counts.insert(table.to_owned(), direct_count(connection, table, node_id)?);
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn delete_direct(
+    transaction: &Transaction<'_>,
+    table: &str,
+    node_id: Option<&str>,
+) -> rusqlite::Result<u64> {
+    let sql = if node_id.is_some() {
+        format!("DELETE FROM {table} WHERE node_id=?1")
+    } else {
+        format!("DELETE FROM {table}")
+    };
+    match node_id {
+        Some(node_id) => transaction.execute(&sql, [node_id]),
+        None => transaction.execute(&sql, []),
+    }
+    .map(|count| count as u64)
+}
+
+fn delete_staged(
+    transaction: &Transaction<'_>,
+    table: &str,
+    node_id: Option<&str>,
+) -> rusqlite::Result<u64> {
+    let sql = if node_id.is_some() {
+        format!(
+            "DELETE FROM {table}
+             WHERE generation_id IN (
+               SELECT generation_id FROM sync_generations WHERE node_id=?1
+             )"
+        )
+    } else {
+        format!("DELETE FROM {table}")
+    };
+    match node_id {
+        Some(node_id) => transaction.execute(&sql, [node_id]),
+        None => transaction.execute(&sql, []),
+    }
+    .map(|count| count as u64)
+}
+
+fn purge_logs(
+    connection: &mut Connection,
+    kind: LogKind,
+    node_id: Option<&str>,
+) -> rusqlite::Result<BTreeMap<String, u64>> {
+    let transaction = connection.transaction()?;
+    let mut counts = BTreeMap::new();
+    match kind {
+        LogKind::Request => {
+            for table in [
+                "staged_event_mutations",
+                "staged_rollup_mutations",
+                "staged_providers",
+            ] {
+                counts.insert(
+                    table.to_owned(),
+                    delete_staged(&transaction, table, node_id)?,
+                );
+            }
+            for table in [
+                "sync_generations",
+                "usage_hourly_cache",
+                "usage_cache_partitions",
+                "usage_events",
+                "usage_daily_snapshots",
+                "ingest_batches",
+            ] {
+                counts.insert(
+                    table.to_owned(),
+                    delete_direct(&transaction, table, node_id)?,
+                );
+            }
+        }
+        LogKind::Quota => {
+            for table in [
+                "quota_metrics",
+                "quota_observations",
+                "quota_provider_states",
+            ] {
+                counts.insert(
+                    table.to_owned(),
+                    delete_direct(&transaction, table, node_id)?,
+                );
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(counts)
+}
+
+fn log_response(
+    kind: LogKind,
+    node_id: Option<String>,
+    counts: BTreeMap<String, u64>,
+    purged: bool,
+) -> LogOperationResponse {
+    let total_rows = counts.values().sum();
+    LogOperationResponse {
+        kind,
+        confirmation: log_confirmation(kind, node_id.as_deref()),
+        node_id,
+        counts,
+        total_rows,
+        purged,
+        warning: log_warning(kind),
+    }
 }
 
 async fn index() -> Html<&'static str> {
@@ -330,6 +606,62 @@ async fn revoke_token(
     }
 }
 
+async fn preview_logs(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<LogPreviewQuery>,
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers) {
+        return *response;
+    }
+    let node_id = match normalize_log_node_id(query.node_id) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let Ok(db) = state.db.lock() else {
+        return database_error("database lock unavailable");
+    };
+    if let Err(response) = require_existing_node(&db, node_id.as_deref()) {
+        return *response;
+    }
+    match collect_log_counts(&db, query.kind, node_id.as_deref()) {
+        Ok(counts) => Json(log_response(query.kind, node_id, counts, false)).into_response(),
+        Err(error) => database_error(error),
+    }
+}
+
+async fn purge_logs_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(payload): Json<LogPurgeRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers) {
+        return *response;
+    }
+    let node_id = match normalize_log_node_id(payload.node_id) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let expected = log_confirmation(payload.kind, node_id.as_deref());
+    if payload.confirmation != expected {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "confirmation_mismatch",
+            format!("confirmation must exactly match: {expected}"),
+        );
+    }
+    let Ok(mut db) = state.db.lock() else {
+        return database_error("database lock unavailable");
+    };
+    if let Err(response) = require_existing_node(&db, node_id.as_deref()) {
+        return *response;
+    }
+    match purge_logs(&mut db, payload.kind, node_id.as_deref()) {
+        Ok(counts) => Json(log_response(payload.kind, node_id, counts, true)).into_response(),
+        Err(error) => database_error(error),
+    }
+}
+
 pub fn routes() -> Router<ServerState> {
     Router::new()
         .route("/admin", get(index))
@@ -345,6 +677,8 @@ pub fn routes() -> Router<ServerState> {
             "/admin/api/nodes/:uuid/token",
             post(regenerate_token).delete(revoke_token),
         )
+        .route("/admin/api/logs/preview", get(preview_logs))
+        .route("/admin/api/logs/purge", post(purge_logs_handler))
 }
 
 #[cfg(test)]
@@ -364,6 +698,277 @@ mod tests {
 
     fn json_body(value: serde_json::Value) -> Body {
         Body::from(serde_json::to_vec(&value).unwrap())
+    }
+
+    fn seed_logs(connection: &Connection, node_id: &str, suffix: &str) {
+        connection
+            .execute(
+                "INSERT INTO usage_events (
+                   event_id,node_id,request_id,created_at,app_type,provider_id,model,
+                   request_model,pricing_model,input_tokens,output_tokens,cache_read_tokens,
+                   cache_creation_tokens,input_token_semantics,total_cost_usd,latency_ms,
+                   status_code,is_streaming,data_source,content_hash,received_at
+                 ) VALUES (?1,?2,?3,100,'codex','provider','model','','',1,2,3,4,2,
+                           '0.1',5,200,0,'proxy','hash',100)",
+                rusqlite::params![
+                    format!("{node_id}:codex:req-{suffix}"),
+                    node_id,
+                    format!("req-{suffix}")
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_daily_snapshots (
+                   snapshot_key,node_id,date,app_type,provider_id,model,request_model,
+                   pricing_model,request_count,success_count,input_tokens,output_tokens,
+                   cache_read_tokens,cache_creation_tokens,input_token_semantics,total_cost_usd,
+                   avg_latency_ms,day_start_utc,day_end_utc,content_hash,received_at
+                 ) VALUES (?1,?2,'1970-01-01','codex','provider','model','','',1,1,1,2,3,4,
+                           2,'0.1',5,0,86400,'hash',100)",
+                rusqlite::params![format!("snapshot-{suffix}"), node_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO provider_catalog(node_id,app_type,provider_id,name,updated_at)
+                 VALUES (?1,'codex','provider',?2,100)",
+                rusqlite::params![node_id, format!("Provider {suffix}")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_cache_partitions(node_id,hour_start,state,updated_at)
+                 VALUES (?1,0,'clean',100)",
+                [node_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_hourly_cache (
+                   node_id,hour_start,app_type,provider_app_type,provider_id,model,
+                   request_model,pricing_model,data_source,request_count,success_count,
+                   input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,
+                   total_cost_usd,latency_total_ms,first_event_at,last_event_at
+                 ) VALUES (?1,0,'codex','codex','provider','model','','','proxy',1,1,
+                           1,2,3,4,'0.1',5,100,100)",
+                [node_id],
+            )
+            .unwrap();
+        let generation_id = format!("generation-{suffix}");
+        connection
+            .execute(
+                "INSERT INTO sync_generations (
+                   generation_id,node_id,replace_all,status,created_at
+                 ) VALUES (?1,?2,0,'open',100)",
+                rusqlite::params![generation_id, node_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO staged_event_mutations (
+                   generation_id,app_type,request_id,operation,content_hash,payload_json
+                 ) VALUES (?1,'codex',?2,'delete','hash',NULL)",
+                rusqlite::params![generation_id, format!("staged-{suffix}")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO staged_rollup_mutations (
+                   generation_id,snapshot_key,operation,content_hash,payload_json
+                 ) VALUES (?1,?2,'delete','hash',NULL)",
+                rusqlite::params![generation_id, format!("staged-rollup-{suffix}")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO staged_providers(generation_id,app_type,provider_id,name)
+                 VALUES (?1,'codex','provider','Provider')",
+                [generation_id.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ingest_batches(batch_id,node_id,received_at,event_count)
+                 VALUES (?1,?2,100,1)",
+                rusqlite::params![format!("batch-{suffix}"), node_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_provider_states (
+                   node_id,app_type,provider_id,provider_name,status,target_kind,
+                   checked_at,last_success_at,received_at
+                 ) VALUES (?1,'codex','provider','Provider','ok',NULL,100,100,100)",
+                [node_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_observations (
+                   node_id,observation_id,content_hash,app_type,provider_id,sampled_at,received_at
+                 ) VALUES (?1,?2,'hash','codex','provider',100,100)",
+                rusqlite::params![node_id, format!("observation-{suffix}")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_metrics (
+                   node_id,observation_id,metric_key,metric_label,metric_kind,
+                   utilization_percent,used,remaining,total,unit,resets_at
+                 ) VALUES (?1,?2,'five_hour','5h','utilizationPercent',50,NULL,NULL,NULL,NULL,NULL)",
+                rusqlite::params![node_id, format!("observation-{suffix}")],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn log_purge_is_authenticated_typed_scoped_and_confirmed() {
+        let state = ServerState::new(
+            init_db(":memory:").unwrap(),
+            PathBuf::from("telemetry.db"),
+            Some("unit-test-admin".to_owned()),
+        );
+        let (node_a, _) = nodes::create(&state.db.lock().unwrap(), "LB13").unwrap();
+        let (node_b, _) = nodes::create(&state.db.lock().unwrap(), "LB16").unwrap();
+        {
+            let connection = state.db.lock().unwrap();
+            seed_logs(&connection, &node_a.uuid, "a");
+            seed_logs(&connection, &node_b.uuid, "b");
+        }
+        state.admin_sessions.lock().unwrap().insert(
+            "purge-test".to_owned(),
+            Instant::now() + Duration::from_secs(60),
+        );
+        let cookie = "telemetry_admin_session=purge-test";
+        let app = router(state.clone());
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/api/logs/preview?kind=request&node_id={}",
+                        node_a.uuid
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/api/logs/preview?kind=request&node_id={}",
+                        node_a.uuid
+                    ))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview = response_json(preview).await;
+        assert_eq!(preview["totalRows"], 9);
+        assert_eq!(preview["counts"]["usage_events"], 1);
+        let confirmation = preview["confirmation"].as_str().unwrap().to_owned();
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/logs/purge")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/json")
+                    .body(json_body(serde_json::json!({
+                        "kind": "request",
+                        "nodeId": node_a.uuid,
+                        "confirmation": "DELETE REQUEST LOGS"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let purged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/logs/purge")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/json")
+                    .body(json_body(serde_json::json!({
+                        "kind": "request",
+                        "nodeId": node_a.uuid,
+                        "confirmation": confirmation
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(purged.status(), StatusCode::OK);
+        let purged = response_json(purged).await;
+        assert_eq!(purged["totalRows"], 9);
+        assert_eq!(purged["purged"], true);
+        {
+            let connection = state.db.lock().unwrap();
+            assert_eq!(
+                direct_count(&connection, "usage_events", Some(&node_a.uuid)).unwrap(),
+                0
+            );
+            assert_eq!(
+                direct_count(&connection, "usage_events", Some(&node_b.uuid)).unwrap(),
+                1
+            );
+            assert_eq!(
+                direct_count(&connection, "quota_observations", Some(&node_a.uuid)).unwrap(),
+                1
+            );
+            assert_eq!(
+                direct_count(&connection, "provider_catalog", Some(&node_a.uuid)).unwrap(),
+                1
+            );
+            assert!(nodes::list(&connection)
+                .unwrap()
+                .iter()
+                .any(|node| node.uuid == node_a.uuid));
+        }
+
+        let quota_purged = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/logs/purge")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/json")
+                    .body(json_body(serde_json::json!({
+                        "kind": "quota",
+                        "confirmation": "DELETE QUOTA LOGS ALL"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(quota_purged.status(), StatusCode::OK);
+        let quota_purged = response_json(quota_purged).await;
+        assert_eq!(quota_purged["totalRows"], 6);
+        let connection = state.db.lock().unwrap();
+        assert_eq!(
+            direct_count(&connection, "quota_observations", None).unwrap(),
+            0
+        );
+        assert_eq!(
+            direct_count(&connection, "usage_events", Some(&node_b.uuid)).unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

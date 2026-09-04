@@ -240,8 +240,7 @@
           </div>
         </div>
         <div id="trendEmpty" class="empty-state" hidden data-i18n="trend.empty">No trend data for the current filters</div>
-        <svg id="trendChart" class="trend-chart" viewBox="0 0 900 280" role="img" aria-label="Usage trend chart" data-i18n-aria-label="trend.chartAria"></svg>
-        <div id="trendTooltip" class="chart-tooltip" role="tooltip" hidden></div>
+        <div id="trendChart" class="trend-chart echarts-chart" role="img" aria-label="Usage trend chart" data-i18n-aria-label="trend.chartAria"></div>
         <p id="coverageText" class="coverage muted">Data coverage: —</p>
       </section>
 
@@ -269,8 +268,7 @@
         </div>
         <div id="quotaCards" class="quota-cards" aria-live="polite"></div>
         <div id="quotaEmpty" class="empty-state" hidden data-i18n="quota.empty">No quota providers or samples for this selection</div>
-        <svg id="quotaChart" class="trend-chart quota-chart" viewBox="0 0 900 300" role="img" aria-label="Codex quota history chart" data-i18n-aria-label="quota.chartAria"></svg>
-        <div id="quotaLegend" class="quota-legend"></div>
+        <div id="quotaChart" class="trend-chart quota-chart echarts-chart" role="img" aria-label="Codex quota history chart" data-i18n-aria-label="quota.chartAria"></div>
         <p id="quotaBucket" class="coverage muted"></p>
       </section>
 
@@ -294,9 +292,8 @@
         </div>
         <div id="dailyEmpty" class="empty-state" hidden data-i18n="daily.empty">No daily data for the current filters</div>
         <div class="daily-scroll">
-          <div id="dailyHeatmap" class="daily-heatmap" role="grid" aria-label="Daily usage" data-i18n-aria-label="daily.chartAria"></div>
+          <div id="dailyHeatmap" class="daily-heatmap echarts-chart" role="img" aria-label="Daily usage" data-i18n-aria-label="daily.chartAria"></div>
         </div>
-        <div id="dailyTooltip" class="chart-tooltip daily-tooltip" role="tooltip" hidden></div>
       </section>
 
       <section class="panel breakdown-panel">

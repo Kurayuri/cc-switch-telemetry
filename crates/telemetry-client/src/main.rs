@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 use telemetry_client::quota::{self, QuotaConfig};
 use telemetry_client::usage_ledger::{self, LocalUsageConfig};
 use telemetry_client::{
-    database_fingerprint, sync_snapshot_v2_with_mode, verify_cc_switch_mirror, ClientConfig,
+    database_fingerprint, sync_snapshot_v3_with_mode, verify_cc_switch_mirror, ClientConfig,
     DatabaseFingerprint,
 };
 
@@ -19,7 +19,6 @@ fn client_config(database: PathBuf) -> anyhow::Result<ClientConfig> {
             .unwrap_or_else(|_| "http://127.0.0.1:8787".into()),
         auth_token,
         batch_size: 512,
-        overlap_seconds: 0,
     })
 }
 
@@ -56,10 +55,10 @@ async fn upload_ledger(
     force_replace_all: bool,
 ) -> anyhow::Result<()> {
     let result =
-        sync_snapshot_v2_with_mode(upload_config, provider_config, source, force_replace_all)
+        sync_snapshot_v3_with_mode(upload_config, provider_config, source, force_replace_all)
             .await?;
     eprintln!(
-        "usage sync v2: inserted={} updated={} unchanged={} deleted={} rollups={} providers={}",
+        "usage sync v3: inserted={} updated={} unchanged={} deleted={} rollups={} providers={}",
         result.inserted,
         result.updated,
         result.unchanged,
@@ -87,7 +86,6 @@ async fn main() -> anyhow::Result<()> {
             server_url: String::new(),
             auth_token: String::new(),
             batch_size: 512,
-            overlap_seconds: 0,
         };
         let report = verify_cc_switch_mirror(&read_config, &local.database)?;
         eprintln!(
@@ -161,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     eprintln!(
-        "telemetry-client starting: protocol=v2 source={} source_db={} ledger={}",
+        "telemetry-client starting: protocol=v3 collector={} source_db={} ledger={}",
         source,
         source_config.cc_switch_db.display(),
         local.database.display(),

@@ -1,9 +1,9 @@
 //! Client-owned usage ledger and source mirror.
 //!
-//! Exact mode mirrors cc-switch detail and rollups. Explicit `local` mode uses
+//! The unified ledger accepts cc-switch and local collectors. Explicit `local` mode uses
 //! the vendored six-source `session-usage-core` adapters and retains every
 //! imported detail row. `local-compact` applies the shared 30-day retention
-//! policy after importing. This module also owns the durable v2 upload-hash
+//! policy after importing. This module also owns the durable v3 upload-hash
 //! baseline and synthetic provider catalog.
 
 use crate::{read_events, ClientConfig, Cursor};
@@ -20,7 +20,13 @@ use std::{
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
-use telemetry_core::{RollupSnapshot, UsageEvent, SCHEMA_VERSION};
+use telemetry_core::{ProviderEntry, RollupSnapshot, UsageEvent, SCHEMA_VERSION};
+
+const LEDGER_SCHEMA_REVISION: &str = "unified-app-key-v3";
+
+fn expected_revision() -> String {
+    format!("{IMPORTER_REVISION}:{LEDGER_SCHEMA_REVISION}")
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalUsageConfig {
@@ -246,7 +252,7 @@ fn calculate_cost(record: &UsageRecord, pricing: Option<&Pricing>) -> ([String; 
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS proxy_request_logs (
- request_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, app_type TEXT NOT NULL, model TEXT NOT NULL,
+ request_id TEXT NOT NULL, provider_id TEXT NOT NULL, app_type TEXT NOT NULL, model TEXT NOT NULL,
  request_model TEXT, pricing_model TEXT, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
  cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
  input_token_semantics INTEGER NOT NULL DEFAULT 0, input_cost_usd TEXT NOT NULL DEFAULT '0',
@@ -254,7 +260,9 @@ CREATE TABLE IF NOT EXISTS proxy_request_logs (
  cache_creation_cost_usd TEXT NOT NULL DEFAULT '0', total_cost_usd TEXT NOT NULL DEFAULT '0',
  latency_ms INTEGER NOT NULL DEFAULT 0, first_token_ms INTEGER, duration_ms INTEGER, status_code INTEGER NOT NULL DEFAULT 200,
  error_message TEXT, session_id TEXT, provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 1,
- cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL, data_source TEXT NOT NULL DEFAULT 'proxy'
+ cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL, data_source TEXT NOT NULL DEFAULT 'proxy',
+ last_collector TEXT NOT NULL DEFAULT 'unknown',
+ PRIMARY KEY (app_type, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type);
 CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON proxy_request_logs(created_at);
@@ -280,14 +288,23 @@ CREATE TABLE IF NOT EXISTS usage_daily_rollups (
  input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
  cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
  input_token_semantics INTEGER NOT NULL DEFAULT 2, total_cost_usd TEXT NOT NULL DEFAULT '0',
- avg_latency_ms INTEGER NOT NULL DEFAULT 0,
+ avg_latency_ms INTEGER NOT NULL DEFAULT 0, last_collector TEXT NOT NULL DEFAULT 'unknown',
  PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model)
+);
+CREATE TABLE IF NOT EXISTS compaction_barriers (
+ day_start_utc INTEGER NOT NULL, day_end_utc INTEGER NOT NULL,
+ PRIMARY KEY (day_start_utc, day_end_utc)
+);
+CREATE TABLE IF NOT EXISTS client_provider_catalog (
+ app_type TEXT NOT NULL, provider_id TEXT NOT NULL, name TEXT NOT NULL,
+ last_collector TEXT NOT NULL,
+ PRIMARY KEY (app_type, provider_id)
 );
 CREATE TABLE IF NOT EXISTS ledger_meta (
  key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS upload_remotes (
- remote_key TEXT PRIMARY KEY, source_kind TEXT NOT NULL, updated_at INTEGER NOT NULL
+ remote_key TEXT PRIMARY KEY, updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS upload_hashes (
  remote_key TEXT NOT NULL, entity_kind TEXT NOT NULL, entity_key TEXT NOT NULL,
@@ -310,6 +327,7 @@ pub fn init_local_ledger(path: &Path) -> anyhow::Result<()> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
+    let expected = expected_revision();
     let had_detail = existed
         && conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'proxy_request_logs')",
@@ -322,7 +340,7 @@ pub fn init_local_ledger(path: &Path) -> anyhow::Result<()> {
         [if had_detail {
             "legacy"
         } else {
-            IMPORTER_REVISION
+            expected.as_str()
         }],
     )?;
     Ok(())
@@ -334,57 +352,28 @@ fn verify_revision(conn: &Connection) -> anyhow::Result<()> {
         [],
         |row| row.get(0),
     )?;
-    if revision != IMPORTER_REVISION {
+    let expected = expected_revision();
+    if revision != expected {
         anyhow::bail!(
-            "local usage ledger importer revision is {revision}, expected {IMPORTER_REVISION}; run rebuild"
+            "local usage ledger revision is {revision}, expected {expected}; run rebuild"
         );
     }
-    Ok(())
-}
-
-fn bind_source(conn: &Connection, source_kind: &str) -> anyhow::Result<()> {
-    let existing = conn
-        .query_row(
-            "SELECT value FROM ledger_meta WHERE key='source_kind'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if let Some(existing) = existing {
-        if existing != source_kind {
-            anyhow::bail!(
-                "local usage ledger is bound to source {existing}, requested {source_kind}; run rebuild"
-            );
-        }
-        return Ok(());
-    }
-    conn.execute(
-        "INSERT INTO ledger_meta(key,value) VALUES ('source_kind',?1)",
-        [source_kind],
-    )?;
     Ok(())
 }
 
 pub(crate) fn load_upload_baseline(
     path: &Path,
     remote_key: &str,
-    source_kind: &str,
 ) -> anyhow::Result<UploadBaseline> {
     let connection = Connection::open(path)?;
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     let initialized = connection
         .query_row(
-            "SELECT source_kind FROM upload_remotes WHERE remote_key=?1",
+            "SELECT 1 FROM upload_remotes WHERE remote_key=?1",
             [remote_key],
-            |row| row.get::<_, String>(0),
+            |row| row.get::<_, i64>(0),
         )
         .optional()?;
-    if initialized
-        .as_deref()
-        .is_some_and(|value| value != source_kind)
-    {
-        anyhow::bail!("upload baseline source does not match {source_kind}");
-    }
     let load_kind = |kind: &str| -> anyhow::Result<BTreeMap<String, String>> {
         let mut statement = connection.prepare(
             "SELECT entity_key,content_hash FROM upload_hashes
@@ -407,7 +396,6 @@ pub(crate) fn load_upload_baseline(
 pub(crate) fn save_upload_baseline(
     path: &Path,
     remote_key: &str,
-    source_kind: &str,
     event_hashes: &BTreeMap<String, String>,
     rollup_hashes: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
@@ -415,10 +403,10 @@ pub(crate) fn save_upload_baseline(
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     let transaction = connection.transaction()?;
     transaction.execute(
-        "INSERT INTO upload_remotes(remote_key,source_kind,updated_at) VALUES (?1,?2,?3)
+        "INSERT INTO upload_remotes(remote_key,updated_at) VALUES (?1,?2)
          ON CONFLICT(remote_key) DO UPDATE SET
-           source_kind=excluded.source_kind,updated_at=excluded.updated_at",
-        params![remote_key, source_kind, chrono::Utc::now().timestamp()],
+           updated_at=excluded.updated_at",
+        params![remote_key, chrono::Utc::now().timestamp()],
     )?;
     transaction.execute(
         "DELETE FROM upload_hashes WHERE remote_key=?1",
@@ -496,7 +484,7 @@ pub fn rebuild_cc_switch(
 pub async fn sync_local(config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary> {
     init_local_ledger(&config.database)?;
     let connection = Connection::open(&config.database)?;
-    bind_source(&connection, "local")?;
+    verify_revision(&connection)?;
     drop(connection);
     sync_into(&config.database, config).await
 }
@@ -515,10 +503,12 @@ pub fn sync_cc_switch(
 ) -> anyhow::Result<RebuildSummary> {
     init_local_ledger(ledger_path)?;
     let conn = Connection::open(ledger_path)?;
-    bind_source(&conn, "cc-switch")?;
+    verify_revision(&conn)?;
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS sync_seen_requests (
-             request_id TEXT PRIMARY KEY
+             app_type TEXT NOT NULL,
+             request_id TEXT NOT NULL,
+             PRIMARY KEY (app_type, request_id)
          );
          DELETE FROM sync_seen_requests;",
     )?;
@@ -534,19 +524,20 @@ pub fn sync_cc_switch(
         }
         let transaction = conn.unchecked_transaction()?;
         for event in &events {
-            if insert_event(&transaction, event)? {
+            if insert_event(&transaction, event, "cc-switch")? {
                 summary.imported += 1;
             } else {
                 summary.skipped += 1;
             }
             transaction.execute(
-                "INSERT OR IGNORE INTO sync_seen_requests(request_id) VALUES (?1)",
-                [&event.request_id],
+                "INSERT OR IGNORE INTO sync_seen_requests(app_type,request_id) VALUES (?1,?2)",
+                params![event.app_type, event.request_id],
             )?;
         }
         let last = events.last().expect("non-empty event batch");
         cursor = Cursor {
             created_at: last.created_at,
+            app_type: last.app_type.clone(),
             request_id: last.request_id.clone(),
         };
         transaction.commit()?;
@@ -556,7 +547,12 @@ pub fn sync_cc_switch(
     }
     conn.execute(
         "DELETE FROM proxy_request_logs
-         WHERE request_id NOT IN (SELECT request_id FROM sync_seen_requests)",
+         WHERE last_collector='cc-switch'
+           AND NOT EXISTS (
+             SELECT 1 FROM sync_seen_requests seen
+             WHERE seen.app_type=proxy_request_logs.app_type
+               AND seen.request_id=proxy_request_logs.request_id
+           )",
         [],
     )?;
     mirror_rollups(source_config, &conn)?;
@@ -566,7 +562,6 @@ pub fn sync_cc_switch(
 async fn sync_into(path: &Path, config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary> {
     let mut conn = Connection::open(path)?;
     verify_revision(&conn)?;
-    bind_source(&conn, "local")?;
     let mut sync_paths = std::collections::HashMap::<String, i64>::new();
     {
         let mut statement =
@@ -598,7 +593,7 @@ async fn sync_into(path: &Path, config: &LocalUsageConfig) -> anyhow::Result<Reb
     };
     let transaction = conn.transaction()?;
     for record in &report.records {
-        if insert_record(&transaction, record, &pricing)? {
+        if insert_record(&transaction, record, &pricing, "local")? {
             summary.imported += 1;
         } else {
             summary.skipped += 1;
@@ -613,6 +608,7 @@ fn insert_record(
     conn: &Connection,
     record: &UsageRecord,
     pricing: &HashMap<String, Pricing>,
+    collector: &str,
 ) -> anyhow::Result<bool> {
     if let Some(identity) = &record.identity {
         let request_seen: bool = conn.query_row(
@@ -680,10 +676,11 @@ fn insert_record(
         record.is_streaming,
         record.created_at,
         &record.data_source,
+        collector,
     )
 }
 
-fn insert_event(conn: &Connection, event: &UsageEvent) -> anyhow::Result<bool> {
+fn insert_event(conn: &Connection, event: &UsageEvent, collector: &str) -> anyhow::Result<bool> {
     insert_values(
         conn,
         &event.request_id,
@@ -706,6 +703,7 @@ fn insert_event(conn: &Connection, event: &UsageEvent) -> anyhow::Result<bool> {
         event.is_streaming,
         event.created_at,
         &event.data_source,
+        collector,
     )
 }
 
@@ -732,7 +730,19 @@ fn insert_values(
     is_streaming: bool,
     created_at: i64,
     data_source: &str,
+    collector: &str,
 ) -> anyhow::Result<bool> {
+    let compacted: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM compaction_barriers
+           WHERE ?1>=day_start_utc AND ?1<day_end_utc
+         )",
+        [created_at],
+        |row| row.get(0),
+    )?;
+    if compacted {
+        return Ok(false);
+    }
     let changed = conn.execute(
         "INSERT INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model, pricing_model,
@@ -740,10 +750,10 @@ fn insert_values(
             input_token_semantics, input_cost_usd, output_cost_usd, cache_read_cost_usd,
             cache_creation_cost_usd, total_cost_usd, latency_ms, first_token_ms, duration_ms,
             status_code, error_message, session_id, provider_type, is_streaming,
-            cost_multiplier, created_at, data_source
+            cost_multiplier, created_at, data_source, last_collector
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, NULL, NULL, ?18, NULL, ?19, ?20, ?21, '1.0', ?22, ?23)
-        ON CONFLICT(request_id) DO UPDATE SET
+                   ?17, NULL, NULL, ?18, NULL, ?19, ?20, ?21, '1.0', ?22, ?23, ?24)
+        ON CONFLICT(app_type,request_id) DO UPDATE SET
             provider_id = excluded.provider_id,
             app_type = excluded.app_type,
             model = excluded.model,
@@ -763,10 +773,9 @@ fn insert_values(
             status_code = excluded.status_code,
             is_streaming = excluded.is_streaming,
             created_at = excluded.created_at,
-            data_source = excluded.data_source
-        WHERE proxy_request_logs.data_source = excluded.data_source
-          AND (proxy_request_logs.provider_id IS NOT excluded.provider_id
-               OR proxy_request_logs.app_type IS NOT excluded.app_type
+            data_source = excluded.data_source,
+            last_collector = excluded.last_collector
+        WHERE proxy_request_logs.provider_id IS NOT excluded.provider_id
                OR proxy_request_logs.model IS NOT excluded.model
                OR proxy_request_logs.request_model IS NOT excluded.request_model
                OR proxy_request_logs.pricing_model IS NOT excluded.pricing_model
@@ -778,7 +787,9 @@ fn insert_values(
                OR proxy_request_logs.total_cost_usd IS NOT excluded.total_cost_usd
                OR proxy_request_logs.latency_ms IS NOT excluded.latency_ms
                OR proxy_request_logs.status_code IS NOT excluded.status_code
-               OR proxy_request_logs.is_streaming IS NOT excluded.is_streaming)",
+               OR proxy_request_logs.is_streaming IS NOT excluded.is_streaming
+               OR proxy_request_logs.data_source IS NOT excluded.data_source
+               OR proxy_request_logs.last_collector IS NOT excluded.last_collector",
         params![
             request_id,
             provider_id,
@@ -803,6 +814,7 @@ fn insert_values(
             is_streaming as i64,
             created_at,
             data_source,
+            collector,
         ],
     )?;
     Ok(changed > 0)
@@ -819,7 +831,14 @@ fn mirror_rollups(source_config: &ClientConfig, ledger: &Connection) -> anyhow::
         |row| row.get(0),
     )?;
     let transaction = ledger.unchecked_transaction()?;
-    transaction.execute("DELETE FROM usage_daily_rollups", [])?;
+    transaction.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS sync_seen_rollups (
+           date TEXT NOT NULL, app_type TEXT NOT NULL, provider_id TEXT NOT NULL,
+           model TEXT NOT NULL, request_model TEXT NOT NULL, pricing_model TEXT NOT NULL,
+           PRIMARY KEY (date,app_type,provider_id,model,request_model,pricing_model)
+         );
+         DELETE FROM sync_seen_rollups;",
+    )?;
     if exists {
         let has_semantics = source
             .prepare("PRAGMA table_info(usage_daily_rollups)")?
@@ -836,7 +855,7 @@ fn mirror_rollups(source_config: &ClientConfig, ledger: &Connection) -> anyhow::
             "SELECT date,app_type,provider_id,model,request_model,pricing_model,
                     request_count,success_count,input_tokens,output_tokens,
                     cache_read_tokens,cache_creation_tokens,{semantics},total_cost_usd,
-                    CAST(avg_latency_ms AS INTEGER) AS avg_latency_ms
+                    CAST(avg_latency_ms AS REAL) AS avg_latency_ms
              FROM usage_daily_rollups"
         );
         let mut statement = source.prepare(&sql)?;
@@ -856,20 +875,82 @@ fn mirror_rollups(source_config: &ClientConfig, ledger: &Connection) -> anyhow::
                 row.get::<_, i64>(11)?,
                 row.get::<_, i64>(12)?,
                 row.get::<_, String>(13)?,
-                row.get::<_, i64>(14)?,
+                row.get::<_, f64>(14)?,
             ))
         })?;
         for row in rows {
             let row = row?;
             transaction.execute(
-                "INSERT INTO usage_daily_rollups VALUES
-                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                "INSERT INTO usage_daily_rollups
+                 (date,app_type,provider_id,model,request_model,pricing_model,
+                  request_count,success_count,input_tokens,output_tokens,cache_read_tokens,
+                  cache_creation_tokens,input_token_semantics,total_cost_usd,avg_latency_ms,
+                  last_collector)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'cc-switch')
+                 ON CONFLICT(date,app_type,provider_id,model,request_model,pricing_model)
+                 DO UPDATE SET
+                   request_count=excluded.request_count,
+                   success_count=excluded.success_count,
+                   input_tokens=excluded.input_tokens,
+                   output_tokens=excluded.output_tokens,
+                   cache_read_tokens=excluded.cache_read_tokens,
+                   cache_creation_tokens=excluded.cache_creation_tokens,
+                   input_token_semantics=excluded.input_token_semantics,
+                   total_cost_usd=excluded.total_cost_usd,
+                   avg_latency_ms=excluded.avg_latency_ms,
+                   last_collector=excluded.last_collector",
                 params![
                     row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
                     row.11, row.12, row.13, row.14
                 ],
             )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO sync_seen_rollups
+                 (date,app_type,provider_id,model,request_model,pricing_model)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![row.0, row.1, row.2, row.3, row.4, row.5],
+            )?;
         }
+    }
+    transaction.execute(
+        "DELETE FROM usage_daily_rollups
+         WHERE last_collector='cc-switch'
+           AND NOT EXISTS (
+             SELECT 1 FROM sync_seen_rollups seen
+             WHERE seen.date=usage_daily_rollups.date
+               AND seen.app_type=usage_daily_rollups.app_type
+               AND seen.provider_id=usage_daily_rollups.provider_id
+               AND seen.model=usage_daily_rollups.model
+               AND seen.request_model=usage_daily_rollups.request_model
+               AND seen.pricing_model=usage_daily_rollups.pricing_model
+           )",
+        [],
+    )?;
+    transaction.commit()?;
+    rebuild_compaction_barriers(ledger)?;
+    Ok(())
+}
+
+fn rebuild_compaction_barriers(connection: &Connection) -> anyhow::Result<()> {
+    let dates = {
+        let mut statement =
+            connection.prepare("SELECT DISTINCT date FROM usage_daily_rollups ORDER BY date")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute("DELETE FROM compaction_barriers", [])?;
+    for date in dates {
+        let day = NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
+        let (day_start_utc, day_end_utc) = cc_switch_usage_core::local_day_utc_bounds(&Local, day)
+            .context("resolve compaction barrier")?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO compaction_barriers(day_start_utc,day_end_utc)
+             VALUES (?1,?2)",
+            params![day_start_utc, day_end_utc],
+        )?;
     }
     transaction.commit()?;
     Ok(())
@@ -891,7 +972,7 @@ fn rollup_local(path: &Path, retain_days: i64) -> anyhow::Result<()> {
         "INSERT OR REPLACE INTO usage_daily_rollups
          (date,app_type,provider_id,model,request_model,pricing_model,request_count,
           success_count,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,
-          input_token_semantics,total_cost_usd,avg_latency_ms)
+          input_token_semantics,total_cost_usd,avg_latency_ms,last_collector)
          SELECT d,a,p,m,rm,pm,
                 COALESCE(old.request_count,0)+new_req,
                 COALESCE(old.success_count,0)+new_succ,
@@ -901,10 +982,11 @@ fn rollup_local(path: &Path, retain_days: i64) -> anyhow::Result<()> {
                 COALESCE(old.cache_creation_tokens,0)+new_cc,
                 2,
                 CAST(COALESCE(CAST(old.total_cost_usd AS REAL),0)+new_cost AS TEXT),
-                CAST(CASE WHEN COALESCE(old.request_count,0)+new_req>0
-                          THEN (COALESCE(old.avg_latency_ms,0)*COALESCE(old.request_count,0)
-                                +new_lat*new_req)/(COALESCE(old.request_count,0)+new_req)
-                          ELSE 0 END AS INTEGER)
+                CASE WHEN COALESCE(old.request_count,0)+new_req>0
+                     THEN (COALESCE(old.avg_latency_ms,0)*COALESCE(old.request_count,0)
+                           +new_lat*new_req)/(COALESCE(old.request_count,0)+new_req)
+                     ELSE 0.0 END,
+                'local'
          FROM (
            SELECT date(l.created_at,'unixepoch','localtime') AS d,
                   l.app_type AS a,l.provider_id AS p,l.model AS m,
@@ -931,7 +1013,85 @@ fn rollup_local(path: &Path, retain_days: i64) -> anyhow::Result<()> {
         [cutoff],
     )?;
     transaction.commit()?;
+    rebuild_compaction_barriers(&connection)?;
     Ok(())
+}
+
+fn collector_owner(collector: &str) -> &str {
+    if collector == "local-compact" {
+        "local"
+    } else {
+        collector
+    }
+}
+
+pub fn merge_provider_snapshot(
+    path: &Path,
+    collector: &str,
+    providers: Vec<ProviderEntry>,
+) -> anyhow::Result<()> {
+    let mut connection = Connection::open(path)?;
+    verify_revision(&connection)?;
+    let collector = collector_owner(collector);
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS sync_seen_providers (
+           app_type TEXT NOT NULL, provider_id TEXT NOT NULL,
+           PRIMARY KEY (app_type,provider_id)
+         );
+         DELETE FROM sync_seen_providers;",
+    )?;
+    for provider in providers {
+        transaction.execute(
+            "INSERT INTO client_provider_catalog(app_type,provider_id,name,last_collector)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(app_type,provider_id) DO UPDATE SET
+               name=excluded.name,last_collector=excluded.last_collector",
+            params![
+                provider.app_type,
+                provider.provider_id,
+                provider.name,
+                collector
+            ],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO sync_seen_providers(app_type,provider_id) VALUES (?1,?2)",
+            params![provider.app_type, provider.provider_id],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM client_provider_catalog
+         WHERE last_collector=?1
+           AND NOT EXISTS (
+             SELECT 1 FROM sync_seen_providers seen
+             WHERE seen.app_type=client_provider_catalog.app_type
+               AND seen.provider_id=client_provider_catalog.provider_id
+           )",
+        [collector],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn read_provider_catalog(path: &Path) -> anyhow::Result<Vec<ProviderEntry>> {
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT app_type,provider_id,name FROM client_provider_catalog
+         ORDER BY app_type,provider_id",
+    )?;
+    let providers = statement
+        .query_map([], |row| {
+            Ok(ProviderEntry {
+                app_type: row.get(0)?,
+                provider_id: row.get(1)?,
+                name: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(providers)
 }
 
 pub fn read_rollups(path: &Path) -> anyhow::Result<Vec<RollupSnapshot>> {
@@ -953,7 +1113,7 @@ pub fn read_rollups(path: &Path) -> anyhow::Result<Vec<RollupSnapshot>> {
         "SELECT date,app_type,provider_id,model,request_model,pricing_model,
                 request_count,success_count,input_tokens,output_tokens,cache_read_tokens,
                 cache_creation_tokens,input_token_semantics,total_cost_usd,
-                CAST(avg_latency_ms AS INTEGER) AS avg_latency_ms
+                CAST(avg_latency_ms AS REAL) AS avg_latency_ms
          FROM usage_daily_rollups ORDER BY date,app_type,provider_id,model,request_model,pricing_model",
     )?;
     let rows = statement.query_map([], |row| {
@@ -972,7 +1132,7 @@ pub fn read_rollups(path: &Path) -> anyhow::Result<Vec<RollupSnapshot>> {
             row.get::<_, i64>(11)?,
             row.get::<_, i64>(12)?,
             row.get::<_, String>(13)?,
-            row.get::<_, i64>(14)?,
+            row.get::<_, f64>(14)?,
         ))
     })?;
     let mut snapshots = Vec::new();
@@ -1268,7 +1428,7 @@ mod tests {
         drop(connection);
 
         rollup_local(&path, 30).unwrap();
-        let merged: (i64, i64, i64, i64, i64, f64, i64) = Connection::open(&path)
+        let merged: (i64, i64, i64, i64, i64, f64, f64) = Connection::open(&path)
             .unwrap()
             .query_row(
                 "SELECT request_count,success_count,input_tokens,output_tokens,
@@ -1297,10 +1457,7 @@ mod tests {
         assert_eq!(merged.3, 550);
         assert_eq!(merged.4, 110);
         assert!((merged.5 - 1.25).abs() < 1e-9);
-        assert_eq!(
-            merged.6, 109,
-            "latency is request-count weighted and integral"
-        );
+        assert!((merged.6 - (1200.0 / 11.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -1341,7 +1498,7 @@ mod tests {
                     success_count INTEGER, input_tokens INTEGER, output_tokens INTEGER,
                     cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
                     input_token_semantics INTEGER, total_cost_usd TEXT,
-                    avg_latency_ms INTEGER
+                    avg_latency_ms REAL
                 );
                 INSERT INTO usage_daily_rollups VALUES
                     ('2026-07-21', 'codex', 'provider', 'model', '', '',
@@ -1365,7 +1522,6 @@ mod tests {
             server_url: "http://localhost".into(),
             auth_token: "test-token".into(),
             batch_size: 1,
-            overlap_seconds: 0,
         };
 
         let first = sync_cc_switch(&source_config, &local.database).unwrap();
@@ -1373,6 +1529,18 @@ mod tests {
         assert_eq!(first.skipped, 0);
         let second = sync_cc_switch(&source_config, &local.database).unwrap();
         assert_eq!(second.imported, 0);
+        let mut mirror_config = source_config.clone();
+        mirror_config.cc_switch_db = local.database.clone();
+        assert_eq!(
+            crate::read_events(&source_config, &Cursor::default()).unwrap(),
+            crate::read_events(&mirror_config, &Cursor::default()).unwrap(),
+            "selected cc-switch detail fields must be copied without repricing or normalization"
+        );
+        assert_eq!(
+            read_rollups(&source_config.cc_switch_db).unwrap(),
+            read_rollups(&local.database).unwrap(),
+            "cc-switch rollup accounting and fractional latency must round-trip exactly"
+        );
         let count: i64 = Connection::open(&local.database)
             .unwrap()
             .query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
@@ -1380,7 +1548,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 2);
-        let mirrored_latency: (i64, String) = Connection::open(&local.database)
+        let mirrored_latency: (f64, String) = Connection::open(&local.database)
             .unwrap()
             .query_row(
                 "SELECT avg_latency_ms,typeof(avg_latency_ms)
@@ -1389,7 +1557,8 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(mirrored_latency, (4183, "integer".into()));
+        assert!((mirrored_latency.0 - 4183.38333333333).abs() < f64::EPSILON);
+        assert_eq!(mirrored_latency.1, "real");
         let verified = crate::verify_cc_switch_mirror(&source_config, &local.database).unwrap();
         assert_eq!(verified.detail_rows, 2);
         assert_eq!(verified.rollup_rows, 2);

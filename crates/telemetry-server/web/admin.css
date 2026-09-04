@@ -21,7 +21,7 @@ h2 { font-size: 20px; }
 .panel { margin-bottom: 18px; padding: 24px; border: 1px solid var(--border); border-radius: 18px; background: color-mix(in srgb, var(--panel) 92%, transparent); box-shadow: 0 18px 50px #02061455; }
 .muted { color: var(--muted); }
 label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; }
-input { min-width: 240px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 10px; background: #0e1628; color: inherit; font: inherit; }
+input, select { min-width: 240px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 10px; background: #0e1628; color: inherit; font: inherit; }
 .stack-form { display: grid; max-width: 360px; gap: 16px; margin-top: 20px; }
 .inline-form { display: flex; align-items: end; flex-wrap: wrap; gap: 14px; margin-top: 22px; }
 .button { cursor: pointer; border: 0; border-radius: 10px; padding: 11px 15px; background: var(--accent); color: #07121f; font-weight: 750; }
@@ -37,12 +37,19 @@ td { font-size: 14px; }
 td code, #tokenValue { overflow-wrap: anywhere; color: var(--accent); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
 .action-group { display: flex; flex-wrap: wrap; gap: 7px; }
 .token-panel { border-color: #4c7292; }
+.danger-panel { border-color: #703844; }
 .token-row { align-items: stretch; margin-top: 14px; }
 .token-row code { flex: 1; display: block; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: #0e1628; }
+.count-list { columns: 2; padding-left: 20px; color: var(--muted); }
+.count-list code { color: var(--accent); }
+.confirmation-row { display: flex; align-items: center; gap: 12px; }
+.confirmation-row input { flex: 1; font-family: ui-monospace, SFMono-Regular, monospace; }
+.button:disabled { cursor: not-allowed; opacity: .45; }
 @media (max-width: 700px) {
   .shell { width: min(100% - 20px, 1120px); padding-top: 24px; }
   .panel { padding: 18px; }
   .header { align-items: flex-start; }
-  .inline-form, .token-row { align-items: stretch; flex-direction: column; }
-  input { width: 100%; min-width: 0; }
+  .inline-form, .token-row, .confirmation-row { align-items: stretch; flex-direction: column; }
+  input, select { width: 100%; min-width: 0; }
+  .count-list { columns: 1; }
 }

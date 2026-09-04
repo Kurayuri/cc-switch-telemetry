@@ -57,6 +57,37 @@
         </table>
         <p id="emptyMessage" class="muted" hidden>暂无节点。</p>
       </div>
+
+      <div class="panel danger-panel">
+        <div class="section-heading">
+          <div>
+            <h2>日志删除</h2>
+            <p class="muted">仅删除 Server 本地日志；节点、Token 和 provider 名称配置会保留。</p>
+          </div>
+        </div>
+        <form id="logPreviewForm" class="inline-form">
+          <label>日志类型
+            <select id="logKindInput">
+              <option value="request">请求日志</option>
+              <option value="quota">Quota 日志</option>
+            </select>
+          </label>
+          <label>范围
+            <select id="logNodeInput"><option value="">全部节点</option></select>
+          </label>
+          <button class="button secondary" type="submit">预览影响范围</button>
+        </form>
+        <p id="logMessage" class="message" role="status"></p>
+        <div id="logPreviewPanel" hidden>
+          <p id="logWarning" class="warning"></p>
+          <ul id="logCountList" class="count-list"></ul>
+          <p>请输入 <code id="logConfirmationValue"></code> 以确认：</p>
+          <div class="confirmation-row">
+            <input id="logConfirmationInput" autocomplete="off" spellcheck="false">
+            <button id="purgeLogsButton" class="button danger" type="button" disabled>永久删除</button>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
   <script type="module" src="/admin/app.js"></script>
