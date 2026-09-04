@@ -1,4 +1,5 @@
 use std::{path::PathBuf, time::Duration};
+use telemetry_client::quota::{self, QuotaConfig};
 use telemetry_client::usage_ledger::{self, LocalUsageConfig};
 use telemetry_client::{
     database_fingerprint, sync_snapshot_v2_with_mode, verify_cc_switch_mirror, ClientConfig,
@@ -98,6 +99,20 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    if args.as_slice() == ["quota", "replay"] {
+        let upload_config = client_config(local.database.clone())?;
+        let quota_config = QuotaConfig::from_env(source_database("cc-switch", &local)?)?;
+        quota::init_db(&quota_config.quota_db)?;
+        let (accepted, duplicates) =
+            quota::upload_pending(&quota_config, &upload_config, true).await?;
+        eprintln!(
+            "quota replay complete: database={} accepted={} duplicates={}",
+            quota_config.quota_db.display(),
+            accepted,
+            duplicates
+        );
+        return Ok(());
+    }
     let source_config = source_config(source, &local)?;
     let upload_config = client_config(local.database.clone())?;
 
@@ -141,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         || (args.first().is_some_and(|arg| arg == "run") && args.len() > 1 && args[1] != "--source")
     {
         anyhow::bail!(
-            "usage: telemetry-client [verify --source cc-switch | rebuild --source local|local-compact|cc-switch --replace-all [--upload] | run --source local|local-compact|cc-switch]"
+            "usage: telemetry-client [verify --source cc-switch | rebuild --source local|local-compact|cc-switch --replace-all [--upload] | quota replay | run --source local|local-compact|cc-switch]"
         );
     }
 
@@ -151,6 +166,27 @@ async fn main() -> anyhow::Result<()> {
         source_config.cc_switch_db.display(),
         local.database.display(),
     );
+    let quota_config = QuotaConfig::from_env(source_database("cc-switch", &local)?)?;
+    let _quota_task = if quota_config.enabled() {
+        match quota::init_db(&quota_config.quota_db) {
+            Ok(_) => {
+                eprintln!(
+                    "quota collector enabled: interval={}s database={}",
+                    quota_config.interval.as_secs(),
+                    quota_config.quota_db.display()
+                );
+                let quota_upload = upload_config.clone();
+                Some(tokio::spawn(quota::run(quota_config, quota_upload)))
+            }
+            Err(error) => {
+                eprintln!("quota collector disabled: initialize database failed: {error}");
+                None
+            }
+        }
+    } else {
+        eprintln!("quota collector disabled by TELEMETRY_QUOTA_INTERVAL_SECONDS=0");
+        None
+    };
     let mut observed: Option<DatabaseFingerprint> = None;
     loop {
         let changed = match database_fingerprint(&source_config.cc_switch_db) {

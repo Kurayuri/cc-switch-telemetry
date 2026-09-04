@@ -14,6 +14,7 @@ use telemetry_core::{
     SyncCommitRequest, SyncCommitResponse, UsageEvent, SCHEMA_VERSION,
 };
 
+pub mod quota;
 pub mod usage_ledger;
 
 const UPLOAD_MAX_ATTEMPTS: usize = 5;
@@ -527,7 +528,7 @@ pub async fn sync_snapshot_v2_with_mode(
     Ok(result)
 }
 
-async fn post_json_with_retry<T: Serialize>(
+pub(crate) async fn post_json_with_retry<T: Serialize>(
     config: &ClientConfig,
     url: &str,
     payload: &T,

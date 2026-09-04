@@ -273,6 +273,7 @@ h2 {
 .kpi-card:nth-child(5) { animation-delay: 180ms; }
 .kpi-card:nth-child(6) { animation-delay: 225ms; }
 .chart-panel { animation: rise-in 680ms 170ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+.quota-panel { animation: rise-in 680ms 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
 .breakdown-panel { animation: rise-in 680ms 230ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
 .events-panel { animation: rise-in 680ms 290ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
 
@@ -542,7 +543,7 @@ select:focus, input:focus {
 .cost-model-row { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 11px; line-height: 1.25; }
 .cost-model-name { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .cost-model-amount { flex: 0 0 auto; color: var(--text); font-weight: 780; font-variant-numeric: tabular-nums; }
-.chart-panel, .breakdown-panel, .events-panel { padding: 23px; margin-bottom: 18px; }
+.chart-panel, .quota-panel, .breakdown-panel, .events-panel { padding: 23px; margin-bottom: 18px; }
 .daily-panel { padding: 23px; margin-bottom: 18px; }
 .daily-controls { display: flex; align-items: center; gap: 10px; }
 .daily-metric-picker { width: 160px; }
@@ -572,6 +573,36 @@ select:focus, input:focus {
 .trend-chart .line { fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 1; stroke-dashoffset: 1; animation: trend-line-in 760ms cubic-bezier(0.2, 0.8, 0.2, 1) both; filter: drop-shadow(0 5px 7px rgba(45, 212, 191, 0.22)); }
 .trend-chart .point { fill: var(--surface-solid); stroke: var(--accent); stroke-width: 2; animation: trend-point-in 360ms ease both; }
 .coverage { margin-top: 10px; font-size: 12px; }
+
+.quota-subtitle { margin: 4px 0 0; font-size: 12px; }
+.quota-controls { display: grid; width: min(640px, 100%); grid-template-columns: repeat(3, minmax(150px, 1fr)); gap: 8px; }
+.quota-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.quota-card { padding: 15px; border: 1px solid var(--border); border-radius: 15px; background: var(--surface-solid); }
+.quota-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+.quota-card-heading > div { min-width: 0; }
+.quota-card-heading strong, .quota-card-heading small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quota-card-heading small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.quota-status { flex: 0 0 auto; padding: 4px 8px; border: 1px solid var(--border-strong); border-radius: 999px; color: var(--muted); font-size: 10px; font-weight: 800; }
+.quota-status-ok .quota-status { border-color: rgba(84, 227, 154, 0.25); background: rgba(84, 227, 154, 0.1); color: var(--success); }
+.quota-status-login_expired .quota-status, .quota-status-query_failed .quota-status, .quota-status-command_failed .quota-status, .quota-status-timed_out .quota-status, .quota-status-invalid_output .quota-status, .quota-status-credential_parse_failed .quota-status { border-color: rgba(251, 113, 133, 0.23); background: var(--danger-soft); color: var(--danger); }
+.quota-details { display: grid; gap: 7px; }
+.quota-detail { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 11px; }
+.quota-detail strong { color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
+.quota-chart .quota-series { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+.quota-chart .quota-amount-series { stroke-dasharray: 7 5; }
+.quota-chart .quota-axis-title { font-weight: 800; }
+.quota-series-0 { stroke: var(--accent); background: var(--accent); color: var(--accent); }
+.quota-series-1 { stroke: var(--violet); background: var(--violet); color: var(--violet); }
+.quota-series-2 { stroke: var(--blue); background: var(--blue); color: var(--blue); }
+.quota-series-3 { stroke: var(--orange); background: var(--orange); color: var(--orange); }
+.quota-series-4 { stroke: var(--success); background: var(--success); color: var(--success); }
+.quota-series-5 { stroke: var(--danger); background: var(--danger); color: var(--danger); }
+.quota-series-6 { stroke: #38bdf8; background: #38bdf8; color: #38bdf8; }
+.quota-series-7 { stroke: #f472b6; background: #f472b6; color: #f472b6; }
+.quota-legend { display: flex; flex-wrap: wrap; gap: 7px 14px; margin-top: 10px; color: var(--muted); font-size: 11px; }
+.quota-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+.quota-legend-dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; }
+.quota-legend-dot.quota-amount-series { width: 14px; height: 0; flex-basis: 14px; border-top: 2px dashed currentColor; border-radius: 0; background: transparent; }
 
 .chart-tooltip {
   position: absolute;
@@ -754,6 +785,7 @@ footer {
     grid-template-areas:
       "filters kpis"
       "trend trend"
+      "quota quota"
       "daily daily"
       "breakdown breakdown"
       "events events";
@@ -774,6 +806,7 @@ footer {
   .kpi-heading { margin-bottom: 11px; }
   .kpi-card strong { font-size: clamp(21px, 2vw, 28px); }
   .chart-panel { grid-area: trend; margin-bottom: 0; }
+  .quota-panel { grid-area: quota; margin-bottom: 0; }
   .daily-panel { grid-area: daily; margin-bottom: 0; }
   .breakdown-panel { grid-area: breakdown; }
   .events-panel { grid-area: events; }
@@ -788,6 +821,7 @@ footer {
   .section-heading { align-items: flex-start; flex-direction: column; }
   .trend-controls { width: 100%; flex-wrap: wrap; }
   .daily-controls { width: 100%; flex-wrap: wrap; }
+  .quota-controls { width: 100%; }
   .metric-picker, .bucket-picker { flex: 1 1 160px; width: auto; }
   .tabs { width: 100%; }
   footer { flex-direction: column; gap: 6px; }
@@ -804,7 +838,7 @@ footer {
   .token-bar-row { gap: 8px; }
   .token-legend { gap: 6px 9px; font-size: 13px; }
   .cache-hit-inline { width: 72px; min-width: 72px; flex-basis: 72px; }
-  .chart-panel, .daily-panel, .breakdown-panel, .events-panel { padding: 18px; }
+  .chart-panel, .quota-panel, .daily-panel, .breakdown-panel, .events-panel { padding: 18px; }
 }
 
 @media (max-width: 430px) {
@@ -820,6 +854,7 @@ footer {
   .tokens-card, .cost-card, .requests-card, .success-card, .latency-card { order: initial; }
   .filters-panel { padding: 16px; }
   .custom-bucket-editor { align-items: stretch; flex-direction: column; }
+  .quota-controls { grid-template-columns: 1fr; }
   .custom-bucket-editor .button { width: 100%; }
   th, td { padding-right: 10px; padding-left: 10px; }
 }

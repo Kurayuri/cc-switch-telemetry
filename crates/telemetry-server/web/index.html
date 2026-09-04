@@ -245,6 +245,35 @@
         <p id="coverageText" class="coverage muted">Data coverage: —</p>
       </section>
 
+      <section class="panel quota-panel" aria-labelledby="quotaTitle">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">CODEX QUOTA</p>
+            <h2 id="quotaTitle" data-i18n="quota.title">Codex quota history</h2>
+            <p class="muted quota-subtitle" data-i18n="quota.subtitle">Normalized subscription utilization and provider balances.</p>
+          </div>
+          <div class="quota-controls">
+            <label>
+              <span data-i18n="quota.node">Node</span>
+              <select id="quotaNodeFilter"><option value="" data-i18n="quota.allNodes">All quota nodes</option></select>
+            </label>
+            <label>
+              <span data-i18n="quota.provider">Provider</span>
+              <select id="quotaProviderFilter"><option value="" data-i18n="quota.allProviders">All quota providers</option></select>
+            </label>
+            <label>
+              <span data-i18n="quota.metric">Metric</span>
+              <select id="quotaMetricFilter"><option value="" data-i18n="quota.allMetrics">All quota metrics</option></select>
+            </label>
+          </div>
+        </div>
+        <div id="quotaCards" class="quota-cards" aria-live="polite"></div>
+        <div id="quotaEmpty" class="empty-state" hidden data-i18n="quota.empty">No quota providers or samples for this selection</div>
+        <svg id="quotaChart" class="trend-chart quota-chart" viewBox="0 0 900 300" role="img" aria-label="Codex quota history chart" data-i18n-aria-label="quota.chartAria"></svg>
+        <div id="quotaLegend" class="quota-legend"></div>
+        <p id="quotaBucket" class="coverage muted"></p>
+      </section>
+
       <section id="dailyPanel" class="panel daily-panel">
         <div class="section-heading">
           <div>

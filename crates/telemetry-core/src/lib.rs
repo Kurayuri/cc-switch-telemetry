@@ -189,6 +189,97 @@ pub struct SyncCommitResponse {
     pub providers: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaProviderStatus {
+    Ok,
+    NotAvailable,
+    CredentialParseFailed,
+    LoginExpired,
+    QueryFailed,
+    CommandFailed,
+    TimedOut,
+    InvalidOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QuotaTargetKind {
+    SubscriptionTool,
+    CodexOAuth,
+    UsageScript,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QuotaMetricKind {
+    UtilizationPercent,
+    Balance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaMetric {
+    pub key: String,
+    pub label: String,
+    pub kind: QuotaMetricKind,
+    #[serde(default)]
+    pub utilization_percent: Option<f64>,
+    #[serde(default)]
+    pub used: Option<f64>,
+    #[serde(default)]
+    pub remaining: Option<f64>,
+    #[serde(default)]
+    pub total: Option<f64>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaProviderState {
+    pub app_type: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub status: QuotaProviderStatus,
+    #[serde(default)]
+    pub target_kind: Option<QuotaTargetKind>,
+    pub checked_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaObservation {
+    pub observation_id: String,
+    pub app_type: String,
+    pub provider_id: String,
+    pub sampled_at: i64,
+    pub metrics: Vec<QuotaMetric>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaUploadBatch {
+    pub schema_version: u32,
+    pub provider_states: Vec<QuotaProviderState>,
+    pub observations: Vec<QuotaObservation>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaBatchResponse {
+    pub accepted: Vec<String>,
+    pub duplicates: Vec<String>,
+    pub provider_states: usize,
+}
+
 pub fn event_id(node_id: &str, request_id: &str) -> String {
     format!("{node_id}:{request_id}")
 }

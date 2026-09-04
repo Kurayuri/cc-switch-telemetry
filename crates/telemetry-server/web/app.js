@@ -15,6 +15,15 @@ import {
   startOfLocalDayMs,
   timeInputValue,
 } from "./range.js";
+import {
+  filterQuotaProviders,
+  optionalQuotaNumber,
+  quotaAmount,
+  quotaAmountRange,
+  quotaMetricIdentity,
+  quotaPercentage,
+  splitQuotaPoints,
+} from "./quota-view.js";
 
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
@@ -96,6 +105,14 @@ const elements = {
   trendEmpty: $("trendEmpty"),
   trendTooltip: $("trendTooltip"),
   coverageText: $("coverageText"),
+  quotaNodeFilter: $("quotaNodeFilter"),
+  quotaProviderFilter: $("quotaProviderFilter"),
+  quotaMetricFilter: $("quotaMetricFilter"),
+  quotaCards: $("quotaCards"),
+  quotaEmpty: $("quotaEmpty"),
+  quotaChart: $("quotaChart"),
+  quotaLegend: $("quotaLegend"),
+  quotaBucket: $("quotaBucket"),
   kpiInputTotal: $("kpiInputTotal"),
   kpiOutputTotal: $("kpiOutputTotal"),
   kpiFreshTokens: $("kpiFreshTokens"),
@@ -122,6 +139,7 @@ const elements = {
 const state = {
   overview: null,
   daily: null,
+  quota: null,
   breakdownDimension: "nodes",
   eventCursor: null,
   requestController: null,
@@ -560,6 +578,258 @@ function renderOverview(overview) {
   renderCoverage(overview.coverage);
 }
 
+function quotaValueLabel(metric) {
+  const percentage = quotaPercentage(metric);
+  if (percentage != null) return formatPercent(percentage);
+  const unit = metric.unit ? ` ${metric.unit}` : "";
+  const number = (value) => formatters.compactNumber.format(Number(value));
+  if (optionalQuotaNumber(metric.remaining) != null && optionalQuotaNumber(metric.total) != null) {
+    return `${number(metric.remaining)} / ${number(metric.total)}${unit}`;
+  }
+  if (optionalQuotaNumber(metric.remaining) != null) return `${number(metric.remaining)}${unit}`;
+  if (optionalQuotaNumber(metric.used) != null) return `${number(metric.used)}${unit} ${t("quota.used")}`;
+  if (optionalQuotaNumber(metric.total) != null) return `${number(metric.total)}${unit}`;
+  return "—";
+}
+
+function quotaProviders() {
+  return filterQuotaProviders(
+    state.quota?.providers,
+    elements.quotaNodeFilter.value,
+    elements.quotaProviderFilter.value,
+  );
+}
+
+function updateQuotaFilters() {
+  const providers = state.quota?.providers || [];
+  const nodes = new Map();
+  const providerOptions = new Map();
+  const metrics = new Map();
+  for (const provider of providers) {
+    nodes.set(provider.nodeId, provider.nodeName || provider.nodeId);
+    if (!providerOptions.has(provider.providerId)) {
+      providerOptions.set(provider.providerId, provider.providerName || provider.providerId);
+    }
+    for (const metric of [...(provider.current || []), ...(provider.series || [])]) {
+      const identity = quotaMetricIdentity(metric);
+      const usesPercentage = quotaPercentage(metric) != null
+        || metric.kind === "utilizationPercent"
+        || metric.points?.some((point) => quotaPercentage(point) != null);
+      const detail = usesPercentage
+        ? "%"
+        : metric.unit || t("quota.balance");
+      metrics.set(identity, `${metric.label || metric.key} · ${detail}`);
+    }
+  }
+  const options = (items) => [...items.entries()]
+    .map(([value, label]) => ({ value, label }))
+    .sort((left, right) => left.label.localeCompare(right.label, locale));
+  setSelectOptions(elements.quotaNodeFilter, options(nodes), t("quota.allNodes"));
+  setSelectOptions(elements.quotaProviderFilter, options(providerOptions), t("quota.allProviders"));
+  setSelectOptions(elements.quotaMetricFilter, options(metrics), t("quota.allMetrics"));
+}
+
+function appendQuotaDetail(container, labelText, valueText) {
+  const item = document.createElement("div");
+  item.className = "quota-detail";
+  const label = document.createElement("span");
+  label.textContent = labelText;
+  const value = document.createElement("strong");
+  value.textContent = valueText;
+  item.append(label, value);
+  container.append(item);
+}
+
+function renderQuotaCards(providers) {
+  elements.quotaCards.replaceChildren();
+  const selectedMetric = elements.quotaMetricFilter.value;
+  for (const provider of providers) {
+    const card = document.createElement("article");
+    card.className = `quota-card quota-status-${provider.status || "unknown"}`;
+    const heading = document.createElement("div");
+    heading.className = "quota-card-heading";
+    const title = document.createElement("div");
+    const providerName = document.createElement("strong");
+    providerName.textContent = provider.providerName || provider.providerId;
+    const nodeName = document.createElement("small");
+    nodeName.textContent = `${provider.nodeName || provider.nodeId} · ${provider.providerId}`;
+    title.append(providerName, nodeName);
+    const status = document.createElement("span");
+    status.className = "quota-status";
+    status.textContent = t(`quota.status.${provider.status || "unknown"}`);
+    heading.append(title, status);
+    card.append(heading);
+
+    const metrics = (provider.current || []).filter(
+      (metric) => !selectedMetric || quotaMetricIdentity(metric) === selectedMetric,
+    );
+    const details = document.createElement("div");
+    details.className = "quota-details";
+    if (metrics.length) {
+      for (const metric of metrics) {
+        appendQuotaDetail(details, metric.label || metric.key, quotaValueLabel(metric));
+        if (metric.resetsAt != null) {
+          appendQuotaDetail(
+            details,
+            t("quota.reset"),
+            formatters.dateTime.format(metric.resetsAt * 1000),
+          );
+        }
+      }
+    } else {
+      appendQuotaDetail(details, t("quota.current"), t("quota.noSuccessfulSample"));
+    }
+    appendQuotaDetail(
+      details,
+      t("quota.lastSuccess"),
+      provider.lastSuccessAt == null
+        ? "—"
+        : formatters.dateTime.format(provider.lastSuccessAt * 1000),
+    );
+    appendQuotaDetail(
+      details,
+      t("quota.lastCheck"),
+      formatters.dateTime.format(provider.checkedAt * 1000),
+    );
+    card.append(details);
+    elements.quotaCards.append(card);
+  }
+}
+
+function quotaSeries(providers) {
+  const selectedMetric = elements.quotaMetricFilter.value;
+  return providers.flatMap((provider) => (provider.series || [])
+    .filter((series) => !selectedMetric || quotaMetricIdentity(series) === selectedMetric)
+    .map((series) => ({ ...series, provider }))
+    .filter((series) => series.points?.length));
+}
+
+function renderQuotaChart(providers) {
+  const series = quotaSeries(providers);
+  const plottedSeries = series.flatMap((item, seriesIndex) => {
+    const plots = [];
+    if (item.points.some((point) => quotaPercentage(point) != null)) {
+      plots.push({ ...item, axis: "percent", seriesIndex, value: quotaPercentage });
+    }
+    if (item.points.some((point) => quotaAmount(point) != null)) {
+      plots.push({ ...item, axis: "amount", seriesIndex, value: quotaAmount });
+    }
+    return plots;
+  });
+  elements.quotaChart.replaceChildren();
+  elements.quotaLegend.replaceChildren();
+  elements.quotaChart.hidden = plottedSeries.length === 0;
+  if (!plottedSeries.length) return;
+
+  const width = 900;
+  const height = 300;
+  const padding = { left: 64, right: 72, top: 28, bottom: 42 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const rangeFrom = Number(state.quota.range.from);
+  const rangeTo = Math.max(Number(state.quota.range.to), rangeFrom + 1);
+  const rangeSpan = rangeTo - rangeFrom;
+  const amountValues = plottedSeries
+    .filter((item) => item.axis === "amount")
+    .flatMap((item) => item.points.map(item.value))
+    .filter(Number.isFinite);
+  const {
+    minimum: amountMinimum,
+    maximum: amountMaximum,
+    span: amountSpan,
+  } = quotaAmountRange(amountValues);
+  const x = (timestamp) => padding.left + (timestamp - rangeFrom) / rangeSpan * plotWidth;
+  const percentY = (value) => padding.top + plotHeight - value / 100 * plotHeight;
+  const amountY = (value) => padding.top
+    + (amountMaximum - value) / amountSpan * plotHeight;
+
+  elements.quotaChart.append(createSvg("text", {
+    x: padding.left,
+    y: 14,
+    "text-anchor": "start",
+    class: "axis-label quota-axis-title",
+  }, t("quota.percentAxis")));
+  if (amountValues.length) {
+    elements.quotaChart.append(createSvg("text", {
+      x: width - padding.right,
+      y: 14,
+      "text-anchor": "end",
+      class: "axis-label quota-axis-title",
+    }, t("quota.amountAxis")));
+  }
+
+  for (let index = 0; index <= 4; index += 1) {
+    const gridY = padding.top + index * plotHeight / 4;
+    elements.quotaChart.append(createSvg("line", {
+      x1: padding.left,
+      x2: width - padding.right,
+      y1: gridY,
+      y2: gridY,
+      class: "grid",
+    }));
+    elements.quotaChart.append(createSvg("text", {
+      x: padding.left - 10,
+      y: gridY + 4,
+      "text-anchor": "end",
+      class: "axis-label",
+    }, `${100 - index * 25}%`));
+    if (amountValues.length) {
+      elements.quotaChart.append(createSvg("text", {
+        x: width - padding.right + 10,
+        y: gridY + 4,
+        "text-anchor": "start",
+        class: "axis-label",
+      }, formatters.compactNumber.format(amountMaximum - amountSpan * index / 4)));
+    }
+  }
+
+  plottedSeries.forEach((item) => {
+    const y = item.axis === "percent" ? percentY : amountY;
+    for (const segment of splitQuotaPoints(
+      item.points,
+      state.quota.range.bucketSeconds,
+      item.value,
+    )) {
+      const path = segment
+        .map((point, index) => `${index ? "L" : "M"} ${x(point.sampledAt)} ${y(item.value(point))}`)
+        .join(" ");
+      elements.quotaChart.append(createSvg("path", {
+        d: path,
+        class: `quota-series quota-series-${item.seriesIndex % 8}${item.axis === "amount" ? " quota-amount-series" : ""}`,
+      }));
+    }
+
+    const legend = document.createElement("span");
+    const dot = document.createElement("i");
+    dot.className = `quota-legend-dot quota-series-${item.seriesIndex % 8}${item.axis === "amount" ? " quota-amount-series" : ""}`;
+    const text = document.createElement("span");
+    const axisLabel = item.axis === "percent" ? "%" : item.unit || t("quota.amountAxis");
+    text.textContent = `${item.provider.nodeName} / ${item.provider.providerName} / ${item.label} · ${axisLabel}`;
+    legend.append(dot, text);
+    elements.quotaLegend.append(legend);
+  });
+
+  [rangeFrom, rangeFrom + rangeSpan / 2, rangeTo].forEach((timestamp, index, labels) => {
+    elements.quotaChart.append(createSvg("text", {
+      x: x(timestamp),
+      y: height - 13,
+      "text-anchor": index === 0 ? "start" : index === labels.length - 1 ? "end" : "middle",
+      class: "axis-label",
+    }, formatTrendAxis(timestamp, rangeSpan)));
+  });
+}
+
+function renderQuota() {
+  updateQuotaFilters();
+  const providers = quotaProviders();
+  elements.quotaEmpty.hidden = providers.length > 0;
+  renderQuotaCards(providers);
+  renderQuotaChart(providers);
+  elements.quotaBucket.textContent = state.quota?.range
+    ? t("quota.resolvedBucket", { bucket: state.quota.range.bucket })
+    : "";
+}
+
 function dailyMetricValue(point, metric) {
   return Number(point?.[metric] || 0);
 }
@@ -734,14 +1004,19 @@ async function refreshAll({ reloadFilters = false } = {}) {
     const params = baseParams(true);
     params.set("bucket", state.trendBucket);
     const daily = dailyParams(true);
-    const [overview, dailyResponse] = await Promise.all([
+    const quotaParams = baseParams(false);
+    quotaParams.set("bucket", "auto");
+    const [overview, dailyResponse, quotaResponse] = await Promise.all([
       fetchJson(`/v2/dashboard/overview?${params}`, controller.signal),
       fetchJson(`/v2/dashboard/daily?${daily}`, controller.signal),
+      fetchJson(`/v2/dashboard/quota?${quotaParams}`, controller.signal),
       loadEvents({ append: false, signal: controller.signal }),
     ]);
     renderOverview(overview);
     state.daily = dailyResponse;
     renderDaily();
+    state.quota = quotaResponse;
+    renderQuota();
     clearError();
     setConnection("online", "status.online");
     state.updatedAt = Date.now();
@@ -985,6 +1260,7 @@ function applyTranslations() {
     : t("status.neverUpdated");
   if (state.overview) renderOverview(state.overview);
   if (state.daily) renderDaily();
+  if (state.quota) renderQuota();
   renderEventRows(state.events, false);
   if (state.lastError) showError(state.lastError);
 }
@@ -1105,6 +1381,9 @@ for (const select of [elements.nodeFilter, elements.appFilter, elements.provider
 
 elements.trendMetric.addEventListener("change", renderTrend);
 elements.dailyMetric.addEventListener("change", renderDaily);
+for (const select of [elements.quotaNodeFilter, elements.quotaProviderFilter, elements.quotaMetricFilter]) {
+  select.addEventListener("change", renderQuota);
+}
 elements.breakdownTabs.addEventListener("click", (event) => {
   const button = event.target.closest("[data-dimension]");
   if (!button) return;

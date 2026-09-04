@@ -24,6 +24,7 @@ const DASHBOARD_FAVICON: &str = include_str!("../web/favicon.svg");
 const DASHBOARD_JS: &str = include_str!("../web/app.js");
 const DASHBOARD_I18N_JS: &str = include_str!("../web/i18n.js");
 const DASHBOARD_RANGE_JS: &str = include_str!("../web/range.js");
+const DASHBOARD_QUOTA_JS: &str = include_str!("../web/quota-view.js");
 const MAX_RANGE_DAYS: i64 = 720;
 const MAX_RANGE_SECONDS: i64 = MAX_RANGE_DAYS * 24 * 60 * 60;
 const MAX_TREND_POINTS: i64 = 20_000;
@@ -1208,6 +1209,10 @@ async fn range_script() -> Response {
     static_response("text/javascript; charset=utf-8", DASHBOARD_RANGE_JS)
 }
 
+async fn quota_script() -> Response {
+    static_response("text/javascript; charset=utf-8", DASHBOARD_QUOTA_JS)
+}
+
 async fn root() -> Redirect {
     Redirect::temporary("/dashboard/")
 }
@@ -1222,10 +1227,12 @@ pub fn routes() -> Router<ServerState> {
         .route("/dashboard/app.js", get(script))
         .route("/dashboard/i18n.js", get(i18n_script))
         .route("/dashboard/range.js", get(range_script))
+        .route("/dashboard/quota-view.js", get(quota_script))
         .route("/v2/dashboard/overview", get(overview))
         .route("/v2/dashboard/daily", get(daily))
         .route("/v2/dashboard/filters", get(filters))
         .route("/v2/dashboard/events", get(events))
+        .route("/v2/dashboard/quota", get(crate::quota::dashboard))
         .route("/v1/dashboard/overview", get(super::v1_upgrade_required))
         .route("/v1/dashboard/daily", get(super::v1_upgrade_required))
         .route("/v1/dashboard/filters", get(super::v1_upgrade_required))

@@ -39,7 +39,7 @@ upload body.
   by the exact-data client and server queries.
 - `telemetry-core`: protocol-v2 request/response and mutation types.
 - `telemetry-client`: source mirror, durable local ledger, hash baseline, and
-  uploader.
+  uploader, plus the independent Codex quota collector/history ledger.
 - `telemetry-server`: staged generation commit, central SQLite store, node
   administration, and embedded Dashboard.
 - `session-usage-core`: six-source raw-session adapter and parser-provenance
@@ -79,6 +79,8 @@ Bearer token. Start that node's exact-data client:
 ```bash
 CC_SWITCH_DB="$HOME/.cc-switch/cc-switch.db" \
 TELEMETRY_LOCAL_USAGE_DB='./data/local-usage.db' \
+TELEMETRY_QUOTA_DB='./data/quota-history.db' \
+TELEMETRY_QUOTA_INTERVAL_SECONDS='60' \
 TELEMETRY_SERVER_URL='http://127.0.0.1:8787' \
 TELEMETRY_TOKEN='node-token-from-admin' \
   cargo run -p telemetry-client -- run --source cc-switch
@@ -123,6 +125,36 @@ cargo run -p telemetry-client -- verify --source cc-switch
 The verifier compares stable detail/rollup keys and content hashes and reports
 only counts plus the first mismatching key; it does not modify either database.
 
+### Codex quota history
+
+Quota collection is deliberately separate from request accounting. On startup
+the client immediately enumerates all `app_type='codex'` providers from
+`CC_SWITCH_DB`, then queries them sequentially every minute with:
+
+```text
+cc-switch-cli --app codex provider quota PROVIDER_ID --json
+```
+
+`cc-switch-cli` remains responsible for official subscription, Codex OAuth,
+and custom Usage Query credential/account routing. Telemetry checks the JSON
+`status`, `available`, and `result` fields even when the command exits zero,
+then retains only allowlisted normalized metrics. It never stores or uploads
+account IDs, credential messages, raw errors, provider settings, or Usage Query
+extras/invalid messages.
+
+Every successful sample is committed to the independent local quota database
+before upload. Neither the local database nor the central quota tables have an
+automatic pruning or compaction path. Network failures leave the remote cursor
+unchanged. To resend the complete local history idempotently to the currently
+configured server:
+
+```bash
+cargo run -p telemetry-client -- quota replay
+```
+
+This database is not touched by `telemetry-client rebuild`. Back it up as an
+independent, non-reconstructable source of historical quota samples.
+
 ## Environment variables
 
 | Variable | Component | Default | Meaning |
@@ -134,6 +166,9 @@ only counts plus the first mismatching key; it does not modify either database.
 | `TELEMETRY_SERVER_URL` | client | `http://127.0.0.1:8787` | Server base URL. |
 | `CC_SWITCH_DB` | exact client | `$HOME/.cc-switch/cc-switch.db` | Read-only source database path. |
 | `TELEMETRY_LOCAL_USAGE_DB` | client | `./data/local-usage.db` | Durable mirror/import ledger and upload-hash baseline. |
+| `CC_SWITCH_CLI` | quota client | PATH, then `$HOME/.local/bin/cc-switch-cli` | Explicit executable path override for the supported quota command. |
+| `TELEMETRY_QUOTA_DB` | quota client | `./data/quota-history.db` | Independent, durable, non-pruning quota history and per-remote upload cursors. |
+| `TELEMETRY_QUOTA_INTERVAL_SECONDS` | quota client | `60` | Sequential quota polling period; `0` disables quota collection. |
 | `TELEMETRY_MODELS_DEV_URL` | local client | `https://models.dev/api.json` | Raw-mode pricing endpoint override. |
 | `TELEMETRY_CLAUDE_DIR`, `TELEMETRY_CODEX_DIR`, `TELEMETRY_GEMINI_DIR`, `TELEMETRY_OPENCODE_DB`, `TELEMETRY_GROK_DIR` | local client | tool defaults | Claude, Codex, Gemini, OpenCode, and Grok raw-source overrides. |
 | `TELEMETRY_PI_SESSION_DIR` | local client | `$HOME/.pi/agent/sessions` | Pi flat or project-directory session root. |
@@ -158,6 +193,17 @@ the shared cc-switch policy. Latency is request-count weighted. Request-list
 pagination remains retained-detail only because rolled-up rows no longer have
 request-level identity.
 
+The Codex quota panel uses independent node, provider, and metric selectors.
+Each `(server-derived node UUID, provider ID)` remains a separate series. Long
+ranges are automatically limited to roughly 2,000 real points per series by
+selecting the final sample in each bucket; values are never averaged and
+missing samples remain visible as gaps. Provider status cards remain visible
+when quota is unsupported, unconfigured, expired, or temporarily failing.
+Explicit utilization and balances derivable from `used / total` or
+`(total - remaining) / total` use the fixed 0–100% left axis. Only balances
+without a usable total use the right amount axis; their native unit remains in
+the legend.
+
 The server never performs scheduled or age-based compaction. It retains every
 uploaded detail event unless the client supplies a daily rollup for that exact
 complete source-local day. Applying that client rollup replaces only the
@@ -178,6 +224,7 @@ Authenticated node endpoints:
 - `POST /v2/sync/rollups`
 - `POST /v2/sync/providers`
 - `POST /v2/sync/commit`
+- `POST /v2/quota/observations`
 
 Loopback-only Dashboard endpoints:
 
@@ -185,6 +232,7 @@ Loopback-only Dashboard endpoints:
 - `GET /v2/dashboard/daily`
 - `GET /v2/dashboard/filters`
 - `GET /v2/dashboard/events`
+- `GET /v2/dashboard/quota?from=&to=&bucket=&node_id=&provider_id=`
 
 `GET /healthz` is unauthenticated. Product `/v1/*` ingestion, summary, and
 Dashboard API routes return HTTP 426 after cutover.
@@ -253,6 +301,11 @@ uninstall script above is invoked explicitly.
 
 - Uploaded records contain usage metadata, not API keys, prompts, response
   bodies, or raw session text.
+- Quota uploads contain provider aliases, status classes, normalized numeric
+  metrics, sample times, and reset times only. Browser code never calls
+  cc-switch or `wham/usage`; it uses the same-origin server Dashboard API.
+- Node identity for quota is derived from the existing Bearer token. A quota
+  upload body has no node-ID field and cannot select another node namespace.
 - Provider labels use `(node_id, app_type, provider_id)` as the stable key; a
   current rename changes display labels without rewriting historical usage.
 - Daily rollups use normalized fresh-input semantics version 2 and carry exact

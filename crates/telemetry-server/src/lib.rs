@@ -1,6 +1,7 @@
 mod admin;
 mod dashboard;
 pub mod nodes;
+mod quota;
 mod sync_v2;
 
 use axum::{
@@ -299,6 +300,7 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     nodes::ensure_schema(&conn)?;
+    quota::ensure_schema(&conn)?;
     Ok(conn)
 }
 
@@ -844,6 +846,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/usage/summary", get(v1_upgrade_required))
         .merge(dashboard::routes())
         .merge(admin::routes())
+        .merge(quota::ingest_routes())
         .merge(sync_v2::routes())
         .with_state(state)
 }
