@@ -11,7 +11,7 @@
     <header class="header">
       <div>
         <p class="eyebrow">CC SWITCH TELEMETRY</p>
-        <h1>Node 管理</h1>
+        <h1>Telemetry 管理</h1>
       </div>
       <button id="logoutButton" class="button secondary" type="button" hidden>退出登录</button>
     </header>
@@ -27,6 +27,16 @@
     </section>
 
     <section id="adminPanel" hidden>
+      <div class="panel">
+        <h2>Dashboard 设置</h2>
+        <p class="muted">设置所有访客首次打开页面时的 Quota 展示。别名按节点独立生效。</p>
+        <form id="settingsForm">
+          <label class="check-label"><input id="settingsAllProviders" type="checkbox">默认显示全部 Provider 和指标</label>
+          <div id="settingsProviders" class="settings-providers"></div>
+          <button id="saveSettings" class="button" type="submit">保存设置</button>
+          <p id="settingsMessage" class="message" role="status"></p>
+        </form>
+      </div>
       <div class="panel">
         <div class="section-heading">
           <div>

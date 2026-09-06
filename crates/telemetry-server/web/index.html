@@ -258,14 +258,18 @@
             </label>
             <label>
               <span data-i18n="quota.provider">Provider</span>
-              <select id="quotaProviderFilter"><option value="" data-i18n="quota.allProviders">All quota providers</option></select>
+              <div id="quotaProviderFilter" class="quota-picker"></div>
             </label>
             <label>
               <span data-i18n="quota.metric">Metric</span>
-              <select id="quotaMetricFilter"><option value="" data-i18n="quota.allMetrics">All quota metrics</option></select>
+              <div id="quotaMetricFilter" class="quota-picker"></div>
             </label>
           </div>
         </div>
+        <div class="quota-chart-actions"><label data-i18n="quota.granularity">Quota granularity</label>
+          <button id="quotaBucketTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-controls="bucketPickerDialog" aria-expanded="false" data-i18n-aria-label="quota.granularity"><span id="quotaGranularityLabel">Auto</span></button>
+        </div>
+        <button id="restoreQuotaDefaults" class="button secondary" type="button" data-i18n="quota.restoreDefaults">Restore defaults</button>
         <div id="quotaCards" class="quota-cards" aria-live="polite"></div>
         <div id="quotaEmpty" class="empty-state" hidden data-i18n="quota.empty">No quota providers or samples for this selection</div>
         <div id="quotaChart" class="trend-chart quota-chart echarts-chart" role="img" aria-label="Codex quota history chart" data-i18n-aria-label="quota.chartAria"></div>

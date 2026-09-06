@@ -1,3 +1,4 @@
+import { providerIdentity, metricIdentity, providerSelected, mergeProviders, renderPicker } from "./quota-settings.js";
 const elements = {
   loginPanel: document.getElementById("loginPanel"),
   loginForm: document.getElementById("loginForm"),
@@ -157,7 +158,7 @@ async function login(event) {
     });
     elements.passwordInput.value = "";
     showAdmin();
-    await loadNodes();
+    await Promise.all([loadNodes(), loadSettings()]);
   } catch (error) {
     showMessage(elements.loginMessage, error.message);
   }
@@ -262,7 +263,7 @@ async function boot() {
   try {
     await api("/admin/api/session");
     showAdmin();
-    await loadNodes();
+    await Promise.all([loadNodes(), loadSettings()]);
   } catch (error) {
     if (error.status === 503) showLogin("管理员功能未启用：请设置 ADMIN_PASSWORD 后重启 server。");
     else showLogin();
@@ -286,3 +287,102 @@ elements.copyTokenButton.addEventListener("click", async () => {
   showMessage(elements.actionMessage, "Token 已复制。", "ok");
 });
 boot();
+
+
+let settingsDraft = null;
+let settingsCatalog = [];
+const settingsForm = document.getElementById("settingsForm");
+const settingsMessage = document.getElementById("settingsMessage");
+const allProvidersInput = document.getElementById("settingsAllProviders");
+function customProviders() {
+  if (settingsDraft.quotaDefaults.providers === null) {
+    settingsDraft.quotaDefaults.providers = settingsCatalog.map(({ nodeId, providerId }) => ({ nodeId, providerId, metrics: null }));
+  }
+  return settingsDraft.quotaDefaults.providers;
+}
+function settingsChanged() { showMessage(settingsMessage, "有未保存的修改。"); }
+function renderSettings() {
+  allProvidersInput.checked = settingsDraft.quotaDefaults.providers === null;
+  const container = document.getElementById("settingsProviders");
+  container.replaceChildren();
+  for (const provider of settingsCatalog) {
+    const identity = providerIdentity(provider);
+    const row = document.createElement("div");
+    row.className = "settings-provider";
+    const label = document.createElement("label");
+    label.className = "check-label";
+    const enabled = document.createElement("input");
+    enabled.type = "checkbox";
+    enabled.checked = providerSelected(settingsDraft.quotaDefaults.providers, provider);
+    label.append(enabled, `${provider.nodeName || provider.nodeId} / ${provider.providerName || provider.providerId}${provider.unavailable ? '（暂无数据）' : ''}`);
+    label.title = provider.nodeId + ' / ' + provider.providerId;
+    enabled.addEventListener("change", () => {
+      const entries = customProviders().filter((p) => providerIdentity(p) !== identity);
+      if (enabled.checked) entries.push({ nodeId: provider.nodeId, providerId: provider.providerId, metrics: null });
+      settingsDraft.quotaDefaults.providers = entries;
+      settingsChanged(); renderSettings();
+    });
+    const aliasLabel = document.createElement("label");
+    aliasLabel.textContent = "显示别名";
+    const alias = document.createElement("input");
+    alias.maxLength = 256;
+    alias.placeholder = provider.providerName || provider.providerId;
+    alias.value = settingsDraft.quotaProviderAliases.find((p) => providerIdentity(p) === identity)?.alias || "";
+    alias.addEventListener("input", () => {
+      settingsDraft.quotaProviderAliases = settingsDraft.quotaProviderAliases.filter((p) => providerIdentity(p) !== identity);
+      if (alias.value.trim()) settingsDraft.quotaProviderAliases.push({ nodeId: provider.nodeId, providerId: provider.providerId, alias: alias.value });
+      settingsChanged();
+    });
+    aliasLabel.append(alias);
+    const picker = document.createElement("div");
+    const metrics = settingsDraft.quotaDefaults.providers?.find((p) => providerIdentity(p) === identity)?.metrics ?? null;
+    renderPicker(picker, {
+      title: "默认指标", allLabel: "全部", noneLabel: "清空",
+      selected: metrics === null ? null : metrics.map(metricIdentity),
+      groups: [{ options: provider.metrics.map((m) => ({ value: metricIdentity(m), label: `${m.label || m.key} · ${m.unit || m.kind}` })) }],
+      onChange: (keys) => {
+        const entries = customProviders();
+        let entry = entries.find((p) => providerIdentity(p) === identity);
+        if (!entry) { entry = { nodeId: provider.nodeId, providerId: provider.providerId, metrics: null }; entries.push(entry); }
+        entry.metrics = keys === null ? null : keys.map((key) => { const [keyName, kind, unit] = JSON.parse(key); return { key: keyName, kind, unit: unit || null }; });
+        allProvidersInput.checked = false;
+        enabled.checked = true;
+        settingsChanged();
+      },
+    });
+    row.append(label, aliasLabel, picker); container.append(row);
+  }
+}
+async function loadSettings() {
+  document.getElementById("saveSettings").disabled = true;
+  try {
+    const result = await api("/admin/api/settings");
+    settingsDraft = result.settings;
+    settingsCatalog = mergeProviders(result.providers, settingsDraft);
+    renderSettings();
+    document.getElementById("saveSettings").disabled = false;
+  } catch (error) {
+    if (error.status === 401) return showLogin("登录已过期，请重新登录。");
+    showMessage(settingsMessage, error.message);
+  }
+}
+allProvidersInput.addEventListener("change", () => {
+  if (!settingsDraft) return;
+  if (allProvidersInput.checked) settingsDraft.quotaDefaults.providers = null;
+  else customProviders();
+  settingsChanged(); renderSettings();
+});
+settingsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!settingsDraft) return;
+  const button = document.getElementById("saveSettings");
+  button.disabled = true;
+  try {
+    settingsDraft = await api("/admin/api/settings", { method: "PUT", body: JSON.stringify(settingsDraft) });
+    renderSettings();
+    showMessage(settingsMessage, "设置已保存。Dashboard 首次打开或恢复默认时应用。", "ok");
+  } catch (error) {
+    if (error.status === 401) showLogin("登录已过期，请重新登录。");
+    else showMessage(settingsMessage, error.message);
+  } finally { button.disabled = false; }
+});

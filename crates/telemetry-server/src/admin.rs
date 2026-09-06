@@ -118,7 +118,7 @@ fn authenticated(state: &ServerState, headers: &HeaderMap) -> bool {
     true
 }
 
-fn require_admin(state: &ServerState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+pub(crate) fn require_admin(state: &ServerState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     if state.admin_password.is_none() {
         return Err(Box::new(json_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -671,6 +671,11 @@ pub fn routes() -> Router<ServerState> {
         .route("/admin/login", post(login))
         .route("/admin/logout", post(logout))
         .route("/admin/api/session", get(session))
+        .route("/admin/quota-settings.js", get(crate::settings::script))
+        .route(
+            "/admin/api/settings",
+            get(crate::settings::admin_get).put(crate::settings::admin_put),
+        )
         .route("/admin/api/nodes", get(list_nodes).post(create_node))
         .route("/admin/api/nodes/:uuid", patch(rename_node))
         .route(

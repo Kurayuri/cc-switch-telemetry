@@ -1,9 +1,9 @@
 const FONT_FAMILY = 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
 const DAY_MS = 86_400_000;
-const DAILY_LABEL_SPACE = 42;
+const DAILY_LABEL_SPACE = 48;
 const DAILY_COMPACT_WIDTH = 480;
 const DAILY_MIN_CELL_SIZE = 3;
-const DAILY_MAX_CELL_SIZE = 15;
+const DAILY_MAX_CELL_SIZE = 20;
 
 function animationOptions(reducedMotion, pointCount) {
   const enabled = !reducedMotion && pointCount <= 2_000;
@@ -87,6 +87,7 @@ export function buildTrendOption({
   points,
   metric,
   range,
+  chartWidth = 840,
   palette,
   formatAxis,
   formatValue,
@@ -123,6 +124,7 @@ export function buildTrendOption({
         ...axisLine(palette).axisLabel,
         formatter: (value) => formatAxis(Number(value)),
       },
+      ...calendarAxisOptions(range, chartWidth, formatAxis, axisLine(palette).axisLabel),
     },
     yAxis: {
       ...axisLine(palette),
@@ -208,12 +210,12 @@ export function joinQuotaSegments(segments, valueSelector) {
   return data;
 }
 
-export function dailyCalendarLayout(range, chartWidth = 840) {
+export function dailyCalendarLayout(range, chartWidth = 1120) {
   const start = Date.parse(`${range?.[0] || ""}T00:00:00Z`);
   const end = Date.parse(`${range?.[1] || ""}T00:00:00Z`);
   const width = Number.isFinite(Number(chartWidth)) && Number(chartWidth) > 0
     ? Number(chartWidth)
-    : 840;
+    : 1120;
   const dayCount = Number.isFinite(start) && Number.isFinite(end) && end >= start
     ? Math.round((end - start) / DAY_MS) + 1
     : 1;
@@ -230,7 +232,8 @@ export function dailyCalendarLayout(range, chartWidth = 840) {
     cellSize,
     weekCount,
     left: labelSpace + Math.max(0, Math.floor((width - contentWidth) / 2)),
-    top: showLabels ? 24 : 8,
+    top: showLabels ? 28 : 8,
+    height: (showLabels ? 28 : 8) + 7 * cellSize + 20,
     showLabels,
     borderWidth: cellSize >= 10 ? 2 : 1,
   };
@@ -240,6 +243,7 @@ export function buildQuotaOption({
   plots,
   range,
   amountRange,
+  chartWidth = 840,
   palette,
   formatAxis,
   formatAmount,
@@ -297,7 +301,13 @@ export function buildQuotaOption({
       bottom: plots.length > 1 ? 50 : 22,
       containLabel: true,
     },
-    tooltip: tooltipOptions(palette, formatTooltip),
+    tooltip: {
+      ...tooltipOptions(palette, formatTooltip),
+      renderMode: "html", appendTo: "body", confine: false, enterable: true,
+      transitionDuration: 0, className: "echarts-tooltip quota-tooltip",
+      position: (point, params, dom, rect, size) => dailyTooltipPosition(point, params, dom, rect, size, "quotaChart"),
+      axisPointer: { axis: "x", type: "line" },
+    },
     legend: {
       show: plots.length > 1,
       type: "scroll",
@@ -320,6 +330,7 @@ export function buildQuotaOption({
       boundaryGap: false,
       splitNumber: 3,
       axisLabel: { ...axes.axisLabel, formatter: (value) => formatAxis(Number(value)) },
+      ...calendarAxisOptions(range, chartWidth, formatAxis, axes.axisLabel),
     },
     yAxis: [
       {
@@ -355,7 +366,7 @@ export function buildQuotaOption({
 export function buildDailyOption({
   points,
   range,
-  chartWidth = 840,
+  chartWidth = 1120,
   palette,
   colors,
   dayNames,
@@ -375,7 +386,17 @@ export function buildDailyOption({
     ...animationOptions(reducedMotion, data.length),
     aria: ariaOptions(ariaDescription),
     backgroundColor: "transparent",
-    tooltip: tooltipOptions(palette, formatTooltip, "item"),
+    tooltip: {
+      ...tooltipOptions(palette, formatTooltip, "item"),
+      renderMode: "html",
+      appendTo: "body",
+      enterable: true,
+      transitionDuration: 0,
+      confine: false,
+      className: "echarts-tooltip daily-tooltip",
+      textStyle: { color: palette.text, fontFamily: FONT_FAMILY, fontSize: 14, lineHeight: 22 },
+      position: dailyTooltipPosition,
+    },
     visualMap: {
       show: false,
       type: "piecewise",
@@ -402,7 +423,7 @@ export function buildDailyOption({
         margin: 7,
         color: palette.muted,
         fontFamily: FONT_FAMILY,
-        fontSize: 10,
+        fontSize: 12,
         nameMap: dayNames,
       },
       monthLabel: {
@@ -410,7 +431,7 @@ export function buildDailyOption({
         margin: 8,
         color: palette.muted,
         fontFamily: FONT_FAMILY,
-        fontSize: 10,
+        fontSize: 12,
         nameMap: monthNames,
       },
     },
@@ -436,5 +457,48 @@ export function buildDailyOption({
       },
       universalTransition: true,
     }],
+  };
+}
+
+export function dailyTooltipPosition(point, params, dom, rect, size, chartId = "dailyHeatmap") {
+  const bounds = dom.ownerDocument.documentElement;
+  const chart = dom.ownerDocument.getElementById(chartId);
+  const origin = chart?.getBoundingClientRect() || { left: 0, top: 0 };
+  const padding = 12;
+  const width = size.contentSize[0];
+  const height = size.contentSize[1];
+  let x = origin.left + point[0] + padding;
+  let y = origin.top + point[1] + padding;
+  if (x + width > bounds.clientWidth - padding) x = origin.left + point[0] - width - padding;
+  if (y + height > bounds.clientHeight - padding) y = origin.top + point[1] - height - padding;
+  x = Math.max(padding, Math.min(x, bounds.clientWidth - width - padding));
+  y = Math.max(padding, Math.min(y, bounds.clientHeight - height - padding));
+  return [x - origin.left, y - origin.top];
+}
+
+export function usageTooltipMarkup(point, title, lines, formatInteger) {
+  return tooltipMarkup(title,
+    [["", `Total: ${formatInteger(Number(point.realTotalTokens || 0))}`], ...lines]);
+}
+
+// Generate all day ticks first; explicitly thin labels at a regular calendar stride.
+export function calendarAxisOptions(range, width, formatAxis, axisLabel = {}) {
+  const from = Number(range.from) * 1000, to = Number(range.to) * 1000;
+  if (to - from <= 2 * DAY_MS) return {};
+  const first = new Date(from);
+  first.setHours(0, 0, 0, 0);
+  if (first.getTime() < from) first.setDate(first.getDate() + 1);
+  const end = new Date(to);
+  const ordinal = (date) => Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / DAY_MS;
+  const count = Math.max(1, ordinal(end) - ordinal(first) + 1);
+  const slots = Math.max(2, Math.floor(Number(width || 840) / 90));
+  const required = Math.ceil(count / slots);
+  const step = [1, 2, 3, 7, 14, 30, 60, 90, 180].find((n) => n >= required) || required;
+  const labels = new Set();
+  for (const date = new Date(first); date.getTime() <= to; date.setDate(date.getDate() + step)) labels.add(date.getTime());
+  return {
+    minInterval: DAY_MS, maxInterval: DAY_MS, splitNumber: Math.ceil((to - from) / DAY_MS),
+    axisLabel: { ...axisLabel, hideOverlap: false, showMinLabel: true, showMaxLabel: true,
+      formatter: (value) => labels.has(Number(value)) ? formatAxis(Number(value)) : "" },
   };
 }

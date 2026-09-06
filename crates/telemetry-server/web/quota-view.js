@@ -54,24 +54,70 @@ export function filterQuotaProviders(providers, nodeId, providerId) {
 }
 
 export function splitQuotaPoints(points, bucketSeconds, valueSelector = quotaMetricValue) {
-  const gapSeconds = Math.max(90, Number(bucketSeconds || 60) * 1.5);
   const segments = [];
   let segment = [];
   let previous = null;
   for (const point of points || []) {
-    if (valueSelector(point) == null) {
-      if (segment.length) segments.push(segment);
-      segment = [];
-      previous = null;
+    const value = optionalQuotaNumber(valueSelector(point));
+    if (value == null) {
+      // A different valid scale is a boundary; an absent sample is not.
+      if (quotaMetricValue(point) != null) {
+        if (segment.length) segments.push(segment);
+        segment = [];
+        previous = null;
+      }
       continue;
     }
-    if (previous != null && point.sampledAt - previous > gapSeconds) {
+    const hasSegments = previous?.segmentId != null && point.segmentId != null;
+    if (previous && (hasSegments
+      ? previous.segmentId !== point.segmentId
+      : point.sampledAt - previous.sampledAt > 600)) {
       if (segment.length) segments.push(segment);
       segment = [];
     }
     segment.push(point);
-    previous = point.sampledAt;
+    previous = point;
   }
   if (segment.length) segments.push(segment);
   return segments;
+}
+
+export function quotaSnapshotRows(plots, snapshot, legendSelection = {}) {
+  const identity = (p) => JSON.stringify([p.nodeId, p.providerId, p.key, p.kind, p.unit || ""]);
+  const points = new Map((snapshot?.metrics || []).map((p) => [identity(p), p]));
+  return plots.filter((plot) => legendSelection[plot.name] !== false).map((plot) => {
+    const candidate = points.get(plot.metricId);
+    const age = Number(snapshot?.at) - Number(candidate?.sampledAt);
+    const point = candidate && age >= 0 && age <= 600 ? candidate : null;
+    return { plot, point, value: point ? plot.value(point) : null };
+  });
+}
+
+export function createQuotaSnapshotLoader(fetcher, delay = 100) {
+  const cache = new Map();
+  let generation = 0, timer = null, controller = null;
+  const cancel = () => { generation++; clearTimeout(timer); controller?.abort(); controller = null; };
+  return {
+    peek: (at) => cache.get(at),
+    cancel,
+    invalidate: () => { cancel(); cache.clear(); },
+    request(at, success, failure) {
+      cancel();
+      if (cache.has(at)) { success(cache.get(at)); return; }
+      const current = generation;
+      timer = setTimeout(async () => {
+        const request = new AbortController();
+        controller = request;
+        try {
+          const result = await fetcher(at, request.signal);
+          if (current !== generation) return;
+          cache.set(at, result);
+          if (cache.size > 64) cache.delete(cache.keys().next().value);
+          success(result);
+        } catch (error) {
+          if (current === generation && error.name !== "AbortError") failure(error);
+        } finally { if (current === generation) controller = null; }
+      }, delay);
+    },
+  };
 }

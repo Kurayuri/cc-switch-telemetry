@@ -118,7 +118,7 @@ test("daily options use a calendar heatmap and quantized color dimension", () =>
     ariaDescription: "Daily usage",
   });
   assert.deepEqual(option.calendar.range, ["2026-01-01", "2026-12-31"]);
-  assert.deepEqual(option.calendar.cellSize, [15, 15]);
+  assert.deepEqual(option.calendar.cellSize, [20, 20]);
   assert.equal(option.calendar.right, undefined);
   assert.equal(option.calendar.bottom, undefined);
   assert.equal(option.calendar.itemStyle.borderColor, palette.surfaceSolid);
@@ -130,12 +130,12 @@ test("daily options use a calendar heatmap and quantized color dimension", () =>
 });
 
 test("daily calendar keeps square separated tiles while fitting narrow charts", () => {
-  const desktop = dailyCalendarLayout(["2026-01-01", "2026-12-31"], 840);
+  const desktop = dailyCalendarLayout(["2026-01-01", "2026-12-31"], 1120);
   const narrow = dailyCalendarLayout(["2026-01-01", "2026-12-31"], 320);
-  assert.equal(desktop.cellSize, 15);
+  assert.equal(desktop.cellSize, 20);
   assert.equal(desktop.borderWidth, 2);
   assert.equal(desktop.showLabels, true);
-  assert.ok(desktop.left >= 42);
+  assert.ok(desktop.left >= 48);
   assert.ok(narrow.cellSize < desktop.cellSize);
   assert.equal(narrow.borderWidth, 1);
   assert.equal(narrow.showLabels, false);

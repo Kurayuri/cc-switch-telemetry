@@ -359,3 +359,48 @@ uninstall script above is invoked explicitly.
 - Existing shell scripts in a deployment may contain local credentials. Keep
   credentials outside source files; this implementation neither reads nor
   migrates those script values.
+
+## Dashboard quota settings
+
+The Server creates `settings.json` alongside `TELEMETRY_DB` (normally
+`data/settings.json`) on startup. The Admin page provides default provider
+selection, independent metric selection per provider, and display aliases scoped
+to `(nodeId, providerId)`. Saving applies immediately to the Server's settings;
+Dashboard visitors load defaults when opening the page or using **Restore
+defaults**. Automatic refresh preserves their current selection and updates
+aliases.
+
+`GET /admin/api/settings` returns `{ settings, providers }`, including the known
+metric catalog. `PUT /admin/api/settings` accepts and returns the settings object;
+both require the existing Admin session. `GET /v3/dashboard/settings` exposes the
+same display settings under the Dashboard's loopback access policy.
+
+```json
+{
+  "version": 1,
+  "quotaDefaults": {
+    "providers": [
+      {
+        "nodeId": "node-uuid",
+        "providerId": "provider-id",
+        "metrics": [{ "key": "weekly", "kind": "utilizationPercent", "unit": "%" }]
+      }
+    ]
+  },
+  "quotaProviderAliases": [
+    { "nodeId": "node-uuid", "providerId": "provider-id", "alias": "My subscription" }
+  ]
+}
+```
+
+`providers: null` selects every provider and metric. Within a selected provider,
+`metrics: null` selects all its metrics. Empty arrays select nothing. An empty
+alias restores the collected provider name. Unavailable selections are retained.
+Updates use an atomic file replacement; invalid existing files cause a startup
+error instead of being silently replaced. Direct file edits require a restart.
+
+Quota history segments raw observations before downsampling: intervals of up to
+600 seconds connect, while longer gaps or changes between percentage and amount
+axes start a new segment. Each bucket retains its last real value and every
+segment retains its endpoints. Usage and daily tooltips display `Totel` using
+`realTotalTokens` (input including cache tokens, plus output).

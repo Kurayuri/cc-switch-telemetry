@@ -4,6 +4,8 @@ import {
   buildQuotaOption,
   buildTrendOption,
   tooltipMarkup,
+  usageTooltipMarkup,
+  dailyCalendarLayout,
 } from "./charts.js";
 import { createFormatters, resolveLocale, translate } from "./i18n.js";
 import {
@@ -30,7 +32,11 @@ import {
   quotaMetricIdentity,
   quotaPercentage,
   splitQuotaPoints,
+  quotaSnapshotRows,
+  createQuotaSnapshotLoader,
 } from "./quota-view.js";
+
+import { providerIdentity, metricIdentity, providerName, providerSelected, metricSelected, mergeProviders, renderPicker } from "./quota-settings.js";
 
 const $ = (id) => document.getElementById(id);
 const localeStorageKey = "cc-switch-telemetry.locale";
@@ -142,6 +148,8 @@ const state = {
   overview: null,
   daily: null,
   quota: null,
+  settings: null,
+  quotaSelection: undefined,
   breakdownDimension: "nodes",
   eventCursor: null,
   requestController: null,
@@ -156,6 +164,11 @@ const state = {
   rangeCalendarMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   activeRangeField: "start",
   trendBucket: "auto",
+  quotaGranularity: "auto",
+  bucketTarget: "trend",
+  resources: {},
+  resourceErrors: new Map(),
+  quotaPlots: [],
   connection: { status: "", key: "status.connecting" },
 };
 
@@ -164,6 +177,8 @@ const chartInstances = {
   quota: null,
   daily: null,
 };
+
+const quotaSnapshots = createQuotaSnapshotLoader((at, signal) => fetchJson(`/v3/dashboard/quota/at?at=${at}`, signal));
 
 function reducedMotion() {
   return typeof window.matchMedia === "function"
@@ -193,6 +208,11 @@ function chartPalette() {
 function ensureChart(name, element) {
   if (!chartInstances[name]) {
     chartInstances[name] = echarts.init(element, null, { renderer: "canvas" });
+    if (name === "quota") {
+      chartInstances[name].on("hideTip", quotaSnapshots.cancel);
+      chartInstances[name].on("legendselectchanged", () => { quotaSnapshots.cancel(); chartInstances[name].dispatchAction({ type: "hideTip" }); });
+      chartInstances[name].getZr().on("globalout", quotaSnapshots.cancel);
+    }
   }
   return chartInstances[name];
 }
@@ -212,6 +232,8 @@ function clearChart(name, element) {
 function resizeCharts() {
   for (const chart of Object.values(chartInstances)) chart?.resize();
   if (state.daily) renderDaily();
+  if (state.overview) renderTrend();
+  if (state.quota) renderQuotaChart(quotaProviders());
 }
 
 function selectedRange() {
@@ -406,7 +428,7 @@ function animateTokenParts(summary) {
 }
 
 function renderSummary(summary) {
-  animateMetric($("kpiRequests"), summary.totalRequests, (value) => formatters.integerNumber.format(value));
+  animateMetric($("kpiRequests"), summary.totalRequests, formatTokens);
   animateMetric($("kpiTokens"), summary.realTotalTokens, formatTokens);
   animateMetric($("kpiCost"), summary.totalCostUsd, (value) => formatters.moneyNumber.format(value));
   animateMetric($("kpiSuccessRate"), summary.successRate, (value) => formatPercent(value));
@@ -484,6 +506,7 @@ function renderTrend() {
     points,
     metric,
     range,
+    chartWidth: elements.trendChart.clientWidth,
     palette,
     formatAxis: (timestampMs) => formatTrendAxis(timestampMs / 1_000, spanSeconds),
     formatValue: (value) => trendValueLabel(value, metric),
@@ -508,21 +531,30 @@ function usageTooltip(point, titleText) {
     ["", t("trend.tooltipCost", { value: formatters.moneyNumber.format(point.totalCostUsd) })],
     ["", t("trend.tooltipLatency", { value: formatLatency(point.avgLatencyMs) })],
   ];
-  return tooltipMarkup(titleText, lines);
+  return usageTooltipMarkup(point, titleText, lines, (value) => formatters.integerNumber.format(value));
 }
 
-function quotaTooltip(params) {
-  const items = (Array.isArray(params) ? params : [params])
-    .filter((item) => item?.data?.source && Number.isFinite(Number(item.value?.[1])));
-  if (!items.length) return "";
-  const title = formatters.dateTime.format(Number(items[0].value[0]));
-  const lines = items.map((item) => [
-    item.seriesName,
-    item.data.axis === "amount"
-      ? formatters.compactNumber.format(Number(item.value[1]))
-      : `${Number(item.value[1]).toFixed(1)}%`,
-  ]);
-  return tooltipMarkup(title, lines);
+function quotaTooltip(params, ticket, callback) {
+  const items = Array.isArray(params) ? params : [params];
+  const raw = items.find((item) => item?.axisValue != null || item?.value?.[0] != null);
+  if (!raw) return "";
+  const at = Math.floor(Number(raw.axisValue ?? raw.value[0]) / 1000);
+  if (!Number.isFinite(at)) return "";
+  const title = formatters.quotaDateTime.format(at * 1000);
+  const legend = chartInstances.quota?.getOption().legend?.[0]?.selected || {};
+  const plots = state.quotaPlots;
+  const markup = (snapshot, placeholder = null) => tooltipMarkup(title,
+    quotaSnapshotRows(plots, snapshot || { at, metrics: [] }, legend).map(({ plot, point, value }) => [
+      plot.name,
+      placeholder || (value == null ? t("quota.noData") :
+        (plot.axis === "amount" ? formatTokens(value) + (plot.unit ? " " + plot.unit : "") : Number(value).toFixed(1) + "%")
+        + " · " + formatters.quotaDateTime.format(point.sampledAt * 1000)),
+    ]));
+  const cached = quotaSnapshots.peek(at);
+  if (cached) { quotaSnapshots.cancel(); return markup(cached); }
+  quotaSnapshots.request(at, (snapshot) => callback?.(ticket, markup(snapshot)),
+    () => callback?.(ticket, markup(null, t("quota.loadFailed"))));
+  return markup(null, t("quota.loading"));
 }
 
 function dailyTooltip(params) {
@@ -599,41 +631,59 @@ function quotaValueLabel(metric) {
   return "—";
 }
 
+function quotaDisplayName(provider) { return providerName(provider, state.settings); }
+
 function quotaProviders() {
-  return filterQuotaProviders(
-    state.quota?.providers,
-    elements.quotaNodeFilter.value,
-    elements.quotaProviderFilter.value,
-  );
+  return (state.quota?.providers || []).filter((provider) =>
+    (!elements.quotaNodeFilter.value || provider.nodeId === elements.quotaNodeFilter.value)
+    && providerSelected(state.quotaSelection, provider));
+}
+
+function quotaCatalog() {
+  return mergeProviders(state.quota?.providers || [], state.settings, state.quotaSelection);
 }
 
 function updateQuotaFilters() {
-  const providers = state.quota?.providers || [];
-  const nodes = new Map();
-  const providerOptions = new Map();
-  const metrics = new Map();
-  for (const provider of providers) {
-    nodes.set(provider.nodeId, provider.nodeName || provider.nodeId);
-    if (!providerOptions.has(provider.providerId)) {
-      providerOptions.set(provider.providerId, provider.providerName || provider.providerId);
-    }
-    for (const metric of [...(provider.current || []), ...(provider.series || [])]) {
-      const identity = quotaMetricIdentity(metric);
-      const usesPercentage = quotaPercentage(metric) != null
-        || metric.kind === "utilizationPercent"
-        || metric.points?.some((point) => quotaPercentage(point) != null);
-      const detail = usesPercentage
-        ? "%"
-        : metric.unit || t("quota.balance");
-      metrics.set(identity, `${metric.label || metric.key} · ${detail}`);
-    }
-  }
-  const options = (items) => [...items.entries()]
-    .map(([value, label]) => ({ value, label }))
-    .sort((left, right) => left.label.localeCompare(right.label, locale));
-  setSelectOptions(elements.quotaNodeFilter, options(nodes), t("quota.allNodes"));
-  setSelectOptions(elements.quotaProviderFilter, options(providerOptions), t("quota.allProviders"));
-  setSelectOptions(elements.quotaMetricFilter, options(metrics), t("quota.allMetrics"));
+  const providers = quotaCatalog();
+  const nodes = new Map(providers.map((p) => [p.nodeId, p.nodeName || p.nodeId]));
+  setSelectOptions(elements.quotaNodeFilter,
+    [...nodes].map(([value, label]) => ({ value, label })), t("quota.allNodes"));
+  const selected = state.quotaSelection;
+  const pickerLabels = { allLabel: t("quota.selectAll"), noneLabel: t("quota.selectNone") };
+  renderPicker(elements.quotaProviderFilter, {
+    ...pickerLabels, title: t("quota.provider"),
+    groups: [{ options: providers.map((p) => ({ value: providerIdentity(p), label: `${p.nodeName || p.nodeId} / ${providerName(p, state.settings)}${p.unavailable ? ' (' + t("quota.unavailable") + ')' : ''}` })) }],
+    selected: selected == null ? null : selected.map(providerIdentity),
+    onChange: (keys) => {
+      state.quotaSelection = keys === null ? null : keys.map((key) => {
+        const [nodeId, providerId] = JSON.parse(key);
+        return selected?.find((p) => providerIdentity(p) === key) || { nodeId, providerId, metrics: null };
+      });
+      renderQuota();
+    },
+  });
+  const chosen = providers.filter((p) => providerSelected(selected, p)
+    && (!elements.quotaNodeFilter.value || p.nodeId === elements.quotaNodeFilter.value));
+  const metricKey = (p, m) => JSON.stringify([p.nodeId, p.providerId, m.key, m.kind, m.unit || ""]);
+  const groups = chosen.map((p) => ({
+    label: `${p.nodeName || p.nodeId} / ${providerName(p, state.settings)}`,
+    options: p.metrics.map((m) => ({ value: metricKey(p, m), label: `${m.label || m.key} · ${m.unit || m.kind}` })),
+  }));
+  const allMetrics = chosen.every((p) => selected == null || selected.find((item) => providerIdentity(item) === providerIdentity(p))?.metrics == null);
+  renderPicker(elements.quotaMetricFilter, {
+    ...pickerLabels, title: t("quota.metric"), groups,
+    selected: allMetrics ? null : chosen.flatMap((p) => p.metrics.filter((m) => metricSelected(selected, p, m)).map((m) => metricKey(p, m))),
+    onChange: (keys) => {
+      const selectedKeys = new Set(keys || []);
+      const entries = selected == null ? providers.map((p) => ({ nodeId: p.nodeId, providerId: p.providerId, metrics: null })) : structuredClone(selected);
+      for (const entry of entries) {
+        const p = chosen.find((p) => providerIdentity(p) === providerIdentity(entry));
+        if (p) entry.metrics = keys === null ? null : p.metrics.filter((m) => selectedKeys.has(metricKey(p, m))).map(({ key, kind, unit }) => ({ key, kind, unit: unit || null }));
+      }
+      state.quotaSelection = entries;
+      renderQuota();
+    },
+  });
 }
 
 function appendQuotaDetail(container, labelText, valueText) {
@@ -649,7 +699,7 @@ function appendQuotaDetail(container, labelText, valueText) {
 
 function renderQuotaCards(providers) {
   elements.quotaCards.replaceChildren();
-  const selectedMetric = elements.quotaMetricFilter.value;
+
   for (const provider of providers) {
     const card = document.createElement("article");
     card.className = `quota-card quota-status-${provider.status || "unknown"}`;
@@ -657,7 +707,7 @@ function renderQuotaCards(providers) {
     heading.className = "quota-card-heading";
     const title = document.createElement("div");
     const providerName = document.createElement("strong");
-    providerName.textContent = provider.providerName || provider.providerId;
+    providerName.textContent = quotaDisplayName(provider);
     const nodeName = document.createElement("small");
     nodeName.textContent = `${provider.nodeName || provider.nodeId} · ${provider.providerId}`;
     title.append(providerName, nodeName);
@@ -668,7 +718,7 @@ function renderQuotaCards(providers) {
     card.append(heading);
 
     const metrics = (provider.current || []).filter(
-      (metric) => !selectedMetric || quotaMetricIdentity(metric) === selectedMetric,
+      (metric) => metricSelected(state.quotaSelection, provider, metric),
     );
     const details = document.createElement("div");
     details.className = "quota-details";
@@ -679,7 +729,7 @@ function renderQuotaCards(providers) {
           appendQuotaDetail(
             details,
             t("quota.reset"),
-            formatters.dateTime.format(metric.resetsAt * 1000),
+            formatters.quotaDateTime.format(metric.resetsAt * 1000),
           );
         }
       }
@@ -691,12 +741,12 @@ function renderQuotaCards(providers) {
       t("quota.lastSuccess"),
       provider.lastSuccessAt == null
         ? "—"
-        : formatters.dateTime.format(provider.lastSuccessAt * 1000),
+        : formatters.quotaDateTime.format(provider.lastSuccessAt * 1000),
     );
     appendQuotaDetail(
       details,
       t("quota.lastCheck"),
-      formatters.dateTime.format(provider.checkedAt * 1000),
+      formatters.quotaDateTime.format(provider.checkedAt * 1000),
     );
     card.append(details);
     elements.quotaCards.append(card);
@@ -704,9 +754,9 @@ function renderQuotaCards(providers) {
 }
 
 function quotaSeries(providers) {
-  const selectedMetric = elements.quotaMetricFilter.value;
+
   return providers.flatMap((provider) => (provider.series || [])
-    .filter((series) => !selectedMetric || quotaMetricIdentity(series) === selectedMetric)
+    .filter((series) => metricSelected(state.quotaSelection, provider, series))
     .map((series) => ({ ...series, provider }))
     .filter((series) => series.points?.length));
 }
@@ -756,8 +806,10 @@ function renderQuotaChart(providers) {
         item.unit,
         item.axis,
       ]),
-      name: `${item.provider.nodeName || item.provider.nodeId} / ${item.provider.providerName || item.provider.providerId} / ${item.label || item.key} · ${axisLabel}`,
+      name: `${item.provider.nodeName || item.provider.nodeId} / ${quotaDisplayName(item.provider)} / ${item.label || item.key} · ${axisLabel}`,
       axis: item.axis,
+      unit: item.unit,
+      metricId: JSON.stringify([item.provider.nodeId, item.provider.providerId, item.key, item.kind, item.unit || ""]),
       color: colors[item.seriesIndex % colors.length],
       value: item.value,
       segments: splitQuotaPoints(
@@ -767,10 +819,12 @@ function renderQuotaChart(providers) {
       ),
     };
   });
+  state.quotaPlots = plots;
   updateChart("quota", elements.quotaChart, buildQuotaOption({
     plots,
     range,
     amountRange: quotaAmountRange(amountValues),
+    chartWidth: elements.quotaChart.clientWidth,
     palette,
     formatAxis: (timestampMs) => formatTrendAxis(timestampMs / 1_000, spanSeconds),
     formatAmount: (value) => formatters.compactNumber.format(value),
@@ -783,6 +837,8 @@ function renderQuotaChart(providers) {
 }
 
 function renderQuota() {
+  quotaSnapshots.cancel();
+  chartInstances.quota?.dispatchAction({ type: "hideTip" });
   updateQuotaFilters();
   const providers = quotaProviders();
   elements.quotaEmpty.hidden = providers.length > 0;
@@ -847,6 +903,8 @@ function renderDaily() {
     };
   });
   const palette = chartPalette();
+  const dailyRange = [localDateKey(first), localDateKey(last)];
+  elements.dailyHeatmap.style.height = `${dailyCalendarLayout(dailyRange, elements.dailyHeatmap.clientWidth).height}px`;
   updateChart("daily", elements.dailyHeatmap, buildDailyOption({
     points: chartPoints,
     range: [localDateKey(first), localDateKey(last)],
@@ -927,36 +985,82 @@ async function loadEvents({ append = false, signal = undefined } = {}) {
   }
 }
 
+async function resource(name, fetcher, commit, parent) {
+  state.resources[name]?.abort();
+  const controller = new AbortController();
+  state.resources[name] = controller;
+  const abort = () => controller.abort();
+  if (parent?.aborted) abort();
+  parent?.addEventListener("abort", abort, { once: true });
+  try {
+    const result = await fetcher(controller.signal);
+    if (controller.signal.aborted || state.resources[name] !== controller) return;
+    commit(result);
+    state.resourceErrors.delete(name);
+  } catch (error) {
+    if (error.name !== "AbortError" && !controller.signal.aborted) {
+      state.resourceErrors.set(name, error);
+      showError(error);
+    }
+    throw error;
+  } finally {
+    parent?.removeEventListener("abort", abort);
+    if (state.resources[name] === controller) delete state.resources[name];
+  }
+}
+
+function refreshOverview(parent) {
+  const params = baseParams(true);
+  params.set("bucket", state.trendBucket);
+  return resource("overview", (signal) => fetchJson(`/v3/dashboard/overview?${params}`, signal), renderOverview, parent);
+}
+
+function refreshQuota(parent) {
+  const params = baseParams(false);
+  params.set("bucket", state.quotaGranularity);
+  return resource("quota", async (signal) => {
+    const response = await fetchJson(`/v3/dashboard/quota?${params}`, signal);
+    if (state.quotaSelection === undefined) await state.settingsPromise;
+    return response;
+  }, (response) => {
+    state.quota = response;
+    quotaSnapshots.invalidate();
+    renderQuota();
+  }, parent);
+}
+
 async function refreshAll({ reloadFilters = false } = {}) {
-  if (state.requestController) state.requestController.abort();
+  state.requestController?.abort();
   const controller = new AbortController();
   state.requestController = controller;
+  // Invalidate independently started requests when the shared range changes.
+  for (const pending of Object.values(state.resources)) pending.abort();
   elements.refreshButton.disabled = true;
   setConnection("", "status.refreshing");
   try {
     if (reloadFilters) await refreshFilters(controller.signal);
-    const params = baseParams(true);
-    params.set("bucket", state.trendBucket);
-    const daily = dailyParams(true);
-    const quotaParams = baseParams(false);
-    quotaParams.set("bucket", "auto");
-    const [overview, dailyResponse, quotaResponse] = await Promise.all([
-      fetchJson(`/v3/dashboard/overview?${params}`, controller.signal),
-      fetchJson(`/v3/dashboard/daily?${daily}`, controller.signal),
-      fetchJson(`/v3/dashboard/quota?${quotaParams}`, controller.signal),
-      loadEvents({ append: false, signal: controller.signal }),
+    if (controller.signal.aborted) return;
+    state.settingsPromise = resource("settings", (signal) => fetchJson("/v3/dashboard/settings", signal), (settings) => {
+      const changed = JSON.stringify(state.settings) !== JSON.stringify(settings);
+      state.settings = settings;
+      if (state.quotaSelection === undefined) state.quotaSelection = structuredClone(settings.quotaDefaults.providers);
+      if (changed && state.quota) renderQuota();
+    }, controller.signal);
+    await Promise.allSettled([
+      state.settingsPromise,
+      refreshOverview(controller.signal),
+      resource("daily", (signal) => fetchJson(`/v3/dashboard/daily?${dailyParams(true)}`, signal), (daily) => {
+        state.daily = daily; renderDaily();
+      }, controller.signal),
+      refreshQuota(controller.signal),
+      resource("events", (signal) => loadEvents({ append: false, signal }), () => {}, controller.signal),
     ]);
-    renderOverview(overview);
-    state.daily = dailyResponse;
-    renderDaily();
-    state.quota = quotaResponse;
-    renderQuota();
+    if (controller.signal.aborted) return;
+    if (state.resourceErrors.size) throw state.resourceErrors.values().next().value;
     clearError();
     setConnection("online", "status.online");
     state.updatedAt = Date.now();
-    elements.updatedAt.textContent = t("status.updatedAt", {
-      time: formatters.dateTime.format(state.updatedAt),
-    });
+    elements.updatedAt.textContent = t("status.updatedAt", { time: formatters.dateTime.format(state.updatedAt) });
   } catch (error) {
     if (error.name !== "AbortError") showError(error);
   } finally {
@@ -985,7 +1089,7 @@ function positionDialog(dialog, trigger) {
 
 function positionOpenPickers() {
   positionDialog(elements.rangePickerDialog, elements.rangePickerTrigger);
-  positionDialog(elements.bucketPickerDialog, elements.trendBucketTrigger);
+  positionDialog(elements.bucketPickerDialog, bucketTrigger());
 }
 
 function openDialog(dialog, trigger) {
@@ -1109,41 +1213,36 @@ function setRangePreset(preset) {
   refreshAll({ reloadFilters: true });
 }
 
+function bucketTrigger() { return state.bucketTarget === "quota" ? $("quotaBucketTrigger") : elements.trendBucketTrigger; }
 function updateBucketPicker() {
-  elements.trendBucketLabel.textContent = state.trendBucket === "auto"
-    ? t("trend.bucketAuto")
-    : bucketDisplayLabel(state.trendBucket);
+  elements.trendBucketLabel.textContent = state.trendBucket === "auto" ? t("trend.bucketAuto") : bucketDisplayLabel(state.trendBucket);
+  $("quotaGranularityLabel").textContent = state.quotaGranularity === "auto" ? t("trend.bucketAuto") : bucketDisplayLabel(state.quotaGranularity);
+  const bucket = state.bucketTarget === "quota" ? state.quotaGranularity : state.trendBucket;
   for (const button of elements.bucketPresetOptions.querySelectorAll("[data-bucket]")) {
-    const active = button.dataset.bucket === state.trendBucket;
+    const active = button.dataset.bucket === bucket;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   }
-  const custom = splitBucketValue(state.trendBucket);
-  if (custom) {
-    elements.customBucketAmount.value = String(custom.amount);
-    elements.customBucketUnit.value = custom.unit;
-  }
+  const custom = splitBucketValue(bucket);
+  if (custom) { elements.customBucketAmount.value = String(custom.amount); elements.customBucketUnit.value = custom.unit; }
 }
-
-function openBucketPicker() {
+function openBucketPicker(target = "trend") {
   if (dialogIsOpen(elements.bucketPickerDialog)) {
+    const same = state.bucketTarget === target;
     closeBucketPicker();
-    return;
+    if (same) return;
   }
+  state.bucketTarget = target;
   elements.customBucketError.hidden = true;
   updateBucketPicker();
-  openDialog(elements.bucketPickerDialog, elements.trendBucketTrigger);
+  openDialog(elements.bucketPickerDialog, bucketTrigger());
 }
-
-function closeBucketPicker() {
-  closeDialog(elements.bucketPickerDialog, elements.trendBucketTrigger);
-}
-
+function closeBucketPicker() { closeDialog(elements.bucketPickerDialog, bucketTrigger()); }
 function setTrendBucket(bucket) {
-  state.trendBucket = bucket;
-  updateBucketPicker();
-  closeBucketPicker();
-  refreshAll();
+  const quota = state.bucketTarget === "quota";
+  if (quota) state.quotaGranularity = bucket; else state.trendBucket = bucket;
+  updateBucketPicker(); closeBucketPicker();
+  (quota ? refreshQuota() : refreshOverview()).catch((error) => { if (error.name !== "AbortError") showError(error); });
 }
 
 function updateFilterPlaceholders() {
@@ -1274,7 +1373,8 @@ for (const field of elements.rangePickerForm.querySelectorAll("[data-range-field
     state.activeRangeField = field.dataset.rangeField;
   });
 }
-elements.trendBucketTrigger.addEventListener("click", openBucketPicker);
+elements.trendBucketTrigger.addEventListener("click", () => openBucketPicker("trend"));
+$("quotaBucketTrigger").addEventListener("click", () => openBucketPicker("quota"));
 elements.bucketPresetOptions.addEventListener("click", (event) => {
   const button = event.target.closest("[data-bucket]");
   if (button) setTrendBucket(button.dataset.bucket);
@@ -1287,7 +1387,7 @@ elements.bucketPickerDialog.addEventListener("cancel", (event) => {
 document.addEventListener("pointerdown", (event) => {
   const pickers = [
     [elements.rangePickerDialog, elements.rangePickerTrigger, closeRangePicker],
-    [elements.bucketPickerDialog, elements.trendBucketTrigger, closeBucketPicker],
+    [elements.bucketPickerDialog, bucketTrigger(), closeBucketPicker],
   ];
   for (const [dialog, trigger, close] of pickers) {
     if (!dialogIsOpen(dialog) || dialog.contains(event.target) || trigger.contains(event.target)) continue;
@@ -1318,7 +1418,12 @@ for (const select of [elements.nodeFilter, elements.appFilter, elements.provider
 
 elements.trendMetric.addEventListener("change", renderTrend);
 elements.dailyMetric.addEventListener("change", renderDaily);
-for (const select of [elements.quotaNodeFilter, elements.quotaProviderFilter, elements.quotaMetricFilter]) {
+$("restoreQuotaDefaults").addEventListener("click", () => {
+  state.quotaSelection = structuredClone(state.settings?.quotaDefaults.providers ?? null);
+  elements.quotaNodeFilter.value = "";
+  renderQuota();
+});
+for (const select of [elements.quotaNodeFilter]) {
   select.addEventListener("change", renderQuota);
 }
 elements.breakdownTabs.addEventListener("click", (event) => {

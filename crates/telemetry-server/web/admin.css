@@ -53,3 +53,16 @@ td code, #tokenValue { overflow-wrap: anywhere; color: var(--accent); font-famil
   input, select { width: 100%; min-width: 0; }
   .count-list { columns: 1; }
 }
+
+.settings-providers { display: grid; gap: 12px; margin: 16px 0; }
+.settings-provider { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(180px, 1fr) minmax(180px, 1fr); gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; }
+.settings-provider input { min-width: 0; width: 100%; }
+.check-label { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+.check-label input[type=checkbox], .quota-picker-menu input[type=checkbox] { min-width: 16px; width: 16px; height: 16px; padding: 0; }
+.quota-picker-trigger { width: 100%; padding: 11px 12px; border: 1px solid var(--border); border-radius: 10px; background: #0e1628; color: inherit; font: inherit; cursor: pointer; }
+.quota-picker-menu { position: fixed; inset: auto; margin: 0; width: min(360px, calc(100vw - 24px)); max-height: min(420px, calc(100vh - 24px)); overflow: auto; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); color: #edf2ff; }
+.quota-picker-menu fieldset { border: 0; min-width: 0; padding: 8px 0; }
+.quota-picker-menu label { display: flex; align-items: center; gap: 8px; padding: 8px 0; overflow-wrap: anywhere; }
+.quota-picker-actions { display: flex; gap: 8px; }
+.quota-picker-actions button { border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; background: transparent; color: inherit; cursor: pointer; }
+@media (max-width: 700px) { .settings-provider { grid-template-columns: 1fr; } }

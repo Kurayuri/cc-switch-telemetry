@@ -2,6 +2,7 @@ mod admin;
 mod dashboard;
 pub mod nodes;
 mod quota;
+mod settings;
 mod sync_v2;
 mod usage_cache;
 
@@ -35,6 +36,7 @@ const WRITE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ServerState {
     pub db: Arc<Mutex<Connection>>,
     pub db_path: PathBuf,
+    pub(crate) settings: Arc<Mutex<Option<settings::Settings>>>,
     pub admin_password: Option<String>,
     pub admin_sessions: Arc<Mutex<HashMap<String, Instant>>>,
     write_tx: mpsc::Sender<WriteTask>,
@@ -67,6 +69,7 @@ impl ServerState {
         Self {
             db,
             db_path,
+            settings: Arc::new(Mutex::new(None)),
             admin_password,
             admin_sessions: Arc::new(Mutex::new(HashMap::new())),
             write_tx,
@@ -923,6 +926,7 @@ pub async fn serve(
         db_path_for_queries,
         admin_password,
     );
+    settings::read(&state)?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|error| anyhow::anyhow!("bind telemetry-server listener {listen}: {error}"))?;

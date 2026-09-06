@@ -135,7 +135,7 @@ test("dashboard exposes calendar-aligned presets, anchored pickers, and a GitHub
   assert.match(css, /\.brand-mark\s*\{[^}]*aspect-ratio:\s*1/s);
   assert.match(css, /\.brand-mark\s*\{[^}]*width:\s*var\(--brand-mark-size/s);
   assert.match(css, /\.picker-trigger > span\s*\{[^}]*margin:\s*0/s);
-  assert.match(css, /\.daily-heatmap\s*\{[^}]*width:\s*100%[^}]*max-width:\s*840px[^}]*min-width:\s*0/s);
+  assert.match(css, /\.daily-heatmap\s*\{[^}]*width:\s*100%[^}]*max-width:\s*1120px[^}]*min-width:\s*0/s);
   assert.match(css, /\.daily-controls\s*\{[^}]*align-items:\s*center/s);
   assert.match(css, /\.daily-scroll\s*\{[^}]*overflow:\s*hidden/s);
   assert.match(css, /\.daily-legend\s*\{[^}]*margin:\s*0/s);
@@ -164,12 +164,30 @@ test("estimated cost exposes a dynamic top-three model list", () => {
 
 test("translations interpolate variables and formatters follow locale", () => {
   assert.equal(translate("en-US", "kpi.successCount", { count: 3 }), "3 successful");
-  assert.equal(createFormatters("en-US").moneyNumber.format(1.2), "$1.2000");
-  assert.equal(createFormatters("en-US").moneyNumber.format(1.234), "$1.2340");
-  assert.match(createFormatters("zh-CN").integerNumber.format(1234), /1[,.]234/);
-  const compactChinese = createFormatters("zh-CN").compactNumber.format(1_200_000);
+  const english = createFormatters("en-US");
+  const chinese = createFormatters("zh-CN");
+  assert.equal(english.moneyNumber.format(1.2), "$1.2000");
+  assert.equal(english.moneyNumber.format(1.234), "$1.2340");
+  assert.match(chinese.integerNumber.format(1234), /1[,.]234/);
+  assert.equal(english.dateTime.resolvedOptions().second, "2-digit");
+  assert.equal(english.quotaDateTime.resolvedOptions().minute, "2-digit");
+  assert.equal(english.quotaDateTime.resolvedOptions().second, undefined);
+  const compactChinese = chinese.compactNumber.format(1_200_000);
   assert.match(compactChinese, /M/);
   assert.doesNotMatch(compactChinese, /万/);
+});
+
+test("every quota timestamp display uses minute precision", () => {
+  const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  assert.equal(app.match(/formatters\.quotaDateTime\.format/g)?.length, 4);
+  assert.doesNotMatch(
+    app,
+    /function quotaTooltip[\s\S]*?formatters\.dateTime\.format[\s\S]*?function dailyTooltip/,
+  );
+  assert.doesNotMatch(
+    app,
+    /function renderQuotaCards[\s\S]*?formatters\.dateTime\.format[\s\S]*?function quotaSeries/,
+  );
 });
 
 test("provider displays prefer mapped names while filters retain provider IDs", () => {

@@ -473,6 +473,7 @@ pub struct QuotaSeries {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaPoint {
+    pub segment_id: i64,
     pub sampled_at: i64,
     pub utilization_percent: Option<f64>,
     pub used: Option<f64>,
@@ -578,8 +579,9 @@ fn public_alias(value: String, fallback: &str) -> String {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MetricRow {
+    segment_id: i64,
     node_id: String,
     provider_id: String,
     key: String,
@@ -596,6 +598,7 @@ struct MetricRow {
 
 fn metric_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetricRow> {
     Ok(MetricRow {
+        segment_id: row.get(12)?,
         node_id: row.get(0)?,
         provider_id: row.get(1)?,
         key: row.get(2)?,
@@ -618,15 +621,6 @@ fn query_metric_rows(
 ) -> rusqlite::Result<Vec<MetricRow>> {
     let mut filters = vec!["o.app_type='codex'".to_owned()];
     let mut values = Vec::<Value>::new();
-    let partition = if current_only {
-        "o.node_id,o.provider_id,m.metric_key,m.metric_kind,COALESCE(m.unit,'')".to_owned()
-    } else {
-        values.push(Value::Integer(query.from));
-        values.push(Value::Integer(query.bucket_seconds));
-        "o.node_id,o.provider_id,m.metric_key,m.metric_kind,COALESCE(m.unit,''),\
-         ((o.sampled_at - ?1) / ?2)"
-            .to_owned()
-    };
     if !current_only {
         filters.push(format!("o.sampled_at >= ?{}", values.len() + 1));
         values.push(Value::Integer(query.from));
@@ -641,30 +635,147 @@ fn query_metric_rows(
         filters.push(format!("o.provider_id = ?{}", values.len() + 1));
         values.push(Value::Text(provider_id.clone()));
     }
-    let sql = format!(
-        "WITH ranked AS (
-             SELECT o.node_id,o.provider_id,m.metric_key,m.metric_label,m.metric_kind,m.unit,
-                    o.sampled_at,m.utilization_percent,m.used,m.remaining,m.total,m.resets_at,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY {partition}
-                        ORDER BY o.sampled_at DESC,o.observation_id DESC
-                    ) AS position
-             FROM quota_observations o
-             JOIN quota_metrics m
-               ON m.node_id=o.node_id AND m.observation_id=o.observation_id
-             WHERE {}
-         )
-         SELECT node_id,provider_id,metric_key,metric_label,metric_kind,unit,sampled_at,
-                utilization_percent,used,remaining,total,resets_at
-         FROM ranked WHERE position=1
-         ORDER BY node_id,provider_id,metric_key,sampled_at",
+    let identity = "node_id,provider_id,metric_key,metric_kind,COALESCE(unit,'')";
+    let raw = format!(
+        "SELECT o.node_id,o.provider_id,m.metric_key,m.metric_label,m.metric_kind,m.unit,
+                o.sampled_at,m.utilization_percent,m.used,m.remaining,m.total,m.resets_at,
+                o.observation_id,
+                CASE WHEN m.utilization_percent IS NOT NULL OR
+                    (m.total>0 AND (m.used IS NOT NULL OR m.remaining IS NOT NULL))
+                    THEN 0 ELSE 1 END AS value_axis
+         FROM quota_observations o JOIN quota_metrics m
+           ON m.node_id=o.node_id AND m.observation_id=o.observation_id
+         WHERE {}",
         filters.join(" AND ")
     );
+    let columns = "node_id,provider_id,metric_key,metric_label,metric_kind,unit,sampled_at,
+                   utilization_percent,used,remaining,total,resets_at";
+    let sql = if current_only {
+        format!(
+            "WITH raw AS ({raw}), ranked AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY {identity}
+                ORDER BY sampled_at DESC,observation_id DESC) AS position FROM raw
+        ) SELECT {columns},0 AS segment_id FROM ranked WHERE position=1
+          ORDER BY node_id,provider_id,metric_key,sampled_at"
+        )
+    } else {
+        format!(
+            "WITH raw AS ({raw}) SELECT {columns},0 AS segment_id FROM raw
+            ORDER BY {identity},sampled_at,observation_id"
+        )
+    };
     let mut statement = connection.prepare(&sql)?;
-    let rows = statement
-        .query_map(params_from_iter(values), metric_row)?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
+    let rows = statement.query_map(params_from_iter(values), metric_row)?;
+    if current_only {
+        return rows.collect();
+    }
+    retain_history(rows, query.from, query.bucket_seconds)
+}
+
+fn same_metric(a: &MetricRow, b: &MetricRow) -> bool {
+    a.node_id == b.node_id
+        && a.provider_id == b.provider_id
+        && a.key == b.key
+        && a.kind == b.kind
+        && a.unit.as_deref().unwrap_or("") == b.unit.as_deref().unwrap_or("")
+}
+fn percentage_axis(row: &MetricRow) -> bool {
+    row.utilization_percent.is_some()
+        || (row.total.is_some_and(|total| total > 0.0)
+            && (row.used.is_some() || row.remaining.is_some()))
+}
+// Ordered input needs only the pending bucket tail, not several SQL window sorts.
+fn retain_history(
+    rows: impl Iterator<Item = rusqlite::Result<MetricRow>>,
+    from: i64,
+    bucket_seconds: i64,
+) -> rusqlite::Result<Vec<MetricRow>> {
+    let mut retained = Vec::new();
+    let mut pending: Option<(MetricRow, i64, bool)> = None;
+    for result in rows {
+        let mut row = result?;
+        let bucket = (row.sampled_at - from) / bucket_seconds;
+        let mut head = true;
+        if let Some((previous, previous_bucket, previous_is_head)) = pending.take() {
+            let same = same_metric(&previous, &row);
+            let split = !same
+                || row.sampled_at - previous.sampled_at > 600
+                || percentage_axis(&previous) != percentage_axis(&row);
+            row.segment_id = if !same {
+                1
+            } else {
+                previous.segment_id + i64::from(split)
+            };
+            if (split || bucket != previous_bucket) && !previous_is_head {
+                retained.push(previous);
+            }
+            head = split;
+        } else {
+            row.segment_id = 1;
+        }
+        if head {
+            retained.push(row.clone());
+        }
+        pending = Some((row, bucket, head));
+    }
+    if let Some((tail, _, false)) = pending {
+        retained.push(tail);
+    }
+    Ok(retained)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuotaAtQuery {
+    pub at: i64,
+}
+
+fn query_at(path: &std::path::Path, at: i64) -> anyhow::Result<serde_json::Value> {
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let mut statement = connection.prepare("WITH ranked AS (
+        SELECT o.node_id,o.provider_id,m.metric_key,m.metric_label,m.metric_kind,m.unit,
+               o.sampled_at,m.utilization_percent,m.used,m.remaining,m.total,m.resets_at,
+               ROW_NUMBER() OVER (PARTITION BY o.node_id,o.provider_id,m.metric_key,m.metric_kind,COALESCE(m.unit,'')
+                 ORDER BY o.sampled_at DESC,o.observation_id DESC) AS position
+        FROM quota_observations o JOIN quota_metrics m
+          ON m.node_id=o.node_id AND m.observation_id=o.observation_id
+        WHERE o.app_type='codex' AND o.sampled_at>=?1 AND o.sampled_at<=?2
+    ) SELECT node_id,provider_id,metric_key,metric_label,metric_kind,unit,sampled_at,
+             utilization_percent,used,remaining,total,resets_at,0 FROM ranked WHERE position=1")?;
+    let metrics = statement.query_map(params![at.saturating_sub(600), at], metric_row)?
+        .map(|result| result.map(|row| serde_json::json!({
+            "nodeId": row.node_id, "providerId": row.provider_id,
+            "key": row.key, "label": public_alias(row.label, "Metric"), "kind": row.kind,
+            "unit": row.unit, "sampledAt": row.sampled_at, "utilizationPercent": row.utilization_percent,
+            "used": row.used, "remaining": row.remaining, "total": row.total, "resetsAt": row.resets_at
+        }))).collect::<Result<Vec<_>, _>>()?;
+    Ok(serde_json::json!({"at": at, "metrics": metrics}))
+}
+
+pub async fn at(State(state): State<ServerState>, Query(query): Query<QuotaAtQuery>) -> Response {
+    if query.at < 0 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "at must be nonnegative",
+        );
+    }
+    match tokio::task::spawn_blocking(move || query_at(&state.db_path, query.at)).await {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(err)) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "query_failed",
+            &err.to_string(),
+        ),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "query_failed",
+            &err.to_string(),
+        ),
+    }
 }
 
 fn query_dashboard(
@@ -753,6 +864,7 @@ fn query_dashboard(
             points: Vec::new(),
         });
         target.points.push(QuotaPoint {
+            segment_id: row.segment_id,
             sampled_at: row.sampled_at,
             utilization_percent: row.utilization_percent,
             used: row.used,
@@ -958,6 +1070,78 @@ mod tests {
         let points = &response.providers[0].series[0].points;
         assert_eq!(points.len(), 2);
         assert_eq!(points[1].utilization_percent, Some(30.0));
+    }
+
+    #[test]
+    fn raw_continuity_preserves_600_second_boundary_inside_large_buckets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let mut connection = crate::init_db(&path).unwrap();
+        let (node, _) = nodes::create(&connection, "node").unwrap();
+        for (index, timestamp) in [100, 699, 1299, 1900].into_iter().enumerate() {
+            store_batch(
+                &mut connection,
+                &node.uuid,
+                &batch(&Uuid::new_v4().to_string(), timestamp, index as f64),
+            )
+            .unwrap();
+        }
+        let response = query_dashboard(
+            &path,
+            ResolvedQuotaQuery {
+                from: 0,
+                to: 4000,
+                bucket_seconds: 3600,
+                bucket_label: "1h".into(),
+                node_id: None,
+                provider_id: None,
+            },
+        )
+        .unwrap();
+        let points = &response.providers[0].series[0].points;
+        assert_eq!(
+            points.iter().map(|p| p.sampled_at).collect::<Vec<_>>(),
+            [100, 1299, 1900]
+        );
+        assert_eq!(points[0].segment_id, points[1].segment_id);
+        assert_ne!(points[1].segment_id, points[2].segment_id);
+    }
+
+    #[test]
+    fn dense_raw_samples_remain_connected_across_coarse_buckets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let mut connection = crate::init_db(&path).unwrap();
+        let (node, _) = nodes::create(&connection, "node").unwrap();
+        for timestamp in (100..=2500).step_by(60) {
+            store_batch(
+                &mut connection,
+                &node.uuid,
+                &batch(&Uuid::new_v4().to_string(), timestamp, 10.0),
+            )
+            .unwrap();
+        }
+        let response = query_dashboard(
+            &path,
+            ResolvedQuotaQuery {
+                from: 0,
+                to: 4000,
+                bucket_seconds: 900,
+                bucket_label: "15m".into(),
+                node_id: None,
+                provider_id: None,
+            },
+        )
+        .unwrap();
+        let points = &response.providers[0].series[0].points;
+        assert!(points
+            .windows(2)
+            .any(|p| p[1].sampled_at - p[0].sampled_at > 600));
+        assert!(points
+            .iter()
+            .all(|point| point.segment_id == points[0].segment_id));
+        assert_eq!(points.first().unwrap().sampled_at, 100);
+        assert_eq!(points.last().unwrap().sampled_at, 2500);
     }
 
     #[tokio::test]
