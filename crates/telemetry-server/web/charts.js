@@ -83,6 +83,44 @@ export function tooltipMarkup(title, lines) {
   return `<strong>${escapeHtml(title)}</strong>${rows}`;
 }
 
+export function accumulateTrendPoints(points) {
+  let totalRequests = 0;
+  let successfulRequests = 0;
+  let freshInputTokens = 0;
+  let cacheCreationTokens = 0;
+  let cacheReadTokens = 0;
+  let outputTokens = 0;
+  let totalCostUsd = 0;
+  let latencyTotalMs = 0;
+  return (points || []).map((point) => {
+    const requests = Number(point.totalRequests) || 0;
+    totalRequests += requests;
+    successfulRequests += Number(point.successfulRequests) || 0;
+    freshInputTokens += Number(point.freshInputTokens) || 0;
+    cacheCreationTokens += Number(point.cacheCreationTokens) || 0;
+    cacheReadTokens += Number(point.cacheReadTokens) || 0;
+    outputTokens += Number(point.outputTokens) || 0;
+    totalCostUsd += Number(point.totalCostUsd) || 0;
+    latencyTotalMs += (Number(point.avgLatencyMs) || 0) * requests;
+    const inputTokens = freshInputTokens + cacheCreationTokens + cacheReadTokens;
+    return {
+      ...point,
+      totalRequests,
+      successfulRequests,
+      successRate: totalRequests > 0 ? successfulRequests / totalRequests * 100 : 0,
+      freshInputTokens,
+      cacheCreationTokens,
+      cacheReadTokens,
+      inputTokens,
+      outputTokens,
+      realTotalTokens: inputTokens + outputTokens,
+      totalCostUsd,
+      avgLatencyMs: totalRequests > 0 ? latencyTotalMs / totalRequests : 0,
+      cacheHitRate: inputTokens > 0 ? cacheReadTokens / inputTokens : 0,
+    };
+  });
+}
+
 export function buildTrendOption({
   points,
   metric,
@@ -261,10 +299,10 @@ export function buildQuotaOption({
     0,
   );
   const axes = axisLine(palette);
-  const series = plots.map((plot) => {
+  const series = plots.flatMap((plot) => {
     const data = joinQuotaSegments(plot.segments, plot.value)
       .map((datum) => ({ ...datum, axis: plot.axis }));
-    return {
+    const actual = {
       id: plot.id,
       name: plot.name,
       type: "line",
@@ -288,6 +326,22 @@ export function buildQuotaOption({
       emphasis: { focus: "series", scale: 1.5 },
       universalTransition: true,
     };
+    if (!plot.prediction) return [actual];
+    return [actual, {
+      id: `${plot.id}:predict`,
+      name: plot.name,
+      type: "line",
+      yAxisIndex: actual.yAxisIndex,
+      data: [plot.prediction.start, plot.prediction.end].map((point) => ({
+        value: [point.at * 1000, point.value], axis: plot.axis, prediction: true,
+      })),
+      encode: { x: 0, y: 1 },
+      showSymbol: false,
+      clip: true,
+      lineStyle: { color: plot.color, width: 1.5, type: "dotted", opacity: 0.8 },
+      itemStyle: { color: plot.color },
+      emphasis: { focus: "series" },
+    }];
   });
   return {
     ...animationOptions(reducedMotion, pointCount),
@@ -310,6 +364,7 @@ export function buildQuotaOption({
     },
     legend: {
       show: plots.length > 1,
+      data: plots.map((plot) => plot.name),
       type: "scroll",
       left: 4,
       right: 4,
@@ -331,6 +386,7 @@ export function buildQuotaOption({
       splitNumber: 3,
       axisLabel: { ...axes.axisLabel, formatter: (value) => formatAxis(Number(value)) },
       ...calendarAxisOptions(range, chartWidth, formatAxis, axes.axisLabel),
+      axisPointer: { snap: false },
     },
     yAxis: [
       {

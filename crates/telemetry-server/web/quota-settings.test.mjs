@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { providerIdentity, metricIdentity, providerName, providerSelected, metricSelected, mergeProviders } from "./quota-settings.js";
+import {
+  providerIdentity,
+  metricIdentity,
+  providerName,
+  providerSelected,
+  metricSelected,
+  mergeProviders,
+  quotaTierPeriodLabel,
+  quotaTierPeriodSeconds,
+} from "./quota-settings.js";
 import { dailyTooltipPosition, usageTooltipMarkup } from "./charts.js";
 const a = { nodeId: "a", providerId: "same", providerName: "Original" };
 const b = { nodeId: "b", providerId: "same", providerName: "Original" };
@@ -31,11 +40,21 @@ test("catalog refresh preserves configured unavailable providers and metrics", (
   assert.equal(catalog[0].metrics[1].unavailable, true);
   assert.equal(settings.quotaDefaults.providers[0].metrics.length, 1);
 });
-test("usage tooltips lead with exact total and preserve escaped date and detail", () => {
-  const markup = usageTooltipMarkup({ realTotalTokens: 1234567 }, "<date>", [["Input", "123"]], (value) => new Intl.NumberFormat("en-US").format(value));
-  assert.ok(markup.startsWith("<strong>Totel: 1,234,567</strong>"));
+test("reset tier periods expose the labels used by dashboard defaults", () => {
+  assert.equal(quotaTierPeriodSeconds({ key: "subscription:five-hour", label: "5h" }), 5 * 60 * 60);
+  assert.equal(quotaTierPeriodSeconds({ key: "weekly" }), 7 * 24 * 60 * 60);
+  assert.equal(quotaTierPeriodLabel(7 * 24 * 60 * 60), "7d");
+});
+test("usage tooltips use compact totals and preserve escaped date and detail", () => {
+  const compactNumber = new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    compactDisplay: "short",
+    maximumFractionDigits: 2,
+  });
+  const markup = usageTooltipMarkup({ realTotalTokens: 132_420_000 }, "<date>", [["Input", "123"]], (value) => compactNumber.format(value));
+  assert.match(markup, /<span>Total: 132\.42M<\/span>/);
   assert.ok(markup.indexOf("&lt;date&gt;") < markup.indexOf("Input"));
-  assert.ok(usageTooltipMarkup({}, "date", [], String).startsWith("<strong>Totel: 0</strong>"));
+  assert.match(usageTooltipMarkup({}, "date", [], String), /<span>Total: 0<\/span>/);
 });
 test("daily tooltip fits viewport even when calendar is near its bottom edge", () => {
   const origin = { left: 20, top: 650 };

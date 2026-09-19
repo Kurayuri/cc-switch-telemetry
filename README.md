@@ -262,6 +262,8 @@ Loopback-only Dashboard endpoints:
 - `GET /v3/dashboard/filters`
 - `GET /v3/dashboard/events`
 - `GET /v3/dashboard/quota?from=&to=&bucket=&node_id=&provider_id=`
+- `GET /v3/dashboard/time-bounds` — earliest stored usage detail, daily rollup, or quota observation.
+- `GET /v3/dashboard/quota/resets` — chronological reset runs including zero usage, grouped by node/provider/tier; independent of chart range and buckets.
 
 Authenticated Admin log lifecycle endpoints:
 
@@ -364,11 +366,24 @@ uninstall script above is invoked explicitly.
 
 The Server creates `settings.json` alongside `TELEMETRY_DB` (normally
 `data/settings.json`) on startup. The Admin page provides default provider
-selection, independent metric selection per provider, and display aliases scoped
-to `(nodeId, providerId)`. Saving applies immediately to the Server's settings;
-Dashboard visitors load defaults when opening the page or using **Restore
-defaults**. Automatic refresh preserves their current selection and updates
-aliases.
+selection, independent metric selection per provider, display aliases scoped to
+`(nodeId, providerId)`, Dashboard default range settings, and per-model billing
+display multipliers. Saving applies immediately to the Server's
+settings; Dashboard visitors load the configured range, custom-input time
+format, and model multipliers when opening the page. Automatic refresh
+preserves their current range and updates aliases. **Restore defaults**
+continues to restore the saved Quota provider and metric selection.
+
+The default range can be a fixed preset or **Last reset**. Last reset stores a
+node, provider, and reset-tier metric identity; if it is unavailable when the
+page opens, the Dashboard uses the first available reset tier. Custom ranges
+are not persisted as defaults. The Usage Trend cumulative checkbox is a
+browser-session option and starts unchecked. The time format setting affects
+only the two custom range time inputs: `HH:mm` in 24-hour mode or
+`hh:mm AM/PM` in 12-hour mode. Each model multiplier defaults to `1` when it
+is not configured, accepts `0` to `1000`, and changes only the Dashboard's
+read-only cost presentation (summary, trend, daily view, breakdowns, and
+events); it does not rewrite SQLite data.
 
 `GET /admin/api/settings` returns `{ settings, providers }`, including the known
 metric catalog. `PUT /admin/api/settings` accepts and returns the settings object;
@@ -378,6 +393,15 @@ same display settings under the Dashboard's loopback access policy.
 ```json
 {
   "version": 1,
+  "dashboardDefaults": {
+    "rangePreset": "24h",
+    "timeFormat": "24h",
+    "modelBillingMultipliers": [
+      { "model": "gpt-5", "multiplier": 1.25 },
+      { "model": "claude-sonnet", "multiplier": 0.8 }
+    ],
+    "lastReset": null
+  },
   "quotaDefaults": {
     "providers": [
       {
@@ -404,3 +428,29 @@ Quota history segments raw observations before downsampling: intervals of up to
 axes start a new segment. Each bucket retains its last real value and every
 segment retains its endpoints. Usage and daily tooltips display `Totel` using
 `realTotalTokens` (input including cache tokens, plus output).
+
+### Past Resets
+
+In **Custom time range → Past Resets**, choose a quota provider, reset tier, and
+recorded cycle. Reset detection uses timestamps, without requiring usage to
+return to zero. Consecutive observations within 60 seconds of a fixed reset
+anchor form a run; three distinct sample timestamps spanning more than 60 seconds
+confirm a new reset. Old
+reset values returning later do not reopen old cycles. A new cycle's inferred
+start (`resetsAt - tier period`) closes the previous cycle early when needed.
+Only after detecting boundaries are cycles without positive usage excluded.
+Periods use the same tier-name/history inference as Last reset; missing cycles
+are not synthesized. Historical sampling may cover only part of a cycle.
+
+Applying a cycle changes only the dashboard time range and preserves usage and
+quota filters. Refreshing a current cycle updates its end if a new early reset
+is confirmed, without switching the selected cycle. Cancel leaves the applied
+range unchanged. This selection is page-local and is not an Admin default.
+
+**All time** starts at the earliest stored usage detail, nonempty daily rollup,
+or quota observation across all nodes/providers and ends now. Existing filters
+remain selected. The `all_time=true` Dashboard query flag resolves the start on
+the server and allows histories longer than 720 days while retaining the trend
+point-count limit. Other custom ranges keep their existing limit. All time is
+also available as an Admin default. Empty databases show an empty recent window
+rather than a range starting in 1970.

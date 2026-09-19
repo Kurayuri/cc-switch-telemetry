@@ -2,7 +2,7 @@ mod admin;
 mod dashboard;
 pub mod nodes;
 mod quota;
-mod settings;
+pub(crate) mod settings;
 mod sync_v2;
 mod usage_cache;
 

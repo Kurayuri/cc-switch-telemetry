@@ -3,7 +3,7 @@ export const DAY_SECONDS = 24 * 60 * 60;
 export const MAX_RANGE_DAYS = 720;
 export const MAX_RANGE_SECONDS = MAX_RANGE_DAYS * DAY_SECONDS;
 
-export const RANGE_PRESETS = ["today", "1h", "24h", "7d", "14d", "30d", "1y"];
+export const RANGE_PRESETS = ["today", "1h", "24h", "7d", "14d", "30d", "1y", "last-reset", "all"];
 
 export const BUCKET_PRESETS = [
   "1s",
@@ -67,6 +67,29 @@ export function resolvePresetRange(preset, nowMs = Date.now(), customRange = nul
   }
 }
 
+export function resolveAllTimeRange(firstRecordedAt, nowMs = Date.now()) {
+  const to = Math.floor(nowMs / 1000);
+  const from = Number.isSafeInteger(firstRecordedAt) && firstRecordedAt >= 0
+    ? Math.min(firstRecordedAt, to - 1) : to - 1;
+  return { from, to };
+}
+
+export function resolveResetRange(resetsAt, periodSeconds, nowMs = Date.now()) {
+  const reset = Number(resetsAt);
+  const period = Number(periodSeconds);
+  const now = Math.floor(Number(nowMs) / 1000);
+  if (!Number.isSafeInteger(reset) || reset <= 0
+    || !Number.isSafeInteger(period) || period <= 0 || period > MAX_RANGE_SECONDS
+    || !Number.isSafeInteger(now) || now <= 0 || reset <= now) {
+    return null;
+  }
+  const from = reset - period;
+  if (!Number.isSafeInteger(from) || from < 0 || from >= now || now - from > MAX_RANGE_SECONDS) {
+    return null;
+  }
+  return { from, to: now };
+}
+
 function pad(value) {
   return String(value).padStart(2, "0");
 }
@@ -76,15 +99,42 @@ export function dateInputValue(timestamp) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-export function timeInputValue(timestamp) {
+export function timeInputValue(timestamp, timeFormat = "24h") {
   const date = new Date(Number(timestamp) * 1000);
+  if (timeFormat === "12h") {
+    const hour = date.getHours();
+    return `${pad(hour % 12 || 12)}:${pad(date.getMinutes())} ${hour >= 12 ? "PM" : "AM"}`;
+  }
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-export function parseDateTimeParts(dateValue, timeValue) {
+function parseTimeParts(timeValue, timeFormat) {
+  const value = String(timeValue || "").trim();
+  if (timeFormat === "12h") {
+    const match = value.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    if (!match) return null;
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+    if (hour < 1 || hour > 12 || minute > 59) return null;
+    const meridiem = match[3].toUpperCase();
+    return [hour % 12 + (meridiem === "PM" ? 12 : 0), minute];
+  }
+  const match = value.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return hour <= 23 && minute <= 59 ? [hour, minute] : null;
+}
+
+export function timeInputPlaceholder(timeFormat = "24h") {
+  return timeFormat === "12h" ? "hh:mm AM/PM" : "HH:mm";
+}
+
+export function parseDateTimeParts(dateValue, timeValue, timeFormat = "24h") {
   const [year, month, day] = String(dateValue).split("-").map(Number);
-  const [hour, minute] = String(timeValue || "00:00").split(":").map(Number);
-  if (![year, month, day, hour, minute].every(Number.isFinite)) return NaN;
+  const time = parseTimeParts(timeValue, timeFormat);
+  if (!time || ![year, month, day].every(Number.isFinite)) return NaN;
+  const [hour, minute] = time;
   const date = new Date(year, month - 1, day, hour, minute, 0, 0);
   if (
     date.getFullYear() !== year ||

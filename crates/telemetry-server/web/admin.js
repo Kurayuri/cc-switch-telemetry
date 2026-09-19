@@ -1,4 +1,12 @@
-import { providerIdentity, metricIdentity, providerSelected, mergeProviders, renderPicker } from "./quota-settings.js";
+import {
+  providerIdentity,
+  metricIdentity,
+  providerSelected,
+  mergeProviders,
+  renderPicker,
+  quotaTierPeriodLabel,
+  quotaTierPeriodSeconds,
+} from "./quota-settings.js";
 const elements = {
   loginPanel: document.getElementById("loginPanel"),
   loginForm: document.getElementById("loginForm"),
@@ -294,6 +302,147 @@ let settingsCatalog = [];
 const settingsForm = document.getElementById("settingsForm");
 const settingsMessage = document.getElementById("settingsMessage");
 const allProvidersInput = document.getElementById("settingsAllProviders");
+const settingsRangePreset = document.getElementById("settingsRangePreset");
+const settingsTimeFormat = document.getElementById("settingsTimeFormat");
+const settingsModelBillingMultipliers = document.getElementById("settingsModelBillingMultipliers");
+const addModelBillingMultiplier = document.getElementById("addModelBillingMultiplier");
+const settingsResetProvider = document.getElementById("settingsResetProvider");
+const settingsResetTier = document.getElementById("settingsResetTier");
+const settingsResetMessage = document.getElementById("settingsResetMessage");
+
+function ensureDashboardDefaults() {
+  settingsDraft.dashboardDefaults = {
+    rangePreset: "24h",
+    timeFormat: "24h",
+    modelBillingMultipliers: [],
+    lastReset: null,
+    ...(settingsDraft.dashboardDefaults || {}),
+  };
+  if (!Array.isArray(settingsDraft.dashboardDefaults.modelBillingMultipliers)) {
+    settingsDraft.dashboardDefaults.modelBillingMultipliers = [];
+  }
+}
+
+function resetDefaultGroups() {
+  return settingsCatalog.map((provider) => ({
+    provider,
+    tiers: (provider.metrics || [])
+      .filter((metric) => metric.kind === "utilizationPercent")
+      .map((metric) => ({
+        metric,
+        periodSeconds: quotaTierPeriodSeconds(metric),
+      }))
+      .filter(({ periodSeconds }) => Number.isSafeInteger(periodSeconds) && periodSeconds > 0)
+      .map((tier) => ({
+        ...tier,
+        id: metricIdentity(tier.metric),
+        periodLabel: quotaTierPeriodLabel(tier.periodSeconds),
+      })),
+  })).filter(({ tiers }) => tiers.length > 0);
+}
+
+function setDashboardResetSelection(group, tier) {
+  settingsDraft.dashboardDefaults.lastReset = group && tier
+    ? {
+      nodeId: group.provider.nodeId,
+      providerId: group.provider.providerId,
+      metricKey: tier.metric.key,
+      metricKind: tier.metric.kind,
+      unit: tier.metric.unit || null,
+    }
+    : null;
+}
+
+function renderModelBillingMultipliers() {
+  const entries = settingsDraft.dashboardDefaults.modelBillingMultipliers;
+  if (!entries.length) entries.push({ model: "", multiplier: 1 });
+  settingsModelBillingMultipliers.replaceChildren();
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "settings-model-billing-row";
+    const modelLabel = document.createElement("label");
+    modelLabel.className = "settings-model-billing-model";
+    modelLabel.textContent = "模型名称";
+    const modelInput = document.createElement("input");
+    modelInput.className = "settings-model-billing-model-input";
+    modelInput.type = "text";
+    modelInput.maxLength = 256;
+    modelInput.placeholder = "例如 gpt-5";
+    modelInput.value = entry.model || "";
+    modelInput.addEventListener("input", () => {
+      entry.model = modelInput.value;
+      settingsChanged();
+    });
+    modelLabel.append(modelInput);
+
+    const multiplierLabel = document.createElement("label");
+    multiplierLabel.className = "settings-model-billing-multiplier";
+    multiplierLabel.textContent = "倍率";
+    const multiplierInput = document.createElement("input");
+    multiplierInput.className = "settings-model-billing-multiplier-input";
+    multiplierInput.type = "number";
+    multiplierInput.min = "0";
+    multiplierInput.max = "1000";
+    multiplierInput.step = "0.01";
+    multiplierInput.inputMode = "decimal";
+    multiplierInput.value = String(entry.multiplier ?? 1);
+    multiplierInput.addEventListener("input", () => {
+      const value = Number(multiplierInput.value);
+      if (Number.isFinite(value) && value >= 0 && value <= 1000) entry.multiplier = value;
+      settingsChanged();
+    });
+    multiplierLabel.append(multiplierInput);
+
+    const remove = document.createElement("button");
+    remove.className = "button danger";
+    remove.type = "button";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      const index = entries.indexOf(entry);
+      if (index >= 0) entries.splice(index, 1);
+      renderModelBillingMultipliers();
+      settingsChanged();
+    });
+    row.append(modelLabel, multiplierLabel, remove);
+    settingsModelBillingMultipliers.append(row);
+  }
+}
+
+function renderDashboardDefaults() {
+  ensureDashboardDefaults();
+  settingsRangePreset.value = settingsDraft.dashboardDefaults.rangePreset;
+  settingsTimeFormat.value = settingsDraft.dashboardDefaults.timeFormat;
+  renderModelBillingMultipliers();
+  const groups = resetDefaultGroups();
+  const configured = settingsDraft.dashboardDefaults.lastReset;
+  const configuredProvider = configured ? providerIdentity(configured) : null;
+  const group = groups.find(({ provider }) => providerIdentity(provider) === configuredProvider) || groups[0];
+  const configuredMetric = configured ? metricIdentity(configured) : null;
+  const tier = group?.tiers.find(({ metric }) => metricIdentity(metric) === configuredMetric) || group?.tiers[0];
+  settingsResetProvider.replaceChildren();
+  for (const item of groups) {
+    const option = new Option(
+      `${item.provider.nodeName || item.provider.nodeId} / ${item.provider.providerName || item.provider.providerId}`,
+      providerIdentity(item.provider),
+    );
+    settingsResetProvider.append(option);
+  }
+  settingsResetProvider.disabled = groups.length === 0;
+  if (group) settingsResetProvider.value = providerIdentity(group.provider);
+  settingsResetTier.replaceChildren();
+  for (const item of group?.tiers || []) {
+    settingsResetTier.append(new Option(
+      `${item.periodLabel} · ${item.metric.label || item.metric.key}`,
+      item.id,
+    ));
+  }
+  settingsResetTier.disabled = !tier;
+  if (tier) settingsResetTier.value = tier.id;
+  settingsResetMessage.textContent = tier
+    ? "选择“最近一次重置”后使用这里保存的 Provider 和 tier。"
+    : "当前没有可识别周期的 Quota reset tier；保存后 Dashboard 会在有可用数据时回退到首个 tier。";
+}
+
 function customProviders() {
   if (settingsDraft.quotaDefaults.providers === null) {
     settingsDraft.quotaDefaults.providers = settingsCatalog.map(({ nodeId, providerId }) => ({ nodeId, providerId, metrics: null }));
@@ -302,6 +451,7 @@ function customProviders() {
 }
 function settingsChanged() { showMessage(settingsMessage, "有未保存的修改。"); }
 function renderSettings() {
+  renderDashboardDefaults();
   allProvidersInput.checked = settingsDraft.quotaDefaults.providers === null;
   const container = document.getElementById("settingsProviders");
   container.replaceChildren();
@@ -334,10 +484,15 @@ function renderSettings() {
       settingsChanged();
     });
     aliasLabel.append(alias);
+    const metricsLabel = document.createElement("label");
+    metricsLabel.className = "settings-provider-metrics";
+    metricsLabel.textContent = "默认指标";
     const picker = document.createElement("div");
+    picker.className = "quota-picker";
     const metrics = settingsDraft.quotaDefaults.providers?.find((p) => providerIdentity(p) === identity)?.metrics ?? null;
     renderPicker(picker, {
       title: "默认指标", allLabel: "全部", noneLabel: "清空",
+      showTitleInTrigger: false,
       selected: metrics === null ? null : metrics.map(metricIdentity),
       groups: [{ options: provider.metrics.map((m) => ({ value: metricIdentity(m), label: `${m.label || m.key} · ${m.unit || m.kind}` })) }],
       onChange: (keys) => {
@@ -350,7 +505,8 @@ function renderSettings() {
         settingsChanged();
       },
     });
-    row.append(label, aliasLabel, picker); container.append(row);
+    metricsLabel.append(picker);
+    row.append(label, aliasLabel, metricsLabel); container.append(row);
   }
 }
 async function loadSettings() {
@@ -359,6 +515,7 @@ async function loadSettings() {
     const result = await api("/admin/api/settings");
     settingsDraft = result.settings;
     settingsCatalog = mergeProviders(result.providers, settingsDraft);
+    ensureDashboardDefaults();
     renderSettings();
     document.getElementById("saveSettings").disabled = false;
   } catch (error) {
@@ -372,15 +529,67 @@ allProvidersInput.addEventListener("change", () => {
   else customProviders();
   settingsChanged(); renderSettings();
 });
+settingsRangePreset.addEventListener("change", () => {
+  if (!settingsDraft) return;
+  settingsDraft.dashboardDefaults.rangePreset = settingsRangePreset.value;
+  settingsChanged();
+});
+settingsTimeFormat.addEventListener("change", () => {
+  if (!settingsDraft) return;
+  settingsDraft.dashboardDefaults.timeFormat = settingsTimeFormat.value;
+  settingsChanged();
+});
+addModelBillingMultiplier.addEventListener("click", () => {
+  if (!settingsDraft) return;
+  settingsDraft.dashboardDefaults.modelBillingMultipliers.push({ model: "", multiplier: 1 });
+  renderModelBillingMultipliers();
+  settingsChanged();
+});
+settingsResetProvider.addEventListener("change", () => {
+  if (!settingsDraft) return;
+  const group = resetDefaultGroups().find(({ provider }) => providerIdentity(provider) === settingsResetProvider.value);
+  setDashboardResetSelection(group, group?.tiers[0]);
+  renderDashboardDefaults();
+  settingsChanged();
+});
+settingsResetTier.addEventListener("change", () => {
+  if (!settingsDraft) return;
+  const group = resetDefaultGroups().find(({ provider }) => providerIdentity(provider) === settingsResetProvider.value);
+  const tier = group?.tiers.find((item) => item.id === settingsResetTier.value);
+  setDashboardResetSelection(group, tier);
+  settingsChanged();
+});
 settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!settingsDraft) return;
   const button = document.getElementById("saveSettings");
   button.disabled = true;
+  const entries = [...settingsModelBillingMultipliers.querySelectorAll(".settings-model-billing-row")];
+  const seen = new Set();
+  const multipliers = [];
+  for (const row of entries) {
+    const model = row.querySelector('input[type="text"]').value.trim();
+    const multiplier = Number(row.querySelector('input[type="number"]').value);
+    if (!model && multiplier === 1) continue;
+    const hasControl = [...model].some((character) => /\p{C}/u.test(character));
+    if (!model || new TextEncoder().encode(model).length > 256 || hasControl || seen.has(model)) {
+      showMessage(settingsMessage, "模型名称必须非空、唯一且不超过 256 字节。");
+      button.disabled = false;
+      return;
+    }
+    if (!Number.isFinite(multiplier) || multiplier < 0 || multiplier > 1000) {
+      showMessage(settingsMessage, "模型计费倍率必须是 0 到 1000 之间的数字。");
+      button.disabled = false;
+      return;
+    }
+    seen.add(model);
+    multipliers.push({ model, multiplier });
+  }
+  settingsDraft.dashboardDefaults.modelBillingMultipliers = multipliers;
   try {
     settingsDraft = await api("/admin/api/settings", { method: "PUT", body: JSON.stringify(settingsDraft) });
     renderSettings();
-    showMessage(settingsMessage, "设置已保存。Dashboard 首次打开或恢复默认时应用。", "ok");
+    showMessage(settingsMessage, "设置已保存。Dashboard 下次打开时应用。", "ok");
   } catch (error) {
     if (error.status === 401) showLogin("登录已过期，请重新登录。");
     else showMessage(settingsMessage, error.message);

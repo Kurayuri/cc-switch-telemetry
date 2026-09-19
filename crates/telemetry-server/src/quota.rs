@@ -20,7 +20,9 @@ const MAX_PROVIDER_STATES: usize = 1_000;
 const MAX_OBSERVATIONS: usize = 2_000;
 const MAX_METRICS: usize = 10_000;
 const MAX_LABEL_BYTES: usize = 256;
-const TARGET_POINTS_PER_SERIES: i64 = 2_000;
+// Keep the automatic dashboard response small enough for a quick refresh while
+// leaving finer buckets available as explicit user selections.
+const TARGET_POINTS_PER_SERIES: i64 = 480;
 
 pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
     connection.execute_batch(
@@ -409,6 +411,7 @@ pub struct QuotaDashboardQuery {
     pub from: Option<i64>,
     pub to: Option<i64>,
     pub bucket: Option<String>,
+    pub include_history: Option<bool>,
     pub node_id: Option<String>,
     pub provider_id: Option<String>,
 }
@@ -480,6 +483,140 @@ pub struct QuotaPoint {
     pub remaining: Option<f64>,
     pub total: Option<f64>,
     pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetObservation {
+    resets_at: i64,
+    first_sampled_at: i64,
+    last_sampled_at: i64,
+    sample_count: u64,
+    first_usage_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetTier {
+    key: String,
+    label: String,
+    kind: String,
+    unit: Option<String>,
+    resets: Vec<ResetObservation>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetProvider {
+    node_id: String,
+    node_name: String,
+    provider_id: String,
+    provider_name: String,
+    tiers: Vec<ResetTier>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResetHistory {
+    providers: Vec<ResetProvider>,
+}
+
+fn query_resets(path: &std::path::Path) -> anyhow::Result<ResetHistory> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Preserve chronological transitions (including zero usage and old-value returns).
+    // Compact only consecutive samples within 60s of a fixed reset anchor.
+    let mut statement = connection.prepare(
+        "SELECT o.node_id,n.node_name,o.provider_id,COALESCE(s.provider_name,o.provider_id),
+                m.metric_key,m.metric_label,m.metric_kind,NULLIF(COALESCE(m.unit,''),''),
+                m.resets_at,o.sampled_at,
+                CASE WHEN m.utilization_percent IS NOT NULL THEN m.utilization_percent>0
+                     WHEN m.used IS NOT NULL THEN m.used>0
+                     ELSE COALESCE(m.total-m.remaining>0,0) END
+         FROM quota_observations o
+         JOIN quota_metrics m ON m.node_id=o.node_id AND m.observation_id=o.observation_id
+         JOIN nodes n ON n.uuid=o.node_id
+         LEFT JOIN quota_provider_states s ON s.node_id=o.node_id
+           AND s.provider_id=o.provider_id AND s.app_type=o.app_type
+         WHERE o.app_type='codex' AND o.sampled_at>=0 AND m.resets_at>o.sampled_at
+         ORDER BY o.node_id,o.provider_id,m.metric_key,m.metric_kind,COALESCE(m.unit,''),o.sampled_at,o.observation_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut providers: Vec<ResetProvider> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let node_id: String = row.get(0)?;
+        let provider_id: String = row.get(2)?;
+        if providers
+            .last()
+            .is_none_or(|p| p.node_id != node_id || p.provider_id != provider_id)
+        {
+            providers.push(ResetProvider {
+                node_id,
+                node_name: public_alias(row.get(1)?, "Node"),
+                provider_id,
+                provider_name: public_alias(row.get(3)?, "Provider"),
+                tiers: Vec::new(),
+            });
+        }
+        let tiers = &mut providers.last_mut().unwrap().tiers;
+        let key: String = row.get(4)?;
+        let kind: String = row.get(6)?;
+        let unit: Option<String> = row.get(7)?;
+        if tiers
+            .last()
+            .is_none_or(|t| t.key != key || t.kind != kind || t.unit != unit)
+        {
+            tiers.push(ResetTier {
+                key,
+                label: public_alias(row.get(5)?, "Metric"),
+                kind,
+                unit,
+                resets: Vec::new(),
+            });
+        }
+        let resets = &mut tiers.last_mut().unwrap().resets;
+        let resets_at: i64 = row.get(8)?;
+        let sampled_at: i64 = row.get(9)?;
+        let has_usage: bool = row.get(10)?;
+        if let Some(previous) = resets
+            .last_mut()
+            .filter(|previous| (previous.resets_at - resets_at).abs() <= 60)
+        {
+            // Duplicate timestamps are not independent confirmation samples.
+            if sampled_at > previous.last_sampled_at {
+                previous.sample_count += 1;
+            }
+            previous.last_sampled_at = sampled_at;
+            if has_usage && previous.first_usage_at.is_none() {
+                previous.first_usage_at = Some(sampled_at);
+            }
+        } else {
+            resets.push(ResetObservation {
+                resets_at,
+                first_sampled_at: sampled_at,
+                last_sampled_at: sampled_at,
+                sample_count: 1,
+                first_usage_at: has_usage.then_some(sampled_at),
+            });
+        }
+    }
+    Ok(ResetHistory { providers })
+}
+
+pub async fn resets(State(state): State<ServerState>) -> Response {
+    let path = state.db_path.clone();
+    match tokio::task::spawn_blocking(move || query_resets(&path)).await {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(err)) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "query_failed",
+            &err.to_string(),
+        ),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "query_failed",
+            &err.to_string(),
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -781,6 +918,7 @@ pub async fn at(State(state): State<ServerState>, Query(query): Query<QuotaAtQue
 fn query_dashboard(
     path: &std::path::Path,
     query: ResolvedQuotaQuery,
+    include_history: bool,
 ) -> anyhow::Result<QuotaDashboardResponse> {
     let connection = Connection::open_with_flags(
         path,
@@ -847,31 +985,33 @@ fn query_dashboard(
     }
 
     let mut series = BTreeMap::<(String, String, String, String, String), QuotaSeries>::new();
-    for row in query_metric_rows(&connection, &query, false)? {
-        let unit_key = row.unit.clone().unwrap_or_default();
-        let key = (
-            row.node_id.clone(),
-            row.provider_id.clone(),
-            row.key.clone(),
-            row.kind.clone(),
-            unit_key,
-        );
-        let target = series.entry(key).or_insert_with(|| QuotaSeries {
-            key: row.key,
-            label: public_alias(row.label, "Metric"),
-            kind: row.kind,
-            unit: row.unit,
-            points: Vec::new(),
-        });
-        target.points.push(QuotaPoint {
-            segment_id: row.segment_id,
-            sampled_at: row.sampled_at,
-            utilization_percent: row.utilization_percent,
-            used: row.used,
-            remaining: row.remaining,
-            total: row.total,
-            resets_at: row.resets_at,
-        });
+    if include_history {
+        for row in query_metric_rows(&connection, &query, false)? {
+            let unit_key = row.unit.clone().unwrap_or_default();
+            let key = (
+                row.node_id.clone(),
+                row.provider_id.clone(),
+                row.key.clone(),
+                row.kind.clone(),
+                unit_key,
+            );
+            let target = series.entry(key).or_insert_with(|| QuotaSeries {
+                key: row.key,
+                label: public_alias(row.label, "Metric"),
+                kind: row.kind,
+                unit: row.unit,
+                points: Vec::new(),
+            });
+            target.points.push(QuotaPoint {
+                segment_id: row.segment_id,
+                sampled_at: row.sampled_at,
+                utilization_percent: row.utilization_percent,
+                used: row.used,
+                remaining: row.remaining,
+                total: row.total,
+                resets_at: row.resets_at,
+            });
+        }
     }
     for ((node_id, provider_id, _, _, _), item) in series {
         if let Some(provider) = providers.get_mut(&(node_id, provider_id)) {
@@ -895,6 +1035,7 @@ pub async fn dashboard(
     State(state): State<ServerState>,
     Query(query): Query<QuotaDashboardQuery>,
 ) -> Response {
+    let include_history = query.include_history.unwrap_or(true);
     let query = match resolve_query(query) {
         Ok(query) => query,
         Err(message) => {
@@ -902,7 +1043,8 @@ pub async fn dashboard(
         }
     };
     let path = state.db_path.clone();
-    match tokio::task::spawn_blocking(move || query_dashboard(&path, query)).await {
+    match tokio::task::spawn_blocking(move || query_dashboard(&path, query, include_history)).await
+    {
         Ok(Ok(response)) => Json(response).into_response(),
         Ok(Err(error_value)) => error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -961,6 +1103,154 @@ mod tests {
                 sampled_at,
                 metrics: vec![metric(value)],
             }],
+        }
+    }
+
+    #[test]
+    fn reset_history_preserves_zero_usage_and_historical_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let mut connection = crate::init_db(&path).unwrap();
+        assert!(query_resets(&path).unwrap().providers.is_empty());
+        let (node_a, _) = nodes::create(&connection, "node-a").unwrap();
+        let (node_b, _) = nodes::create(&connection, "private@example.com").unwrap();
+        let mut cases = Vec::new();
+        for (key, percent, used, remaining, total) in [
+            ("percent", Some(1.0), None, None, None),
+            ("explicit-zero", Some(0.0), Some(5.0), None, None),
+            ("used", None, Some(2.0), None, None),
+            ("used-zero", None, Some(0.0), Some(1.0), Some(10.0)),
+            ("balance", None, None, Some(9.0), Some(10.0)),
+            ("empty", None, None, None, None),
+            ("balance-zero", None, None, Some(10.0), Some(10.0)),
+        ] {
+            let mut value = metric(0.0);
+            value.key = key.to_owned();
+            value.label = "private@example.com".to_owned();
+            value.utilization_percent = percent;
+            value.used = used;
+            value.remaining = remaining;
+            value.total = total;
+            cases.push(value);
+        }
+        // Two samples with identical reset timestamps become one compact record.
+        for time in [100, 200] {
+            let mut value = batch(&Uuid::new_v4().to_string(), time, 0.0);
+            value.observations[0].metrics = cases.clone();
+            store_batch(&mut connection, &node_a.uuid, &value).unwrap();
+        }
+        let mut other = batch(&Uuid::new_v4().to_string(), 300, 1.0);
+        other.provider_states[0].provider_name = "private@example.com".to_owned();
+        store_batch(&mut connection, &node_b.uuid, &other).unwrap();
+        // Latest observations no longer contain the old tiers.
+        store_batch(
+            &mut connection,
+            &node_a.uuid,
+            &batch(&Uuid::new_v4().to_string(), 400, 0.0),
+        )
+        .unwrap();
+        // A removed current state must not hide historical observations.
+        connection
+            .execute(
+                "DELETE FROM quota_provider_states WHERE node_id=?1",
+                [&node_a.uuid],
+            )
+            .unwrap();
+        let result = query_resets(&path).unwrap();
+        assert_eq!(result.providers.len(), 2);
+        let a = result
+            .providers
+            .iter()
+            .find(|p| p.node_id == node_a.uuid)
+            .unwrap();
+        assert_eq!(a.provider_id, "provider-a");
+        assert_eq!(
+            a.tiers.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(),
+            vec![
+                "balance",
+                "balance-zero",
+                "empty",
+                "explicit-zero",
+                "five-hour",
+                "percent",
+                "used",
+                "used-zero"
+            ]
+        );
+        for tier in &a.tiers {
+            assert_eq!(tier.resets.len(), 1);
+            assert_eq!(tier.resets[0].resets_at, 1_800_000_000);
+            if tier.key == "five-hour" {
+                assert_eq!(tier.resets[0].sample_count, 1);
+            } else {
+                assert_eq!(tier.resets[0].first_sampled_at, 100);
+                assert_eq!(tier.resets[0].last_sampled_at, 200);
+                assert_eq!(tier.resets[0].sample_count, 2);
+            }
+            let expected_usage = matches!(tier.key.as_str(), "balance" | "percent" | "used");
+            assert_eq!(tier.resets[0].first_usage_at, expected_usage.then_some(100));
+        }
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("private@example.com"));
+        assert!(!serialized.contains("\"utilizationPercent\":"));
+        assert!(!serialized.contains("contentHash"));
+    }
+
+    #[test]
+    fn reset_runs_preserve_order_anchor_jitter_and_duplicate_sample_times() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let mut connection = crate::init_db(&path).unwrap();
+        let (node, _) = nodes::create(&connection, "node").unwrap();
+        for (sample, delta) in [
+            (100, 0),
+            (100, 1),
+            (160, 60),
+            (220, 120),
+            (280, 121),
+            (340, 122),
+            (400, 0),
+        ] {
+            let mut value = batch(&Uuid::new_v4().to_string(), sample, 0.0);
+            value.observations[0].metrics[0].resets_at = Some(1_800_000_000 + delta);
+            store_batch(&mut connection, &node.uuid, &value).unwrap();
+        }
+        let history = query_resets(&path).unwrap();
+        let runs = &history.providers[0].tiers[0].resets;
+        assert_eq!(runs.len(), 3);
+        assert_eq!(
+            runs.iter().map(|r| r.sample_count).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+        assert_eq!(runs[1].resets_at, 1_800_000_120);
+        assert!(runs.iter().all(|r| r.first_usage_at.is_none()));
+    }
+
+    #[tokio::test]
+    async fn reset_history_and_module_use_dashboard_access_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let connection = crate::init_db(&path).unwrap();
+        let state = ServerState::new(connection, path, None);
+        for uri in ["/v3/dashboard/quota/resets", "/dashboard/past-resets.js"] {
+            for (address, expected) in [
+                ([127, 0, 0, 1], StatusCode::OK),
+                ([192, 0, 2, 1], StatusCode::FORBIDDEN),
+            ] {
+                let response = router(state.clone())
+                    .layer(MockConnectInfo(SocketAddr::from((address, 12345))))
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected);
+                if expected == StatusCode::OK && uri.ends_with("/resets") {
+                    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                        serde_json::json!({"providers": []})
+                    );
+                }
+            }
         }
     }
 
@@ -1061,15 +1351,32 @@ mod tests {
                 to: 200,
                 bucket_seconds: 60,
                 bucket_label: "1m".to_owned(),
-                node_id: Some(node_a.uuid),
+                node_id: Some(node_a.uuid.clone()),
                 provider_id: None,
             },
+            true,
         )
         .unwrap();
         assert_eq!(response.providers.len(), 1);
         let points = &response.providers[0].series[0].points;
         assert_eq!(points.len(), 2);
         assert_eq!(points[1].utilization_percent, Some(30.0));
+
+        let current_only = query_dashboard(
+            &path,
+            ResolvedQuotaQuery {
+                from: 60,
+                to: 200,
+                bucket_seconds: 60,
+                bucket_label: "1m".to_owned(),
+                node_id: Some(node_a.uuid),
+                provider_id: None,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(current_only.providers[0].current.len(), 1);
+        assert!(current_only.providers[0].series.is_empty());
     }
 
     #[test]
@@ -1096,6 +1403,7 @@ mod tests {
                 node_id: None,
                 provider_id: None,
             },
+            true,
         )
         .unwrap();
         let points = &response.providers[0].series[0].points;
@@ -1131,6 +1439,7 @@ mod tests {
                 node_id: None,
                 provider_id: None,
             },
+            true,
         )
         .unwrap();
         let points = &response.providers[0].series[0].points;

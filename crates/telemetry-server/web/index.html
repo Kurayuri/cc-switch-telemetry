@@ -104,6 +104,9 @@
             <button type="button" class="range-preset-button" data-range-preset="14d" data-i18n="filters.range14d">Last 14 days</button>
             <button type="button" class="range-preset-button" data-range-preset="30d" data-i18n="filters.range30d">Last 30 days</button>
             <button type="button" class="range-preset-button" data-range-preset="1y" data-i18n="filters.range1y">Last calendar year</button>
+            <button type="button" class="range-preset-button" data-range-preset="all" data-i18n="filters.rangeAll">All time</button>
+            <button type="button" class="range-preset-button" data-range-preset="last-reset" data-i18n="filters.rangeLastReset">Last reset</button>
+            <button type="button" class="range-preset-button" data-range-preset="past-resets" data-i18n="filters.rangePastResets">Past Resets</button>
             <button type="button" id="customRangePreset" class="range-preset-button active" data-range-preset="custom" data-i18n="filters.custom">Custom</button>
           </div>
           <div id="customRangeEditor" class="custom-range-editor">
@@ -112,11 +115,11 @@
               <div class="custom-range-fields">
                 <label class="range-field-card" data-range-field="start">
                   <span data-i18n="filters.start">Start</span>
-                  <div class="range-field-inputs"><input id="customFromDate" type="date" required><input id="customFromTime" type="time" step="60" required></div>
+                  <div class="range-field-inputs"><input id="customFromDate" type="date" required><input id="customFromTime" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" required></div>
                 </label>
                 <label class="range-field-card" data-range-field="end">
                   <span data-i18n="filters.end">End</span>
-                  <div class="range-field-inputs"><input id="customToDate" type="date" required><input id="customToTime" type="time" step="60" required></div>
+                  <div class="range-field-inputs"><input id="customToDate" type="date" required><input id="customToTime" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" required></div>
                 </label>
                 <p id="customRangeError" class="dialog-error" role="alert" hidden></p>
               </div>
@@ -130,10 +133,48 @@
                 <div id="calendarDays" class="calendar-days"></div>
               </div>
             </div>
-            <div class="dialog-actions">
-              <button id="cancelRange" class="button secondary" type="button" data-i18n="action.cancel">Cancel</button>
-              <button id="applyRange" class="button primary" type="submit" data-i18n="action.applyRange">Apply range</button>
+          </div>
+          <div id="lastResetEditor" class="last-reset-editor" hidden>
+            <p class="range-picker-hint muted" data-i18n="filters.lastResetHint">Choose a quota provider and reset tier. The range starts one tier period before the next reset and ends now.</p>
+            <div class="last-reset-fields">
+              <label>
+                <span data-i18n="filters.lastResetProvider">Quota Provider</span>
+                <select id="lastResetProvider"></select>
+              </label>
+              <label>
+                <span data-i18n="filters.lastResetTier">Reset tier</span>
+                <select id="lastResetTier"></select>
+              </label>
             </div>
+            <div class="last-reset-preview" aria-live="polite">
+              <div class="last-reset-preview-item">
+                <span data-i18n="filters.start">Start</span>
+                <strong id="lastResetFrom">—</strong>
+              </div>
+              <div class="last-reset-preview-item">
+                <span data-i18n="filters.end">End</span>
+                <strong id="lastResetTo">—</strong>
+              </div>
+            </div>
+            <p id="lastResetError" class="dialog-error" role="alert" hidden></p>
+          </div>
+          <div id="pastResetEditor" class="last-reset-editor" hidden>
+            <p class="range-picker-hint muted" data-i18n="filters.pastResetHint">Choose a recorded cycle with nonzero usage. A current cycle ends now.</p>
+            <div class="last-reset-fields">
+              <label><span data-i18n="filters.lastResetProvider">Quota Provider</span><select id="pastResetProvider"></select></label>
+              <label><span data-i18n="filters.lastResetTier">Reset tier</span><select id="pastResetTier"></select></label>
+              <label class="past-reset-cycle"><span data-i18n="filters.pastResetCycle">Cycle</span><select id="pastResetCycle"></select></label>
+            </div>
+            <div class="last-reset-preview" aria-live="polite">
+              <div class="last-reset-preview-item"><span data-i18n="filters.start">Start</span><strong id="pastResetFrom">—</strong></div>
+              <div class="last-reset-preview-item"><span data-i18n="filters.end">End</span><strong id="pastResetTo">—</strong></div>
+            </div>
+            <p id="pastResetStatus" class="range-picker-hint muted" role="status" hidden></p>
+            <button id="pastResetRetry" type="button" class="button secondary" data-i18n="filters.pastResetRetry" hidden>Retry</button>
+          </div>
+          <div class="dialog-actions">
+            <button id="cancelRange" class="button secondary" type="button" data-i18n="action.cancel">Cancel</button>
+            <button id="applyRange" class="button primary" type="submit" data-i18n="action.applyRange">Apply range</button>
           </div>
         </form>
       </dialog>
@@ -198,6 +239,7 @@
         <article class="kpi-card cost-card">
           <div class="kpi-heading"><span class="kpi-icon cost-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3.5v17M16 7.25c-.65-1.1-1.85-1.75-3.5-1.75-2.2 0-3.5 1.1-3.5 2.75 0 4.25 7 2.25 7 6.5 0 1.65-1.35 2.75-3.75 2.75-1.8 0-3.1-.7-3.75-1.9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span><span class="kpi-label" data-i18n="kpi.cost">Estimated cost</span></div>
           <strong id="kpiCost">—</strong>
+          <small id="kpiCostAdjustment" class="cost-adjustment" hidden></small>
           <div class="cost-top-label" data-i18n="kpi.topModels">Top models by cost</div>
           <div id="kpiCostTopModels" class="cost-top-models" aria-live="polite"></div>
         </article>
@@ -229,6 +271,10 @@
                 <option value="avgLatencyMs" data-i18n="kpi.latency">Average latency</option>
               </select>
             </label>
+            <label id="trendCumulativeToggle" class="trend-cumulative-toggle">
+              <input id="trendCumulative" type="checkbox">
+              <span data-i18n="trend.cumulative">Show cumulative data for range</span>
+            </label>
             <label class="bucket-picker">
               <span class="sr-only" data-i18n="trend.bucketAria">Time granularity</span>
               <button id="trendBucketTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
@@ -251,27 +297,29 @@
             <h2 id="quotaTitle" data-i18n="quota.title">Codex quota history</h2>
             <p class="muted quota-subtitle" data-i18n="quota.subtitle">Normalized subscription utilization and provider balances.</p>
           </div>
-          <div class="quota-controls">
-            <label>
-              <span data-i18n="quota.node">Node</span>
-              <select id="quotaNodeFilter"><option value="" data-i18n="quota.allNodes">All quota nodes</option></select>
-            </label>
-            <label>
-              <span data-i18n="quota.provider">Provider</span>
-              <div id="quotaProviderFilter" class="quota-picker"></div>
-            </label>
-            <label>
-              <span data-i18n="quota.metric">Metric</span>
-              <div id="quotaMetricFilter" class="quota-picker"></div>
-            </label>
-          </div>
         </div>
-        <div class="quota-chart-actions"><label data-i18n="quota.granularity">Quota granularity</label>
-          <button id="quotaBucketTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-controls="bucketPickerDialog" aria-expanded="false" data-i18n-aria-label="quota.granularity"><span id="quotaGranularityLabel">Auto</span></button>
+        <div class="quota-controls">
+          <label>
+            <span data-i18n="quota.node">Node</span>
+            <select id="quotaNodeFilter"><option value="" data-i18n="quota.allNodes">All quota nodes</option></select>
+          </label>
+          <label>
+            <span data-i18n="quota.provider">Provider</span>
+            <div id="quotaProviderFilter" class="quota-picker"></div>
+          </label>
+          <label>
+            <span data-i18n="quota.metric">Metric</span>
+            <div id="quotaMetricFilter" class="quota-picker"></div>
+          </label>
+          <label class="quota-granularity-control">
+            <span data-i18n="quota.granularity">Quota granularity</span>
+            <button id="quotaBucketTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-controls="bucketPickerDialog" aria-expanded="false" data-i18n-aria-label="quota.granularity"><span id="quotaGranularityLabel">Auto</span></button>
+          </label>
+          <button id="restoreQuotaDefaults" class="button secondary quota-restore-button" type="button" data-i18n="quota.restoreDefaults">Restore defaults</button>
         </div>
-        <button id="restoreQuotaDefaults" class="button secondary" type="button" data-i18n="quota.restoreDefaults">Restore defaults</button>
         <div id="quotaCards" class="quota-cards" aria-live="polite"></div>
         <div id="quotaEmpty" class="empty-state" hidden data-i18n="quota.empty">No quota providers or samples for this selection</div>
+        <p id="quotaPredictionStatus" class="coverage muted" role="status" hidden></p>
         <div id="quotaChart" class="trend-chart quota-chart echarts-chart" role="img" aria-label="Codex quota history chart" data-i18n-aria-label="quota.chartAria"></div>
         <p id="quotaBucket" class="coverage muted"></p>
       </section>

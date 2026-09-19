@@ -4,6 +4,7 @@ import {
   buildDailyOption,
   buildQuotaOption,
   buildTrendOption,
+  accumulateTrendPoints,
   dailyCalendarLayout,
   escapeHtml,
   joinQuotaSegments,
@@ -50,6 +51,54 @@ test("trend options use a bounded time axis and retain source data for tooltips"
   assert.equal(option.series[0].data[0].source, point);
   assert.equal(option.tooltip.formatter([{ data: option.series[0].data[0] }]), "tip:25");
   assert.equal(option.series[0].universalTransition, true);
+});
+
+test("cumulative trend points preserve buckets and aggregate totals", () => {
+  const cumulative = accumulateTrendPoints([
+    {
+      bucketStart: 10,
+      totalRequests: 2,
+      successfulRequests: 1,
+      freshInputTokens: 10,
+      cacheCreationTokens: 2,
+      cacheReadTokens: 8,
+      outputTokens: 5,
+      totalCostUsd: 0.25,
+      avgLatencyMs: 100,
+    },
+    {
+      bucketStart: 20,
+      totalRequests: 0,
+      successfulRequests: 0,
+      freshInputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      outputTokens: 0,
+      totalCostUsd: 0,
+      avgLatencyMs: 999,
+    },
+    {
+      bucketStart: 30,
+      totalRequests: 3,
+      successfulRequests: 3,
+      freshInputTokens: 20,
+      cacheCreationTokens: 3,
+      cacheReadTokens: 7,
+      outputTokens: 10,
+      totalCostUsd: 0.75,
+      avgLatencyMs: 200,
+    },
+  ]);
+  assert.deepEqual(cumulative.map((point) => point.bucketStart), [10, 20, 30]);
+  assert.equal(cumulative[0].realTotalTokens, 25);
+  assert.equal(cumulative[1].realTotalTokens, 25);
+  assert.equal(cumulative[2].realTotalTokens, 65);
+  assert.equal(cumulative[2].totalRequests, 5);
+  assert.equal(cumulative[2].successfulRequests, 4);
+  assert.equal(cumulative[2].successRate, 80);
+  assert.equal(cumulative[2].totalCostUsd, 1);
+  assert.equal(cumulative[2].avgLatencyMs, 160);
+  assert.equal(cumulative[2].cacheHitRate, 15 / 50);
 });
 
 test("quota segment conversion inserts nulls so missing samples never get connected", () => {
@@ -103,6 +152,35 @@ test("quota options preserve percentage and amount axes", () => {
   assert.equal(option.series[1].showSymbol, false);
   assert.equal(option.tooltip.trigger, "axis");
   assert.equal(option.series[1].lineStyle.type, "dashed");
+});
+
+test("quota predictions are dotted, share their actual legend and retain axis identity", () => {
+  const plots = ["percent", "amount"].map((axis) => ({
+    id: axis, name: axis, axis, color: "#0cc", segments: [], value: (point) => point.value,
+    prediction: { start: { at: 60, value: 20 }, end: { at: 120, value: 30 }, slope: 1 / 6 },
+  }));
+  const options = {
+    plots, range: { from: 0, to: 120 }, amountRange: { minimum: 0, maximum: 30 }, palette,
+    formatAxis: String, formatAmount: String, formatTooltip: () => "tooltip",
+    percentAxisName: "Usage", amountAxisName: "Balance", ariaDescription: "Quota chart",
+  };
+  const option = buildQuotaOption(options);
+  assert.equal(option.series.length, 4);
+  assert.deepEqual(option.legend.data, ["percent", "amount"]);
+  for (const [actual, prediction] of [[option.series[0], option.series[1]], [option.series[2], option.series[3]]]) {
+    assert.equal(prediction.name, actual.name);
+    assert.equal(prediction.id, `${actual.id}:predict`);
+    assert.equal(prediction.yAxisIndex, actual.yAxisIndex);
+    assert.equal(prediction.lineStyle.color, actual.lineStyle.color);
+    assert.equal(prediction.lineStyle.type, "dotted");
+    assert.equal(prediction.showSymbol, false);
+    assert.deepEqual(prediction.data.map((p) => p.value), [[60_000, 20], [120_000, 30]]);
+    assert.equal(prediction.data[0].prediction, true);
+  }
+  assert.equal(option.yAxis[0].max, 100);
+  assert.equal(option.xAxis.max, 120_000);
+  assert.equal(option.xAxis.axisPointer.snap, false);
+  assert.equal(buildQuotaOption({ ...options, plots: plots.map((p) => ({ ...p, prediction: null })) }).series.length, 2);
 });
 
 test("daily options use a calendar heatmap and quantized color dimension", () => {

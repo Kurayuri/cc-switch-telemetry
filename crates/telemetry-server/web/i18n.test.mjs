@@ -59,14 +59,29 @@ test("trend exposes metric and granularity controls with rich tooltip support", 
   const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const charts = readFileSync(new URL("./charts.js", import.meta.url), "utf8");
   assert.match(html, /id="trendMetric"/);
+  assert.match(html, /id="trendCumulative"/);
   assert.match(html, /id="trendBucketTrigger"/);
   assert.match(html, /data-bucket="auto"/);
   assert.match(html, /data-bucket="15m"/);
   assert.match(html, /id="customBucketAmount"/);
   assert.match(html, /id="trendChart"[^>]*class="[^"]*echarts-chart/);
   assert.match(app, /params\.set\("bucket", state\.trendBucket\)/);
+  assert.match(app, /accumulateTrendPoints/);
+  assert.match(app, /state\.timeFormat/);
   assert.match(app, /trend\.tooltipCacheCreation/);
+  assert.match(app, /usageTooltipMarkup\(point, titleText, lines, formatTokens\)/);
   assert.match(charts, /className: "echarts-tooltip"/);
+});
+
+test("quota controls share one responsive control row", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const quota = html.slice(html.indexOf('<section class="panel quota-panel"'), html.indexOf('<section id="dailyPanel"'));
+  assert.match(quota, /class="quota-controls"[\s\S]*id="quotaNodeFilter"[\s\S]*id="quotaProviderFilter"[\s\S]*id="quotaMetricFilter"[\s\S]*id="quotaBucketTrigger"[\s\S]*id="restoreQuotaDefaults"/);
+  assert.doesNotMatch(quota, /quota-chart-actions/);
+  assert.match(css, /\.quota-controls\s*\{[^}]*grid-template-columns: repeat\(5/);
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*\.quota-controls\s*\{[^}]*repeat\(3/);
+  assert.match(css, /\.quota-restore-button\s*\{/);
 });
 
 test("dashboard exposes compact KPI details, custom range dialog, and directional animations", () => {
@@ -112,6 +127,9 @@ test("dashboard exposes calendar-aligned presets, anchored pickers, and a GitHub
   const charts = readFileSync(new URL("./charts.js", import.meta.url), "utf8");
   assert.match(html, /data-range-preset="today"/);
   assert.match(html, /data-range-preset="14d"/);
+  assert.match(html, /data-range-preset="last-reset"/);
+  assert.match(html, /id="lastResetProvider"/);
+  assert.match(html, /id="lastResetTier"/);
   assert.match(html, /id="customFromDate"/);
   assert.match(html, /id="customFromTime"/);
   assert.match(html, /id="dailyPanel"/);
@@ -179,7 +197,8 @@ test("translations interpolate variables and formatters follow locale", () => {
 
 test("every quota timestamp display uses minute precision", () => {
   const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
-  assert.equal(app.match(/formatters\.quotaDateTime\.format/g)?.length, 4);
+  assert.equal(app.match(/formatters\.quotaDateTime\.format/g)?.length, 8);
+  assert.match(app, /formatters\.quotaDateTime\.format\(estimate\.at \* 1000\)/);
   assert.doesNotMatch(
     app,
     /function quotaTooltip[\s\S]*?formatters\.dateTime\.format[\s\S]*?function dailyTooltip/,

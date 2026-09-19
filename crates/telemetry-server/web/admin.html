@@ -29,15 +29,66 @@
     <section id="adminPanel" hidden>
       <div class="panel">
         <h2>Dashboard 设置</h2>
-        <p class="muted">设置所有访客首次打开页面时的 Quota 展示。别名按节点独立生效。</p>
+        <p class="muted">设置所有访客首次打开页面时的 Dashboard 范围和 Quota 展示。别名按节点独立生效。</p>
         <form id="settingsForm">
-          <label class="check-label"><input id="settingsAllProviders" type="checkbox">默认显示全部 Provider 和指标</label>
-          <div id="settingsProviders" class="settings-providers"></div>
+          <div class="settings-section settings-defaults">
+            <h3>时间范围默认选项</h3>
+            <div class="settings-defaults-grid">
+              <label>默认时间范围
+                <select id="settingsRangePreset">
+                  <option value="today">今天</option>
+                  <option value="1h">最近 1 小时</option>
+                  <option value="24h">最近 24 小时</option>
+                  <option value="7d">最近 7 天</option>
+                  <option value="14d">最近 14 天</option>
+                  <option value="30d">最近 30 天</option>
+                  <option value="1y">最近一年</option>
+                  <option value="all">全部时间 / All time</option>
+                  <option value="last-reset">最近一次重置</option>
+                </select>
+              </label>
+              <label>自定义时间输入格式
+                <select id="settingsTimeFormat">
+                  <option value="24h">24 小时制（HH:mm）</option>
+                  <option value="12h">12 小时制（hh:mm AM/PM）</option>
+                </select>
+              </label>
+            </div>
+            <div class="settings-defaults-grid settings-reset-defaults">
+              <label>最近一次重置 Provider
+                <select id="settingsResetProvider"></select>
+              </label>
+              <label>Reset tier
+                <select id="settingsResetTier"></select>
+              </label>
+            </div>
+            <p id="settingsResetMessage" class="muted settings-reset-message">选择“最近一次重置”后使用这里保存的 Provider 和 tier。</p>
+          </div>
+          <div class="settings-section settings-billing">
+            <div class="settings-billing-heading">
+              <div>
+                <h3>模型计费倍率</h3>
+                <p class="muted">按模型分别设置；未配置模型使用原始费用。只影响 Dashboard 展示，不会改写数据库。</p>
+              </div>
+              <button id="addModelBillingMultiplier" class="button secondary" type="button">添加模型倍率</button>
+            </div>
+            <div id="settingsModelBillingMultipliers" class="settings-model-billing"></div>
+          </div>
+          <div class="settings-section settings-provider-section">
+            <div class="settings-section-heading">
+              <div>
+                <h3>Quota Provider</h3>
+                <p class="muted">选择 Dashboard 默认展示的 Quota Provider、指标和显示别名。</p>
+              </div>
+            </div>
+            <label class="check-label"><input id="settingsAllProviders" type="checkbox">默认显示全部 Provider 和指标</label>
+            <div id="settingsProviders" class="settings-providers"></div>
+          </div>
           <button id="saveSettings" class="button" type="submit">保存设置</button>
           <p id="settingsMessage" class="message" role="status"></p>
         </form>
       </div>
-      <div class="panel">
+      <div class="panel nodes-panel">
         <div class="section-heading">
           <div>
             <h2>节点</h2>
@@ -49,23 +100,21 @@
           <button class="button" type="submit">创建节点并生成 Token</button>
         </form>
         <p id="actionMessage" class="message" role="status"></p>
-      </div>
-
-      <div id="tokenPanel" class="panel token-panel" hidden>
-        <div class="section-heading">
-          <h2>新 Token</h2>
-          <button id="closeTokenButton" class="button secondary" type="button">关闭</button>
+        <div id="tokenPanel" class="token-panel" hidden>
+          <div class="section-heading">
+            <h2>新 Token</h2>
+            <button id="closeTokenButton" class="button secondary" type="button">关闭</button>
+          </div>
+          <p class="warning">此 Token 只显示本次。关闭后只能重新生成，旧 Token 会立即失效。</p>
+          <div class="token-row"><code id="tokenValue"></code><button id="copyTokenButton" class="button secondary" type="button">复制</button></div>
         </div>
-        <p class="warning">此 Token 只显示本次。关闭后只能重新生成，旧 Token 会立即失效。</p>
-        <div class="token-row"><code id="tokenValue"></code><button id="copyTokenButton" class="button secondary" type="button">复制</button></div>
-      </div>
-
-      <div class="panel table-wrap">
-        <table>
-          <thead><tr><th>Node_Name</th><th>UUID</th><th>Token</th><th>更新时间</th><th>操作</th></tr></thead>
-          <tbody id="nodeRows"></tbody>
-        </table>
-        <p id="emptyMessage" class="muted" hidden>暂无节点。</p>
+        <div class="table-wrap nodes-table-wrap">
+          <table>
+            <thead><tr><th>Node_Name</th><th>UUID</th><th>Token</th><th>更新时间</th><th>操作</th></tr></thead>
+            <tbody id="nodeRows"></tbody>
+          </table>
+          <p id="emptyMessage" class="muted" hidden>暂无节点。</p>
+        </div>
       </div>
 
       <div class="panel danger-panel">

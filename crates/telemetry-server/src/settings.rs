@@ -19,7 +19,60 @@ pub struct Settings {
     pub version: u32,
     pub quota_defaults: QuotaDefaults,
     pub quota_provider_aliases: Vec<ProviderAlias>,
+    #[serde(default)]
+    pub dashboard_defaults: DashboardDefaults,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DashboardDefaults {
+    #[serde(default = "default_dashboard_range_preset")]
+    pub range_preset: String,
+    #[serde(default = "default_dashboard_time_format")]
+    pub time_format: String,
+    #[serde(default)]
+    pub model_billing_multipliers: Vec<ModelBillingMultiplier>,
+    #[serde(default)]
+    pub last_reset: Option<DashboardLastReset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelBillingMultiplier {
+    pub model: String,
+    pub multiplier: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DashboardLastReset {
+    pub node_id: String,
+    pub provider_id: String,
+    pub metric_key: String,
+    pub metric_kind: String,
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
+fn default_dashboard_range_preset() -> String {
+    "24h".into()
+}
+
+fn default_dashboard_time_format() -> String {
+    "24h".into()
+}
+
+impl Default for DashboardDefaults {
+    fn default() -> Self {
+        Self {
+            range_preset: default_dashboard_range_preset(),
+            time_format: default_dashboard_time_format(),
+            model_billing_multipliers: Vec::new(),
+            last_reset: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuotaDefaults {
@@ -52,6 +105,7 @@ impl Default for Settings {
             version: 1,
             quota_defaults: QuotaDefaults::default(),
             quota_provider_aliases: Vec::new(),
+            dashboard_defaults: DashboardDefaults::default(),
         }
     }
 }
@@ -60,6 +114,57 @@ fn valid_text(value: &str) -> bool {
 }
 fn normalize(mut settings: Settings) -> anyhow::Result<Settings> {
     anyhow::ensure!(settings.version == 1, "unsupported settings version");
+    anyhow::ensure!(
+        matches!(
+            settings.dashboard_defaults.range_preset.as_str(),
+            "today" | "1h" | "24h" | "7d" | "14d" | "30d" | "1y" | "last-reset" | "all"
+        ),
+        "invalid dashboard range preset"
+    );
+    anyhow::ensure!(
+        matches!(
+            settings.dashboard_defaults.time_format.as_str(),
+            "12h" | "24h"
+        ),
+        "invalid dashboard time format"
+    );
+    anyhow::ensure!(
+        settings.dashboard_defaults.model_billing_multipliers.len() <= 1000,
+        "too many model billing multipliers"
+    );
+    let mut models = BTreeSet::new();
+    for entry in &mut settings.dashboard_defaults.model_billing_multipliers {
+        entry.model = entry.model.trim().to_owned();
+        anyhow::ensure!(
+            valid_text(&entry.model)
+                && entry.multiplier.is_finite()
+                && (0.0..=1000.0).contains(&entry.multiplier),
+            "invalid model billing multiplier"
+        );
+        anyhow::ensure!(
+            models.insert(entry.model.clone()),
+            "duplicate model billing multiplier"
+        );
+    }
+    if let Some(last_reset) = &mut settings.dashboard_defaults.last_reset {
+        anyhow::ensure!(
+            valid_text(&last_reset.node_id)
+                && valid_text(&last_reset.provider_id)
+                && valid_text(&last_reset.metric_key)
+                && matches!(
+                    last_reset.metric_kind.as_str(),
+                    "balance" | "utilizationPercent"
+                )
+                && last_reset
+                    .unit
+                    .as_deref()
+                    .is_none_or(|unit| unit.is_empty() || valid_text(unit)),
+            "invalid dashboard reset metric"
+        );
+        if let Some(unit) = &mut last_reset.unit {
+            *unit = unit.trim().to_owned();
+        }
+    }
     if let Some(providers) = &settings.quota_defaults.providers {
         anyhow::ensure!(providers.len() <= 1000, "too many providers");
         let mut identities = BTreeSet::new();
@@ -292,6 +397,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
         assert!(load(&path).unwrap().quota_defaults.providers.is_none());
+        let legacy_path = directory.path().join("legacy-settings.json");
+        fs::write(
+            &legacy_path,
+            br#"{"version":1,"quotaDefaults":{},"quotaProviderAliases":[]}"#,
+        )
+        .unwrap();
+        let legacy = load(&legacy_path).unwrap();
+        assert_eq!(legacy.dashboard_defaults.range_preset, "24h");
+        assert_eq!(legacy.dashboard_defaults.time_format, "24h");
+        assert!(legacy
+            .dashboard_defaults
+            .model_billing_multipliers
+            .is_empty());
         let mut settings = Settings::default();
         settings.quota_provider_aliases = vec![
             ProviderAlias {
@@ -314,6 +432,25 @@ mod tests {
                 unit: Some("%".into()),
             }]),
         }]);
+        settings.dashboard_defaults.range_preset = "last-reset".into();
+        settings.dashboard_defaults.time_format = "12h".into();
+        settings.dashboard_defaults.model_billing_multipliers = vec![
+            ModelBillingMultiplier {
+                model: " gpt-5 ".into(),
+                multiplier: 1.25,
+            },
+            ModelBillingMultiplier {
+                model: "claude-sonnet".into(),
+                multiplier: 0.8,
+            },
+        ];
+        settings.dashboard_defaults.last_reset = Some(DashboardLastReset {
+            node_id: "a".into(),
+            provider_id: "same".into(),
+            metric_key: "five-hour".into(),
+            metric_kind: "utilizationPercent".into(),
+            unit: Some(" % ".into()),
+        });
         let settings = normalize(settings).unwrap();
         persist(&path, &settings).unwrap();
         let reloaded = load(&path).unwrap();
@@ -327,6 +464,81 @@ mod tests {
                 .key,
             "weekly"
         );
+        assert_eq!(reloaded.dashboard_defaults.range_preset, "last-reset");
+        assert_eq!(reloaded.dashboard_defaults.time_format, "12h");
+        assert_eq!(
+            reloaded.dashboard_defaults.model_billing_multipliers,
+            vec![
+                ModelBillingMultiplier {
+                    model: "gpt-5".into(),
+                    multiplier: 1.25,
+                },
+                ModelBillingMultiplier {
+                    model: "claude-sonnet".into(),
+                    multiplier: 0.8,
+                },
+            ]
+        );
+        assert_eq!(
+            reloaded
+                .dashboard_defaults
+                .last_reset
+                .unwrap()
+                .unit
+                .as_deref(),
+            Some("%")
+        );
+        let mut invalid = Settings::default();
+        invalid.dashboard_defaults.range_preset = "custom".into();
+        assert!(normalize(invalid).is_err());
+        let mut invalid = Settings::default();
+        invalid.dashboard_defaults.time_format = "18h".into();
+        assert!(normalize(invalid).is_err());
+        let mut invalid = Settings::default();
+        invalid.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
+            model: "gpt-5".into(),
+            multiplier: -0.01,
+        }];
+        assert!(normalize(invalid).is_err());
+        let mut invalid = Settings::default();
+        invalid.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
+            model: "gpt-5".into(),
+            multiplier: 1000.01,
+        }];
+        assert!(normalize(invalid).is_err());
+        let mut invalid = Settings::default();
+        invalid.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
+            model: "gpt-5".into(),
+            multiplier: f64::NAN,
+        }];
+        assert!(normalize(invalid).is_err());
+        let mut invalid = Settings::default();
+        invalid.dashboard_defaults.model_billing_multipliers = vec![
+            ModelBillingMultiplier {
+                model: "gpt-5".into(),
+                multiplier: 1.0,
+            },
+            ModelBillingMultiplier {
+                model: " gpt-5 ".into(),
+                multiplier: 2.0,
+            },
+        ];
+        assert!(normalize(invalid).is_err());
+        let mut invalid = Settings::default();
+        invalid.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
+            model: "  ".into(),
+            multiplier: 1.0,
+        }];
+        assert!(normalize(invalid).is_err());
+        let mut invalid = Settings::default();
+        invalid.dashboard_defaults.last_reset = Some(DashboardLastReset {
+            node_id: "node".into(),
+            provider_id: "provider".into(),
+            metric_key: "metric".into(),
+            metric_kind: "unknown".into(),
+            unit: None,
+        });
+        assert!(normalize(invalid).is_err());
         let blocked = directory.path().join("directory.json");
         fs::create_dir(&blocked).unwrap();
         assert!(persist(&blocked, &settings).is_err());
@@ -384,6 +596,10 @@ mod tests {
             .to_owned();
         let mut settings = Settings::default();
         settings.quota_defaults.providers = Some(vec![]);
+        settings.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
+            model: "gpt-5".into(),
+            multiplier: 1.25,
+        }];
         let saved = app
             .clone()
             .oneshot(
@@ -415,6 +631,16 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["settings"]
                 ["quotaDefaults"]["providers"],
             serde_json::json!([])
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["settings"]
+                ["dashboardDefaults"]["rangePreset"],
+            "24h"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["settings"]
+                ["dashboardDefaults"]["modelBillingMultipliers"],
+            serde_json::json!([{"model": "gpt-5", "multiplier": 1.25}])
         );
         for (peer, expected) in [
             ("127.0.0.1:1234", StatusCode::OK),
