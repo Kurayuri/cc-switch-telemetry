@@ -68,7 +68,7 @@ td code, #tokenValue { overflow-wrap: anywhere; color: var(--accent); font-famil
 .settings-billing-heading h3 { margin: 0 0 6px; font-size: 15px; }
 .settings-billing-heading p { margin: 0; font-size: 12px; }
 .settings-model-billing { display: grid; gap: 10px; margin-top: 14px; }
-.settings-model-billing-row { display: grid; grid-template-columns: minmax(180px, 1fr) 140px auto; align-items: end; gap: 10px; }
+.settings-model-billing-row { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(150px, 1fr) minmax(160px, 2fr) auto; align-items: end; gap: 10px; }
 .settings-model-billing-row > label { min-width: 0; }
 .settings-model-billing-row .settings-model-billing-model-input,
 .settings-model-billing-row .settings-model-billing-multiplier-input {
@@ -97,3 +97,13 @@ td code, #tokenValue { overflow-wrap: anywhere; color: var(--accent); font-famil
   .settings-provider, .settings-defaults-grid, .settings-model-billing-row { grid-template-columns: 1fr; }
   .settings-billing-heading { align-items: stretch; flex-direction: column; }
 }
+
+.settings-billing-factors { display: flex; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.settings-billing-factors > label { flex: 1 1 80px; min-width: 0; }
+.settings-billing-mode { width: 100%; }
+.settings-billing-pricing { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.settings-billing-pricing[hidden] { display: none; }
+.settings-billing-pricing p { flex: 1 1 250px; white-space: pre-line; overflow-wrap: anywhere; margin: 0; }
+@media (max-width: 1000px) { .settings-model-billing-row { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 640px) { .settings-model-billing-row { grid-template-columns: 1fr; } }
+#addModelBillingMultiplier { flex-shrink: 0; white-space: nowrap; }

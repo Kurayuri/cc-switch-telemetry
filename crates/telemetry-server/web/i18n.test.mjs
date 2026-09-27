@@ -36,7 +36,7 @@ test("dashboard has an English static fallback without remote assets", () => {
   assert.match(html, /<html lang="en-US"(?: data-theme="dark")?>/);
   assert.doesNotMatch(html, /[\u3400-\u9fff]/u);
   assert.doesNotMatch(html, /https?:\/\//u);
-  assert.match(html, /<link rel="icon" href="\/dashboard\/favicon\.svg" type="image\/svg\+xml">/);
+  assert.match(html, /<link rel="icon" href="\/dashboard\/favicon\.svg\?v=2" type="image\/svg\+xml">/);
   assert.match(html, /\/dashboard\/styles\.css/);
   assert.match(html, /\/dashboard\/app\.js/);
 });
@@ -65,7 +65,7 @@ test("trend exposes metric and granularity controls with rich tooltip support", 
   assert.match(html, /data-bucket="15m"/);
   assert.match(html, /id="customBucketAmount"/);
   assert.match(html, /id="trendChart"[^>]*class="[^"]*echarts-chart/);
-  assert.match(app, /params\.set\("bucket", state\.trendBucket\)/);
+  assert.match(app, /params\.set\("bucket", state\.chartBucket\)/);
   assert.match(app, /accumulateTrendPoints/);
   assert.match(app, /state\.timeFormat/);
   assert.match(app, /trend\.tooltipCacheCreation/);
@@ -79,8 +79,8 @@ test("quota controls share one responsive control row", () => {
   const quota = html.slice(html.indexOf('<section class="panel quota-panel"'), html.indexOf('<section id="dailyPanel"'));
   assert.match(quota, /class="quota-controls"[\s\S]*id="quotaNodeFilter"[\s\S]*id="quotaProviderFilter"[\s\S]*id="quotaMetricFilter"[\s\S]*id="quotaBucketTrigger"[\s\S]*id="restoreQuotaDefaults"/);
   assert.doesNotMatch(quota, /quota-chart-actions/);
-  assert.match(css, /\.quota-controls\s*\{[^}]*grid-template-columns: repeat\(5/);
-  assert.match(css, /@media \(max-width: 820px\)[\s\S]*\.quota-controls\s*\{[^}]*repeat\(3/);
+  assert.match(css, /\.quota-controls\s*\{[^}]*display: flex;[^}]*flex-wrap: wrap/);
+  assert.match(css, /\.quota-controls > label\s*\{[^}]*flex: 0 1 160px/);
   assert.match(css, /\.quota-restore-button\s*\{/);
 });
 
@@ -115,8 +115,8 @@ test("token KPI owns the cache rate and spans two grid units", () => {
   assert.match(css, /\.cache-hit-inline span\s*\{[^}]*font-size:\s*14px/);
   assert.match(css, /\.cache-hit-inline span\s*\{[^}]*position:\s*absolute/);
   assert.match(css, /\.cache-hit-inline\s*\{[^}]*min-height:\s*14px/);
-  assert.match(css, /\.token-bar-row\s*\{[^}]*gap:\s*30px/);
-  assert.match(css, /\.cache-hit-inline\s*\{[^}]*width:\s*72px/);
+  assert.match(css, /\.token-bar-row\s*\{[^}]*gap:\s*16px/);
+  assert.match(css, /\.cache-hit-inline\s*\{[^}]*width:\s*max-content;[^}]*min-width:\s*0/);
   assert.match(css, /\.token-legend\s*\{[^}]*flex-wrap:\s*nowrap/);
 });
 
@@ -144,14 +144,13 @@ test("dashboard exposes calendar-aligned presets, anchored pickers, and a GitHub
   assert.match(app, /buildDailyOption/);
   assert.match(charts, /type: "heatmap"/);
   assert.match(charts, /coordinateSystem: "calendar"/);
-  assert.match(app, /function syncBrandMarkSize/);
-  assert.match(app, /new ResizeObserver\(syncBrandMarkSize\)/);
+  assert.doesNotMatch(app, /syncBrandMarkSize/);
   assert.match(app, /function positionDialog/);
   assert.match(app, /document\.addEventListener\("pointerdown"/);
   assert.doesNotMatch(app, /showModal/);
   assert.match(css, /\.range-picker-dialog, \.bucket-picker-dialog\s*\{[^}]*position:\s*fixed/s);
   assert.match(css, /\.brand-mark\s*\{[^}]*aspect-ratio:\s*1/s);
-  assert.match(css, /\.brand-mark\s*\{[^}]*width:\s*var\(--brand-mark-size/s);
+  assert.match(css, /\.brand-mark\s*\{[^}]*width:\s*72px/s);
   assert.match(css, /\.picker-trigger > span\s*\{[^}]*margin:\s*0/s);
   assert.match(css, /\.daily-heatmap\s*\{[^}]*width:\s*100%[^}]*max-width:\s*1120px[^}]*min-width:\s*0/s);
   assert.match(css, /\.daily-controls\s*\{[^}]*align-items:\s*center/s);
@@ -197,7 +196,7 @@ test("translations interpolate variables and formatters follow locale", () => {
 
 test("every quota timestamp display uses minute precision", () => {
   const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
-  assert.equal(app.match(/formatters\.quotaDateTime\.format/g)?.length, 8);
+  assert.equal(app.match(/formatters\.quotaDateTime\.format/g)?.length, 20);
   assert.match(app, /formatters\.quotaDateTime\.format\(estimate\.at \* 1000\)/);
   assert.doesNotMatch(
     app,

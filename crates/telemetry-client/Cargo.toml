@@ -24,3 +24,6 @@ tempfile = "3"
 [dev-dependencies]
 axum.workspace = true
 telemetry-server = { path = "../telemetry-server" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

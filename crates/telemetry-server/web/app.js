@@ -1,14 +1,19 @@
+import { createRequestPool } from "./requests.js";
 import * as echarts from "./vendor/echarts.esm.min.mjs";
 import {
   buildDailyOption,
   buildQuotaOption,
   buildTrendOption,
+  buildComparisonOption,
   accumulateTrendPoints,
   tooltipMarkup,
   usageTooltipMarkup,
   dailyCalendarLayout,
 } from "./charts.js";
-import { pastResetGroups, choosePastReset, resolvePastResetRange, createPastResetLoader } from "./past-resets.js";
+import { createHistoryQuotaService, createHistoryQuotaLoader, historyIdentity } from "./history-quota.js";
+import { createEstimatedQuotaLoader } from "./estimated-quota.js";
+import { createPastResetLoader } from "./past-resets.js";
+import { resetCycleGroups, resolveResetCycleChoice } from "./reset-cycle.js";
 import { createFormatters, resolveLocale, translate } from "./i18n.js";
 import {
   DAY_SECONDS,
@@ -20,11 +25,11 @@ import {
   parseBucketValue,
   parseDateTimeParts,
   RANGE_PRESETS,
-  resolveResetRange,
+  rangeIncludesNow,
   resolveAllTimeRange,
   resolvePresetRange,
   sameLocalDay,
-  setDateKeepTime,
+  selectCalendarRange,
   splitBucketValue,
   startOfLocalDayMs,
   timeInputPlaceholder,
@@ -32,6 +37,7 @@ import {
 } from "./range.js";
 import {
   filterQuotaProviders,
+  estimatedQuota,
   optionalQuotaNumber,
   quotaAmount,
   quotaAmountRange,
@@ -49,6 +55,21 @@ import {
 } from "./quota-view.js";
 
 import { providerIdentity, metricIdentity, providerName, providerSelected, metricSelected, mergeProviders, renderPicker } from "./quota-settings.js";
+
+const fetchJson = createRequestPool(async (url, signal) => {
+  const response = await fetch(url, { signal, headers: { Accept: "application/json" } });
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      if (body.message) message = body.message;
+    } catch {
+      // Keep the HTTP status when the response is not JSON.
+    }
+    throw new Error(message);
+  }
+  return response.json();
+});
 
 const $ = (id) => document.getElementById(id);
 const localeStorageKey = "cc-switch-telemetry.locale";
@@ -88,8 +109,6 @@ const elements = {
   languageToggle: $("languageToggle"),
   refreshButton: $("refreshButton"),
   errorBanner: $("errorBanner"),
-  brandLockup: $("brandLockup"),
-  brandMark: $("brandMark"),
   rangePickerTrigger: $("rangePickerTrigger"),
   rangePickerLabel: $("rangePickerLabel"),
   rangePickerDialog: $("rangePickerDialog"),
@@ -97,20 +116,16 @@ const elements = {
   rangePresetOptions: $("rangePresetOptions"),
   customRangeEditor: $("customRangeEditor"),
   customRangeError: $("customRangeError"),
-  pastResetEditor: $("pastResetEditor"),
-  pastResetProvider: $("pastResetProvider"),
-  pastResetTier: $("pastResetTier"),
-  pastResetCycle: $("pastResetCycle"),
-  pastResetFrom: $("pastResetFrom"),
-  pastResetTo: $("pastResetTo"),
-  pastResetStatus: $("pastResetStatus"),
-  pastResetRetry: $("pastResetRetry"),
   lastResetEditor: $("lastResetEditor"),
   lastResetProvider: $("lastResetProvider"),
   lastResetTier: $("lastResetTier"),
   lastResetFrom: $("lastResetFrom"),
   lastResetTo: $("lastResetTo"),
   lastResetError: $("lastResetError"),
+  resetCycleSelect: $("resetCycleSelect"),
+  resetCycleCurrent: $("resetCycleCurrent"),
+  resetCycleLast: $("resetCycleLast"),
+  resetCycleRetry: $("resetCycleRetry"),
   closeRangePicker: $("closeRangePicker"),
   cancelRange: $("cancelRange"),
   customFromDate: $("customFromDate"),
@@ -193,21 +208,19 @@ const state = {
   rangePreset: "24h",
   timeFormat: "24h",
   modelBillingMultipliers: [],
-  customRange: defaultCustomRange(),
+  customRange: null,
   rangeDraft: null,
   lastResetSelection: null,
   rangePresetDraft: null,
   rangePresetController: null,
   firstRecordedAt: null,
   lastResetDraft: null,
-  pastResetSelection: null,
-  pastResetDraft: null,
-  pastResetHistory: { loading: false, error: false, response: null },
+  resetCycleHistory: { loading: false, error: false, response: null },
   rangeCalendarMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   activeRangeField: "start",
+  comparison: { enabled: false, selection: null, savedMetric: null, predictDefaultPending: null, estimatedQuota: false, historyEnabled: true, historyConfig: { mode: "full" } },
   trendCumulative: false,
-  trendBucket: "auto",
-  quotaGranularity: "auto",
+  chartBucket: "auto",
   bucketTarget: "trend",
   resources: {},
   resourceErrors: new Map(),
@@ -215,17 +228,30 @@ const state = {
   connection: { status: "", key: "status.connecting" },
 };
 
+const historyQuotaService = createHistoryQuotaService(fetchJson, async (url, body, signal) => {
+  const response = await fetch(url, { method: "POST", signal,
+    headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(body) });
+  if (!response.ok) throw new Error(`Quota reference: ${response.status}`);
+  return response.json();
+});
+const historyQuotaLoader = createHistoryQuotaLoader(historyQuotaService, () => renderTrend());
+const historyPreviewLoader = createHistoryQuotaLoader(historyQuotaService, () => renderHistoryDialog());
+let historyDraft = null;
+const estimatedQuotaLoader = createEstimatedQuotaLoader(fetchJson, () => renderTrend());
+const predictionChartCache = new Map();
+const resolvedPredictionCache = new Map();
+
 const chartInstances = {
   trend: null,
   quota: null,
   daily: null,
 };
 
-const pastResetLoader = createPastResetLoader(
-  (signal) => fetchJson("/v3/dashboard/quota/resets", signal),
+const resetCycleLoader = createPastResetLoader(
+  (signal) => fetchResetCycleContext(signal),
   (history) => {
-    state.pastResetHistory = history;
-    if (pickerPreset() === "past-resets") renderPastResetEditor();
+    state.resetCycleHistory = { ...history, response: history.response ?? state.resetCycleHistory.response };
+    if (pickerPreset() === "last-reset") renderLastResetEditor();
   },
 );
 
@@ -268,14 +294,35 @@ function ensureChart(name, element) {
   return chartInstances[name];
 }
 
+const pendingChartOptions = new Map();
+let chartFrame = null;
+
 function updateChart(name, element, option) {
   element.hidden = false;
   const chart = ensureChart(name, element);
-  chart.resize();
-  chart.setOption(option, { replaceMerge: ["series"], lazyUpdate: false });
+  const identity = name === "trend" ? JSON.stringify([state.comparison.enabled,
+    state.comparison.selection, elements.trendMetric.value, state.trendCumulative, state.chartBucket])
+    : JSON.stringify(option.series?.map((series) => series.id));
+  for (const series of option.series || []) series.animation = Boolean(option.animation);
+  if (element.dataset.chartIdentity === identity) {
+    option.animation = false;
+    for (const series of option.series || []) { series.animation = false; series.universalTransition = false; }
+  }
+  element.dataset.chartIdentity = identity;
+  pendingChartOptions.set(name, { chart, option });
+  if (!chartFrame) chartFrame = requestAnimationFrame(() => {
+    chartFrame = null;
+    const updates = [...pendingChartOptions.values()];
+    pendingChartOptions.clear();
+    for (const { chart, option } of updates) {
+      chart.resize();
+      chart.setOption(option, { replaceMerge: ["series", "yAxis"], lazyUpdate: false });
+    }
+  });
 }
 
 function clearChart(name, element) {
+  pendingChartOptions.delete(name);
   chartInstances[name]?.clear();
   element.hidden = true;
 }
@@ -287,38 +334,40 @@ function resizeCharts() {
   if (state.quota) renderQuotaChart(quotaProviders());
 }
 
-function lastResetGroups() {
-  return (state.quota?.providers || [])
-    .map((provider) => ({ provider, tiers: quotaResetTiers(provider) }))
-    .filter(({ tiers }) => tiers.length > 0);
+function resetGroups(nowMs = Date.now()) {
+  return resetCycleGroups(state.resetCycleHistory.response, state.resetCycleHistory.response?.currentProviders || state.quota?.providers || [], nowMs);
 }
 
 function resolveLastResetChoice(nowMs = Date.now(), selection = state.lastResetSelection) {
-  const groups = lastResetGroups();
-  if (!groups.length) return null;
-  const selectedProviderKey = selection?.providerKey;
-  const group = groups.find(({ provider }) => providerIdentity(provider) === selectedProviderKey) || groups[0];
-  const selectedTierId = selection?.tierId;
-  const preferred = group.tiers.find((item) => item.id === selectedTierId) || group.tiers[0];
-  const candidates = [preferred, ...group.tiers.filter((item) => item !== preferred)];
-  for (const tier of candidates) {
-    const range = resolveResetRange(tier.metric.resetsAt, tier.periodSeconds, nowMs);
-    if (range) return { group, tier, range };
-  }
-  return { group, tier: preferred, range: null };
+  return resolveResetCycleChoice(resetGroups(nowMs), selection, nowMs);
 }
 
-function selectedRange() {
+async function fetchResetCycleContext(signal, selection = null) {
+  const params = new URLSearchParams();
+  if (selection?.providerKey) {
+    const [node, provider] = JSON.parse(selection.providerKey);
+    params.set("node_id", node); params.set("provider_id", provider);
+  }
+  const suffix = params.size ? `?${params}` : "";
+  const currentParams = new URLSearchParams(params);
+  currentParams.set("include_history", "false");
+  const [history, current] = await Promise.all([
+    fetchJson(`/v3/dashboard/quota/resets${suffix}`, signal),
+    fetchJson(`/v3/dashboard/quota?${currentParams}`, signal),
+  ]);
+  return { ...history, currentProviders: current.providers };
+}
+
+function selectedRange(nowMs = Date.now()) {
   const range = state.rangePreset === "all"
-    ? resolveAllTimeRange(state.firstRecordedAt)
-    : state.rangePreset === "past-resets"
-    ? resolvePastResetRange(state.pastResetSelection?.cycle)
+    ? resolveAllTimeRange(state.firstRecordedAt, nowMs)
     : state.rangePreset === "last-reset"
-      ? resolveLastResetChoice()?.range
-      : resolvePresetRange(state.rangePreset, Date.now(), state.customRange);
+      ? resolveLastResetChoice(nowMs)?.range
+      : resolvePresetRange(state.rangePreset, nowMs, state.customRange);
   if (!range) {
-    const error = new Error(t("filters.lastResetUnavailable"));
-    error.translationKey = "filters.lastResetUnavailable";
+    const key = state.lastResetSelection?.mode === "last" ? "filters.lastCycleUnavailable" : "filters.lastResetUnavailable";
+    const error = new Error(t(key));
+    error.translationKey = key;
     throw error;
   }
   if (!Number.isFinite(range.from) || !Number.isFinite(range.to) || range.from >= range.to) {
@@ -327,6 +376,26 @@ function selectedRange() {
     throw error;
   }
   return range;
+}
+
+function selectedRangeIncludesNow() {
+  const nowMs = Date.now();
+  const range = selectedRange(nowMs);
+  return rangeIncludesNow(range, nowMs);
+}
+
+function comparisonPredictionId() {
+  const selection = state.comparison.selection;
+  return selection?.providerKey && selection?.tierId
+    ? JSON.stringify([...JSON.parse(selection.providerKey), ...JSON.parse(selection.tierId)]) : null;
+}
+
+function setQuotaPrediction(key, checked) {
+  if (checked) state.quotaPredictions.add(key); else state.quotaPredictions.delete(key);
+  if (state.comparison.enabled && key === comparisonPredictionId()) {
+    state.comparison.predictDefaultPending = null;
+    if (checked) state.comparison.estimatedQuota = true;
+  }
 }
 
 function paramsForRange(range, includeFilters = true) {
@@ -353,6 +422,7 @@ function paramsForRange(range, includeFilters = true) {
 
 function applyDashboardSettings(settings) {
   state.settings = settings;
+  if (state.quotaSelection === undefined) state.quotaSelection = structuredClone(settings.quotaDefaults?.providers ?? null);
   if (state.quotaSelection === undefined) {
     state.quotaSelection = structuredClone(settings?.quotaDefaults?.providers ?? null);
   }
@@ -384,7 +454,7 @@ function applyModelBillingMultipliers(settings) {
 async function preloadQuotaForLastReset(includeHistory = false) {
   const range = resolvePresetRange("24h");
   const params = paramsForRange(range, false);
-  params.set("bucket", state.quotaGranularity);
+  params.set("bucket", state.chartBucket);
   params.set("include_history", String(includeHistory));
   const response = await fetchJson(`/v3/dashboard/quota?${params}`);
   state.quota = response;
@@ -419,20 +489,7 @@ function dailyParams(includeFilters = true) {
   return params;
 }
 
-async function fetchJson(url, signal) {
-  const response = await fetch(url, { signal, headers: { Accept: "application/json" } });
-  if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`;
-    try {
-      const body = await response.json();
-      if (body.message) message = body.message;
-    } catch {
-      // Keep the HTTP status when the response is not JSON.
-    }
-    throw new Error(message);
-  }
-  return response.json();
-}
+
 
 function setConnection(status, key) {
   state.connection = { status, key };
@@ -482,14 +539,14 @@ function setSelectOptions(select, values, allLabel, preserveSelection = false) {
   }
 }
 
-async function refreshFilters(signal) {
-  const params = baseParams(false);
+async function refreshFilters(signal, range = selectedRange()) {
+  const params = paramsForRange(range, false);
   const filters = await fetchJson(`/v3/dashboard/filters?${params}`, signal);
-  setSelectOptions(elements.nodeFilter, filters.nodes, t("filters.allNodes"), ["past-resets", "all"].includes(state.rangePreset));
-  setSelectOptions(elements.appFilter, filters.apps, t("filters.allApps"), ["past-resets", "all"].includes(state.rangePreset));
-  setSelectOptions(elements.providerFilter, filters.providers, t("filters.allProviders"), ["past-resets", "all"].includes(state.rangePreset));
-  setSelectOptions(elements.modelFilter, filters.models, t("filters.allModels"), ["past-resets", "all"].includes(state.rangePreset));
-  setSelectOptions(elements.sourceFilter, filters.dataSources, t("filters.allSources"), ["past-resets", "all"].includes(state.rangePreset));
+  setSelectOptions(elements.nodeFilter, filters.nodes, t("filters.allNodes"), ["last-reset", "all"].includes(state.rangePreset));
+  setSelectOptions(elements.appFilter, filters.apps, t("filters.allApps"), ["last-reset", "all"].includes(state.rangePreset));
+  setSelectOptions(elements.providerFilter, filters.providers, t("filters.allProviders"), ["last-reset", "all"].includes(state.rangePreset));
+  setSelectOptions(elements.modelFilter, filters.models, t("filters.allModels"), ["last-reset", "all"].includes(state.rangePreset));
+  setSelectOptions(elements.sourceFilter, filters.dataSources, t("filters.allSources"), ["last-reset", "all"].includes(state.rangePreset));
 }
 
 function formatTokens(value) {
@@ -507,11 +564,11 @@ function formatLatency(value) {
 }
 
 function renderCostAdjustment() {
-  const count = state.modelBillingMultipliers.filter((entry) => Number(entry?.multiplier) !== 1).length;
-  elements.kpiCostAdjustment.hidden = count === 0;
-  elements.kpiCostAdjustment.textContent = count > 0
-    ? t("kpi.costAdjustment", { count: formatters.integerNumber.format(count) })
-    : "";
+  const notes = [];
+  const unavailable = Number(state.overview?.summary?.unadjustedCostRequests || 0);
+  if (unavailable) notes.push(t("kpi.unadjustedCost", { count: formatters.integerNumber.format(unavailable) }));
+  elements.kpiCostAdjustment.hidden = !notes.length;
+  elements.kpiCostAdjustment.textContent = notes.join(" · ");
 }
 
 function animateMetric(element, target, formatter) {
@@ -575,7 +632,7 @@ function renderSummary(summary) {
   animateMetric($("kpiTokens"), summary.realTotalTokens, formatTokens);
   animateMetric($("kpiCost"), summary.totalCostUsd, (value) => formatters.moneyNumber.format(value));
   animateMetric($("kpiSuccessRate"), summary.successRate, (value) => formatPercent(value));
-  animateMetric($("kpiCacheRate"), summary.cacheHitRate * 100, (value) => formatPercent(value));
+  animateMetric($("kpiCacheRate"), summary.cacheHitRate * 100, (value) => `${value.toFixed(2)}%`);
   animateMetric($("kpiLatency"), summary.avgLatencyMs, formatLatency);
   $("kpiSuccessCount").textContent = t("kpi.successCount", {
     count: formatters.integerNumber.format(summary.successfulRequests),
@@ -628,7 +685,134 @@ function formatTrendAxis(timestamp, spanSeconds) {
     .replaceAll("/", "-");
 }
 
+function comparisonSeries() {
+  const selection = state.comparison.selection;
+  const providers = (state.quota?.providers || []).filter((provider) =>
+    provider.series?.some((series) => series.points.some((point) => quotaPercentage(point) != null)));
+  setResetSelectOptions($("comparisonProvider"), [
+    { value: "", label: t("compare.chooseProvider") },
+    ...providers.map((provider) => ({ value: providerIdentity(provider),
+      label: `${provider.nodeName || provider.nodeId} / ${quotaDisplayName(provider)}` })),
+  ], selection?.providerKey || "");
+  const provider = providers.find((item) => providerIdentity(item) === selection?.providerKey);
+  const series = (provider?.series || []).filter((item) => item.points.some((point) => quotaPercentage(point) != null));
+  setResetSelectOptions($("comparisonTier"), [
+    { value: "", label: t("compare.chooseTier") },
+    ...series.map((item) => ({ value: metricIdentity(item), label: item.label || item.key })),
+  ], selection?.tierId || "");
+  $("comparisonTier").disabled = !provider;
+  const selected = series.find((item) => metricIdentity(item) === selection?.tierId);
+  return selected ? { ...selected, provider } : null;
+}
+
+function historyContext(series = comparisonSeries()) {
+  if (!series || !state.overview?.range) return null;
+  return { provider: series.provider, metric: series, range: state.overview.range,
+    params: paramsForRange(state.overview.range), billing: state.modelBillingMultipliers };
+}
+
+function historyDescription(reference) {
+  const lines = [[t("history.line"), `${formatters.moneyNumber.format(reference.amount)} = 100%`]];
+  if (reference.mode !== "manual") {
+    lines.push([t("history.period"), `${formatters.quotaDateTime.format(reference.from * 1000)} – ${formatters.quotaDateTime.format(reference.to * 1000)}`],
+      [t("history.sample"), `${formatters.quotaDateTime.format(reference.sampledAt * 1000)} · ${formatPercent(reference.utilizationPercent)}`],
+      [t("compare.cycleCost"), `${formatters.moneyNumber.format(reference.cost)}`]);
+  }
+  return lines;
+}
+
+function historyStatus(result) {
+  return t(`history.${result?.loading ? "loading" : result?.reason || "unavailable"}`);
+}
+
+function renderHistoryDialog() {
+  if (!historyDraft || !dialogIsOpen($("historyReferenceDialog"))) return;
+  const context = historyContext();
+  const result = historyDraft.mode === "none" ? { reason: "disabled" }
+    : context ? historyPreviewLoader.ensure(context, historyDraft) : null;
+  if (historyDraft.mode === "none") historyPreviewLoader.cancel();
+  $("historyReferenceSource").value = historyDraft.mode;
+  $("historyReferenceAmountField").hidden = historyDraft.mode !== "manual";
+  $("historyReferenceCycleField").hidden = historyDraft.mode !== "cycle";
+  setResetSelectOptions($("historyReferenceCycle"), [
+    { value: "", label: t("history.chooseCycle") },
+    ...(result?.cycles || []).map((cycle) => ({ value: String(cycle.resetsAt),
+      label: `${formatters.quotaDateTime.format(cycle.from * 1000)} – ${formatters.quotaDateTime.format(cycle.to * 1000)}` })),
+  ], historyDraft.identity === (context && historyIdentity(context)) ? String(historyDraft.cycleId || "") : "");
+  $("historyReferenceApply").disabled = historyDraft.mode !== "none" && !result?.reference;
+  $("historyReferenceRetry").hidden = result?.reason !== "failed";
+  $("historyReferencePreview").textContent = result?.reference
+    ? historyDescription(result.reference).map(([label, value]) => `${label}: ${value}`).join("\n") : historyStatus(result);
+  positionDialog($("historyReferenceDialog"), $("historyReferenceEdit"));
+}
+
+function openHistoryDialog() {
+  historyDraft = { ...state.comparison.historyConfig };
+  $("historyReferenceAmount").value = historyDraft.amount ?? "";
+  historyPreviewLoader.cancel();
+  openDialog($("historyReferenceDialog"), $("historyReferenceEdit"));
+  renderHistoryDialog();
+}
+
+function closeHistoryDialog() {
+  closeDialog($("historyReferenceDialog"), $("historyReferenceEdit"));
+  historyDraft = null;
+  historyPreviewLoader.cancel();
+}
+
 function renderTrend() {
+  elements.trendMetric.title = elements.trendMetric.selectedOptions[0]?.textContent || "";
+  const comparing = state.comparison.enabled;
+  if (comparing && (state.resources.overview || state.resources.quota)) return;
+  $("estimatedQuotaStatus").hidden = true;
+  elements.trendChart.classList.toggle("is-comparing", comparing);
+  $("trendCompare").checked = comparing;
+  $("comparisonControls").hidden = !comparing;
+  $("comparisonStatus").hidden = !comparing;
+  elements.trendCumulative.disabled = false;
+  elements.trendMetric.querySelector('[value="avgLatencyMs"]').disabled = comparing;
+  const quotaSeries = comparing ? comparisonSeries() : null;
+  const predictionId = quotaSeries ? JSON.stringify([quotaSeries.provider.nodeId,
+    quotaSeries.provider.providerId, quotaSeries.key, quotaSeries.kind, quotaSeries.unit || ""]) : null;
+  if (comparing && state.comparison.predictDefaultPending !== null && predictionId) {
+    // Apply entry defaults once; subsequent renders must preserve manual choices.
+    const checked = state.comparison.predictDefaultPending;
+    state.comparison.predictDefaultPending = null;
+    if (checked) state.quotaPredictions.add(predictionId); else state.quotaPredictions.delete(predictionId);
+    if (state.quota) {
+      renderQuota();
+      return;
+    }
+  }
+  $("comparisonPredict").disabled = !quotaSeries;
+  $("comparisonPredict").checked = state.quotaPredictions.has(predictionId);
+  $("comparisonEstimatedQuota").disabled = !quotaSeries;
+  $("comparisonEstimatedQuota").checked = state.comparison.estimatedQuota;
+  const historyContextValue = comparing && quotaSeries ? historyContext(quotaSeries) : null;
+  const historyResult = historyContextValue && state.comparison.historyEnabled
+    ? historyQuotaLoader.ensure(historyContextValue, state.comparison.historyConfig) : null;
+  if (!historyContextValue || !state.comparison.historyEnabled) historyQuotaLoader.cancel();
+  const referenceLabel = !state.comparison.historyEnabled ? t("history.none")
+    : historyResult?.reference ? formatters.moneyNumber.format(historyResult.reference.amount)
+    : historyResult?.loading ? "…" : "—";
+  $("historyReferenceEdit").textContent = `${t("compare.historyLabel")}: ${referenceLabel}`;
+  $("historyReferenceEdit").title = historyResult?.reference
+    ? historyDescription(historyResult.reference).map(([label, value]) => `${label}: ${value}`).join("\n")
+    : !state.comparison.historyEnabled ? t("history.disabled") : historyStatus(historyResult);
+  $("historyReferenceEdit").setAttribute("aria-label", `${t("history.configure")}: ${$("historyReferenceEdit").title}`);
+  renderHistoryDialog();
+  const matchingRange = state.quota?.range?.from === state.overview?.range?.from
+    && state.quota?.range?.to === state.overview?.range?.to;
+  // While a new range loads, retain the previous chart until both responses
+  // arrive. Never draw an old quota range against new Usage data.
+  if (comparing && !matchingRange) {
+    estimatedQuotaLoader.cancel();
+    return;
+  }
+  if (comparing) {
+    $("comparisonStatus").textContent = t(!quotaSeries ? "compare.select" : "compare.waiting");
+    $("comparisonStatus").hidden = !!quotaSeries && matchingRange;
+  }
   const rawPoints = state.overview?.trend || [];
   const metric = elements.trendMetric.value;
   const cumulativeSupported = ["realTotalTokens", "totalRequests", "totalCostUsd"].includes(metric);
@@ -649,14 +833,40 @@ function renderTrend() {
     });
   }
   if (!points.length) {
+    estimatedQuotaLoader.cancel();
     clearChart("trend", elements.trendChart);
     return;
   }
 
-  const range = state.overview.range;
+  const predictionEnabled = comparing && matchingRange && quotaSeries && state.quotaPredictions.has(predictionId);
+  const predictionState = predictionEnabled ? resolveQuotaPrediction(quotaSeries, quotaPercentage) : {};
+  if (predictionState.prediction) predictionChartCache.set(predictionId, predictionState.prediction);
+  else if (predictionState.history?.loading) predictionState.prediction = predictionChartCache.get(predictionId);
+  if (predictionEnabled && !predictionState.prediction) {
+    $("comparisonStatus").hidden = false;
+    $("comparisonStatus").textContent = t(predictionState.history?.loading ? "quota.predictLoading" : "quota.predictUnavailable");
+  }
+  let quotaEstimate = null;
+  const estimateEnabled = comparing && matchingRange && quotaSeries && state.comparison.estimatedQuota;
+  if (estimateEnabled) {
+    const params = paramsForRange(state.overview.range);
+    params.delete("all_time");
+    const scope = new URLSearchParams(params);
+    scope.delete("from"); scope.delete("to");
+    const key = JSON.stringify([predictionId, scope.toString(), state.overview.range.bucket,
+      state.rangePreset, state.rangePreset === "custom" ? state.customRange : null, state.modelBillingMultipliers]);
+    quotaEstimate = estimatedQuotaLoader.ensure(key, { provider: quotaSeries.provider,
+      metric: quotaSeries, overview: state.overview, params });
+  } else {
+    estimatedQuotaLoader.cancel();
+  }
+  $("estimatedQuotaStatus").hidden = !estimateEnabled || (!quotaEstimate?.error && Boolean(quotaEstimate?.points.some((point) => point.value != null)));
+  $("estimatedQuotaStatus").textContent = t(quotaEstimate?.loading || (estimateEnabled && state.requestController)
+    ? "compare.estimateLoading" : quotaEstimate?.error ? "compare.estimateFailed" : "compare.estimateUnavailable");
+  const range = comparing ? quotaPredictionRange(state.overview.range, [predictionState.prediction]) : state.overview.range;
   const spanSeconds = Math.max(1, Number(range.to) - Number(range.from));
   const palette = chartPalette();
-  updateChart("trend", elements.trendChart, buildTrendOption({
+  const option = (comparing ? buildComparisonOption : buildTrendOption)({
     points,
     metric,
     range,
@@ -670,7 +880,39 @@ function renderTrend() {
     ),
     ariaDescription: t("trend.chartAria"),
     reducedMotion: reducedMotion(),
-  }));
+    usageRange: state.overview.range,
+    estimatedQuotaEnabled: comparing && state.comparison.estimatedQuota,
+    historyReferenceEnabled: comparing && state.comparison.historyEnabled,
+    historyReference: historyResult?.reference ? { ...historyResult.reference,
+      name: t("history.line"), color: cssColor("--success", "#34d399") } : null,
+    formatHistoryReferenceTooltip: (reference) => tooltipMarkup(t("history.line"), historyDescription(reference)),
+    quotaPlot: comparing && matchingRange && quotaSeries ? {
+      id: "comparison-quota", name: `${quotaSeries.label || quotaSeries.key} · %`,
+      axis: "percent", color: cssColor("--violet", "#a78bfa"), value: quotaPercentage,
+      segments: splitQuotaPoints(quotaSeries.points, state.quota.range.bucketSeconds, quotaPercentage),
+      prediction: predictionState.prediction,
+    } : null,
+    estimatedQuotaPlot: quotaEstimate?.points.some((point) => point.value != null) ? {
+      name: t("quota.estimatedQuota"), color: cssColor("--amber", "#fbbf24"), points: quotaEstimate.points,
+    } : null,
+    formatMoney: (value) => formatters.moneyNumber.format(value),
+    formatEstimatedQuotaTooltip: (point) => tooltipMarkup(formatters.quotaDateTime.format(point.at * 1000), [
+      [t("quota.estimatedQuota"), formatters.moneyNumber.format(point.value)],
+      [t("compare.cycleCost"), formatters.moneyNumber.format(point.cost)],
+      [t("quota.percentAxis"), formatPercent(point.utilization)],
+      [t("compare.sampledAt"), formatters.quotaDateTime.format(point.sampledAt * 1000)],
+      [t("compare.cycleStart"), formatters.quotaDateTime.format(point.cycleFrom * 1000)],
+    ]),
+    usageLabel: elements.trendMetric.selectedOptions[0].textContent,
+    quotaLabel: t("quota.percentAxis"),
+    formatPredictionTooltip: (point) => tooltipMarkup(formatters.quotaDateTime.format(point.value[0]), [
+      [t("quota.predicted"), formatPercent(point.value[1])],
+    ]),
+    formatQuotaTooltip: (point) => tooltipMarkup(formatters.quotaDateTime.format(point.sampledAt * 1000), [
+      [quotaSeries?.label || quotaSeries?.key || "Quota", formatPercent(quotaPercentage(point))],
+    ]),
+  });
+  updateChart("trend", elements.trendChart, option);
 }
 
 function usageTooltip(point, titleText) {
@@ -685,6 +927,7 @@ function usageTooltip(point, titleText) {
     ["", t("trend.tooltipCost", { value: formatters.moneyNumber.format(point.totalCostUsd) })],
     ["", t("trend.tooltipLatency", { value: formatLatency(point.avgLatencyMs) })],
   ];
+  if (point.unadjustedCostRequests) lines.push(["", t("kpi.unadjustedCost", { count: formatters.integerNumber.format(point.unadjustedCostRequests) })]);
   return usageTooltipMarkup(point, titleText, lines, formatTokens);
 }
 
@@ -753,7 +996,8 @@ function renderBreakdown() {
     appendCell(row, formatters.integerNumber.format(item.totalRequests), "table-value");
     appendCell(row, formatTokens(item.realTotalTokens), "table-value");
     appendCell(row, formatPercent(item.successRate), "table-value");
-    appendCell(row, formatters.moneyNumber.format(item.totalCostUsd), "table-value");
+    appendCell(row, formatters.moneyNumber.format(item.totalCostUsd)
+      + (item.unadjustedCostRequests ? ` · ${t("cost.unadjusted")}` : ""), "table-value");
     elements.breakdownRows.append(row);
   }
 }
@@ -778,6 +1022,8 @@ function renderCoverage(coverage) {
 function renderOverview(overview) {
   state.overview = overview;
   renderSummary(overview.summary);
+  renderCostAdjustment();
+  if (state.quota) renderQuotaCards(quotaProviders());
   renderCostTopModels(overview.breakdowns?.models);
   renderTrend();
   renderBreakdown();
@@ -815,10 +1061,11 @@ function updateQuotaFilters() {
   const nodes = new Map(providers.map((p) => [p.nodeId, p.nodeName || p.nodeId]));
   setSelectOptions(elements.quotaNodeFilter,
     [...nodes].map(([value, label]) => ({ value, label })), t("quota.allNodes"));
+  elements.quotaNodeFilter.title = elements.quotaNodeFilter.selectedOptions[0]?.textContent || "";
   const selected = state.quotaSelection;
   const pickerLabels = { allLabel: t("quota.selectAll"), noneLabel: t("quota.selectNone") };
   renderPicker(elements.quotaProviderFilter, {
-    ...pickerLabels, title: t("quota.provider"),
+    ...pickerLabels, title: t("quota.provider"), showTitleInTrigger: false,
     groups: [{ options: providers.map((p) => ({ value: providerIdentity(p), label: `${p.nodeName || p.nodeId} / ${providerName(p, state.settings)}${p.unavailable ? ' (' + t("quota.unavailable") + ')' : ''}` })) }],
     selected: selected == null ? null : selected.map(providerIdentity),
     onChange: (keys) => {
@@ -838,12 +1085,12 @@ function updateQuotaFilters() {
   }));
   const allMetrics = chosen.every((p) => selected == null || selected.find((item) => providerIdentity(item) === providerIdentity(p))?.metrics == null);
   renderPicker(elements.quotaMetricFilter, {
-    ...pickerLabels, title: t("quota.metric"), groups,
+    ...pickerLabels, title: t("quota.metric"), groups, showTitleInTrigger: false,
     itemControl: {
       label: t("quota.predict"),
       selected: state.quotaPredictions,
       onChange: (key, checked) => {
-        if (checked) state.quotaPredictions.add(key); else state.quotaPredictions.delete(key);
+        setQuotaPrediction(key, checked);
         quotaSnapshots.cancel();
         renderQuotaChart(quotaProviders());
       },
@@ -891,6 +1138,14 @@ function renderQuotaCards(providers) {
     const status = document.createElement("span");
     status.className = "quota-status";
     status.textContent = t(`quota.status.${provider.status || "unknown"}`);
+    if (provider.diagnosticCode === "cli_schema_incompatible") {
+      status.textContent = t("quota.cliIncompatible");
+      status.title = t("quota.cliIncompatibleHint");
+    }
+    if (provider.diagnosticCode === "quota_api_unavailable") {
+      status.textContent = t("quota.apiUnavailable");
+      status.title = t("quota.apiUnavailableHint");
+    }
     heading.append(title, status);
     card.append(heading);
 
@@ -898,12 +1153,34 @@ function renderQuotaCards(providers) {
       (metric) => metricSelected(state.quotaSelection, provider, metric),
     );
     const details = document.createElement("div");
-    details.className = "quota-details";
+    details.className = `quota-details${metrics.length === 1 ? " is-single" : ""}`;
     if (metrics.length) {
       for (const metric of metrics) {
         const group = document.createElement("div");
         group.className = "quota-metric-group";
-        appendQuotaDetail(group, metric.label || metric.key, quotaValueLabel(metric));
+        const metricLabel = document.createElement("h3");
+        metricLabel.className = "quota-metric-label";
+        metricLabel.textContent = metric.label || metric.key;
+        const metricValue = document.createElement("strong");
+        metricValue.className = "quota-metric-value";
+        metricValue.textContent = quotaValueLabel(metric);
+        group.append(metricLabel, metricValue);
+        const percentage = quotaPercentage(metric);
+        if (percentage != null) {
+          const meter = document.createElement("div");
+          meter.className = "quota-meter";
+          meter.setAttribute("role", "progressbar");
+          meter.setAttribute("aria-label", metric.label || metric.key);
+          meter.setAttribute("aria-valuemin", "0");
+          meter.setAttribute("aria-valuemax", "100");
+          meter.setAttribute("aria-valuenow", String(percentage));
+          const fill = document.createElement("span");
+          fill.style.width = `${percentage}%`;
+          meter.append(fill);
+          group.append(meter);
+        } else {
+          group.classList.add("quota-metric-amount");
+        }
         const reset = optionalQuotaNumber(metric.resetsAt);
         if (reset != null && reset > 0 && Number.isFinite(new Date(reset * 1000).getTime())) {
           appendQuotaDetail(group, t("quota.reset"), formatters.quotaDateTime.format(reset * 1000));
@@ -917,12 +1194,19 @@ function renderQuotaCards(providers) {
           }
           const text = estimate.status === "estimated"
             ? formatters.quotaDateTime.format(estimate.at * 1000)
-              + (estimate.afterReset ? ` · ${t("quota.atCurrentRate")}` : "")
-            : t(`quota.exhaustion.${estimate.status}`);
+            : estimate.status === "unavailable" ? "—"
+              : estimate.status === "loading" ? "…" : t(`quota.exhaustion.${estimate.status}`);
           const value = appendQuotaDetail(group, t("quota.estimatedExhaustion"), text);
+          if (estimate.status === "unavailable" || estimate.status === "loading") {
+            value.title = t(`quota.exhaustion.${estimate.status}`);
+            value.setAttribute("aria-label", value.title);
+          }
           value.classList.toggle("quota-exhaustion-early", estimate.beforeReset);
           value.parentElement.classList.add("quota-exhaustion");
           value.parentElement.dataset.status = estimate.status;
+          const quota = estimatedQuota(metric, state.overview?.summary?.totalCostUsd);
+          appendQuotaDetail(group, t("quota.estimatedQuota"),
+            quota == null ? "—" : formatters.moneyNumber.format(quota));
         }
         details.append(group);
       }
@@ -989,13 +1273,20 @@ function predictionHistory(item, metricId) {
 
 function resolveQuotaPrediction(item, valueSelector) {
   const metricId = JSON.stringify([item.provider.nodeId, item.provider.providerId, item.key, item.kind, item.unit || ""]);
+  const signature = JSON.stringify([state.quota.range.bucketSeconds, item.points]);
+  const cached = resolvedPredictionCache.get(metricId);
+  if (cached?.signature === signature && !cached.result.history?.loading
+    && (cached.result.prediction || !cached.result.history?.points.length)) return cached.result;
   let prediction = quotaPrediction(item.points, state.quota.range.bucketSeconds, valueSelector);
   const history = !prediction ? predictionHistory(item, metricId) : null;
   if (history?.points.length) prediction = quotaPrediction(history.points, state.quota.range.bucketSeconds, valueSelector);
-  return { prediction, history };
+  const result = { prediction, history };
+  resolvedPredictionCache.set(metricId, { signature, result });
+  return result;
 }
 
 function renderQuotaChart(providers) {
+  if (state.resources.quota && chartInstances.quota) return;
   const series = quotaSeries(providers);
   const plottedSeries = series.flatMap((item, seriesIndex) => {
     const plots = [];
@@ -1009,6 +1300,7 @@ function renderQuotaChart(providers) {
   });
   if (!plottedSeries.length) {
     clearChart("quota", elements.quotaChart);
+    if (state.comparison.enabled) renderTrend();
     return;
   }
 
@@ -1031,8 +1323,13 @@ function renderQuotaChart(providers) {
     const axisLabel = item.axis === "percent" ? "%" : item.unit || t("quota.amountAxis");
     const metricId = JSON.stringify([item.provider.nodeId, item.provider.providerId, item.key, item.kind, item.unit || ""]);
     const enabled = state.quotaPredictions.has(metricId);
-    const { prediction, history } = enabled
+    let { prediction, history } = enabled
       ? resolveQuotaPrediction(item, item.value) : { prediction: null, history: null };
+    if (prediction) predictionChartCache.set(metricId, prediction);
+    else if (history?.loading) {
+      const previous = predictionChartCache.get(metricId);
+      if (previous?.start.at >= state.quota.range.from && previous.start.at <= state.quota.range.to) prediction = previous;
+    }
     return {
       id: JSON.stringify([
         item.provider.nodeId,
@@ -1083,6 +1380,7 @@ function renderQuotaChart(providers) {
     ariaDescription: t("quota.chartAria"),
     reducedMotion: reducedMotion(),
   }));
+  if (state.comparison.enabled) renderTrend();
 }
 
 function renderQuota() {
@@ -1105,18 +1403,6 @@ function dailyMetricValue(point, metric) {
 
 function localDateKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
-let brandMarkSyncQueued = false;
-
-function syncBrandMarkSize() {
-  if (brandMarkSyncQueued) return;
-  brandMarkSyncQueued = true;
-  requestAnimationFrame(() => {
-    brandMarkSyncQueued = false;
-    const height = Math.round(elements.brandMark.getBoundingClientRect().height);
-    if (height > 0) elements.brandMark.style.setProperty("--brand-mark-size", `${height}px`);
-  });
 }
 
 function renderDaily() {
@@ -1192,10 +1478,23 @@ function renderEventRows(items, append) {
     appendCell(row, formatters.dateTime.format(item.createdAt * 1000));
     appendCell(row, item.nodeName || item.nodeId || "—");
     appendCell(row, item.appType || "—");
-    appendCell(row, `${item.providerName || item.providerId || "—"} / ${item.model || item.requestModel || "—"}`);
+    const modelCell = appendCell(row, `${item.providerName || item.providerId || "—"} / ${item.model || item.requestModel || "—"}`);
+    const metadata = document.createElement("div"); metadata.className = "event-metadata";
+    for (const [key, value] of [["tier", item.serviceTier], ["effort", item.reasoningEffort]]) {
+      const tag = document.createElement("span");
+      tag.textContent = `${t(`events.${key}`)}: ${value === "default" ? "Standard" : value || t("events.unknown")}`;
+      if (key === "tier") {
+        tag.title = t(item.serviceTierSource === "response" ? "events.metadataResponse" : item.serviceTierSource === "request" ? "events.metadataRequest" : "events.metadataUnknown");
+        tag.tabIndex = 0;
+        tag.setAttribute("aria-label", `${tag.textContent}; ${tag.title}`);
+      }
+      metadata.append(tag);
+    }
+    modelCell.append(metadata);
     appendCell(row, formatTokens(item.realTotalTokens), "table-value");
     appendCell(row, formatTokens(item.cacheReadTokens), "table-value");
-    appendCell(row, formatters.moneyNumber.format(item.totalCostUsd), "table-value");
+    appendCell(row, formatters.moneyNumber.format(item.totalCostUsd)
+      + (item.unadjustedCostRequests ? ` · ${t("cost.unadjusted")}` : ""), "table-value");
     appendCell(row, formatLatency(item.latencyMs), "table-value");
     const [label, className] = eventStatus(item.statusCode);
     const statusCell = appendCell(row, "");
@@ -1208,26 +1507,34 @@ function renderEventRows(items, append) {
   }
 }
 
-async function loadEvents({ append = false, signal = undefined } = {}) {
+async function loadEvents({ append = false, signal = undefined, range = state.activeRange || selectedRange() } = {}) {
   if (append && state.eventsLoading) return;
+  state.eventsController?.abort();
+  const controller = new AbortController(); state.eventsController = controller;
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
+  signal?.addEventListener("abort", abort, { once: true });
   const generation = ++state.eventsGeneration;
   state.eventsLoading = true;
   elements.loadMore.disabled = true;
   try {
-    const params = baseParams(true);
+    const params = paramsForRange(range, true);
     params.set("limit", "50");
+    if ($("eventTierFilter").value) params.set("service_tier", $("eventTierFilter").value);
+    if ($("eventEffortFilter").value) params.set("reasoning_effort", $("eventEffortFilter").value);
     if (append && state.eventCursor) {
       params.set("before_created_at", String(state.eventCursor.beforeCreatedAt));
       params.set("before_event_id", state.eventCursor.beforeEventId);
     }
-    const response = await fetchJson(`/v3/dashboard/events?${params}`, signal);
-    if (generation !== state.eventsGeneration) return;
+    const response = await fetchJson(`/v3/dashboard/events?${params}`, controller.signal);
+    if (controller.signal.aborted || generation !== state.eventsGeneration) return;
     state.events = append ? [...state.events, ...response.items] : response.items;
     renderEventRows(state.events, false);
     state.eventCursor = response.nextCursor;
     elements.eventsEmpty.hidden = state.events.length > 0;
     elements.loadMore.hidden = !state.eventCursor;
   } finally {
+    signal?.removeEventListener("abort", abort);
     if (generation === state.eventsGeneration) {
       state.eventsLoading = false;
       elements.loadMore.disabled = false;
@@ -1245,6 +1552,7 @@ async function resource(name, fetcher, commit, parent) {
   try {
     const result = await fetcher(controller.signal);
     if (controller.signal.aborted || state.resources[name] !== controller) return;
+    delete state.resources[name];
     commit(result);
     state.resourceErrors.delete(name);
   } catch (error) {
@@ -1259,29 +1567,40 @@ async function resource(name, fetcher, commit, parent) {
   }
 }
 
-function refreshOverview(parent) {
-  const params = baseParams(true);
-  params.set("bucket", state.trendBucket);
+function refreshOverview(parent, range = selectedRange()) {
+  const params = paramsForRange(range, true);
+  params.set("bucket", state.chartBucket === "auto" && state.comparison.enabled ? "quota-auto" : state.chartBucket);
   return resource("overview", (signal) => fetchJson(`/v3/dashboard/overview?${params}`, signal), renderOverview, parent);
 }
 
-function refreshQuota(parent) {
-  const params = baseParams(false);
-  params.set("bucket", state.quotaGranularity);
+function refreshQuota(parent, range = selectedRange()) {
+  const params = paramsForRange(range, false);
+  params.set("bucket", state.chartBucket);
   return resource("quota", async (signal) => {
     const response = await fetchJson(`/v3/dashboard/quota?${params}`, signal);
     if (state.quotaSelection === undefined) await state.settingsPromise;
     return response;
   }, (response) => {
-    for (const entry of state.quotaPredictionHistory.values()) entry.controller.abort();
-    state.quotaPredictionHistory.clear();
+    if (state.quotaPredictionHistory.size > 64) {
+      for (const entry of state.quotaPredictionHistory.values()) entry.controller.abort();
+      state.quotaPredictionHistory.clear(); resolvedPredictionCache.clear();
+    }
     state.quota = response;
-    quotaSnapshots.invalidate();
+      quotaSnapshots.invalidate();
     renderQuota();
   }, parent);
 }
 
-async function refreshAll({ reloadFilters = false } = {}) {
+async function refreshAll({ reloadFilters = false, revalidate = false, reason = "refresh" } = {}) {
+  if (revalidate) {
+    estimatedQuotaLoader.revalidate();
+    historyQuotaService.invalidate();
+    historyQuotaLoader.cancel(); historyPreviewLoader.cancel();
+    resolvedPredictionCache.clear();
+    for (const entry of state.quotaPredictionHistory.values()) entry.controller.abort();
+    state.quotaPredictionHistory.clear();
+  }
+  const previousOverview = state.overview, previousQuota = state.quota;
   state.requestController?.abort();
   const controller = new AbortController();
   state.requestController = controller;
@@ -1290,37 +1609,51 @@ async function refreshAll({ reloadFilters = false } = {}) {
   elements.refreshButton.disabled = true;
   setConnection("", "status.refreshing");
   try {
-    if (state.rangePreset === "all") {
+    if (reason !== "filters" && state.rangePreset === "all") {
       const bounds = await fetchJson("/v3/dashboard/time-bounds", controller.signal);
       if (controller.signal.aborted) return;
       state.firstRecordedAt = bounds.firstRecordedAt;
-    } else if (state.rangePreset === "past-resets" && state.pastResetSelection?.cycle.endAt > Date.now() / 1000) {
-      // Keep the selected cycle, but allow a newly confirmed early reset to close it.
-      const history = await fetchJson("/v3/dashboard/quota/resets", controller.signal);
+    } else if (reason !== "filters" && state.rangePreset === "last-reset"
+      && (reason !== "range" || !state.resetCycleHistory.response)) {
+      const response = await fetchResetCycleContext(controller.signal, state.lastResetSelection);
       if (controller.signal.aborted) return;
-      const choice = state.pastResetSelection;
-      const group = pastResetGroups(history).find((item) => item.id === choice.providerKey);
-      const tier = group?.tiers.find((item) => item.id === choice.tierId);
-      const cycle = tier?.cycles.find((item) => item.id === choice.cycleId);
-      if (cycle) state.pastResetSelection = { ...choice, cycle };
+      state.resetCycleHistory = { loading: false, error: false, response };
+      const choice = resolveLastResetChoice();
+      if (choice.selection) state.lastResetSelection = choice.selection;
     }
-    if (reloadFilters) await refreshFilters(controller.signal);
+
+    if (reason === "range" && state.comparison.enabled) {
+      // A real range selection supersedes entry defaults; refresh/filter changes do not.
+      state.comparison.predictDefaultPending = null;
+      if (!selectedRangeIncludesNow()) {
+        const key = comparisonPredictionId();
+        if (key) setQuotaPrediction(key, false);
+        else state.comparison.predictDefaultPending = false;
+        $("comparisonPredict").checked = false;
+      }
+    }
+    const chartRange = reason === "filters" && state.activeRange ? state.activeRange : selectedRange();
+    state.activeRange = chartRange;
+    if (reloadFilters) await refreshFilters(controller.signal, chartRange);
     if (controller.signal.aborted) return;
-    state.settingsPromise = resource("settings", (signal) => fetchJson("/v3/dashboard/settings", signal), (settings) => {
+    if (reason === "refresh" || !state.settings) state.settingsPromise = resource("settings", (signal) => fetchJson("/v3/dashboard/settings", signal), (settings) => {
       const changed = JSON.stringify(state.settings) !== JSON.stringify(settings);
       applyModelBillingMultipliers(settings);
       state.settings = settings;
       if (state.quotaSelection === undefined) state.quotaSelection = structuredClone(settings.quotaDefaults.providers);
       if (changed && state.quota) renderQuota();
     }, controller.signal);
+    const quotaMatches = state.quota?.range.from === chartRange.from && state.quota?.range.to === chartRange.to;
+    const dailyKey = dailyParams(true).toString();
+    const dailyNeeded = reason !== "range" || state.dailyKey !== dailyKey || !state.daily;
     await Promise.allSettled([
       state.settingsPromise,
-      refreshOverview(controller.signal),
-      resource("daily", (signal) => fetchJson(`/v3/dashboard/daily?${dailyParams(true)}`, signal), (daily) => {
-        state.daily = daily; renderDaily();
-      }, controller.signal),
-      refreshQuota(controller.signal),
-      resource("events", (signal) => loadEvents({ append: false, signal }), () => {}, controller.signal),
+      refreshOverview(controller.signal, chartRange),
+      dailyNeeded ? resource("daily", (signal) => fetchJson(`/v3/dashboard/daily?${dailyKey}`, signal), (daily) => {
+        state.daily = daily; state.dailyKey = dailyKey; renderDaily();
+      }, controller.signal) : Promise.resolve(),
+      reason !== "filters" || !quotaMatches ? refreshQuota(controller.signal, chartRange) : Promise.resolve(),
+      resource("events", (signal) => loadEvents({ append: false, signal, range: chartRange }), () => {}, controller.signal),
     ]);
     if (controller.signal.aborted) return;
     if (state.resourceErrors.size) throw state.resourceErrors.values().next().value;
@@ -1329,10 +1662,15 @@ async function refreshAll({ reloadFilters = false } = {}) {
     state.updatedAt = Date.now();
     elements.updatedAt.textContent = t("status.updatedAt", { time: formatters.dateTime.format(state.updatedAt) });
   } catch (error) {
+    if (state.comparison.enabled && state.requestController === controller && (state.resourceErrors.has("overview") || state.resourceErrors.has("quota"))) {
+      state.overview = previousOverview; state.quota = previousQuota;
+    }
     if (error.name !== "AbortError") showError(error);
   } finally {
     if (state.requestController === controller) {
       state.requestController = null;
+      if (state.quota) renderQuota();
+      if (state.overview) renderTrend();
       elements.refreshButton.disabled = false;
     }
   }
@@ -1389,6 +1727,7 @@ function positionDialog(dialog, trigger) {
 function positionOpenPickers() {
   positionDialog(elements.rangePickerDialog, elements.rangePickerTrigger);
   positionDialog(elements.bucketPickerDialog, bucketTrigger());
+  if (historyDraft) renderHistoryDialog();
 }
 
 function openDialog(dialog, trigger) {
@@ -1416,7 +1755,6 @@ function rangeLabelKey(preset) {
     "30d": "filters.range30d",
     "1y": "filters.range1y",
     "last-reset": "filters.rangeLastReset",
-    "past-resets": "filters.rangePastResets",
     all: "filters.rangeAll",
     custom: "filters.custom",
   }[preset] || "filters.range24h";
@@ -1434,87 +1772,50 @@ function setResetSelectOptions(select, options, selectedValue) {
   if (options.some((option) => option.value === selectedValue)) select.value = selectedValue;
 }
 
-function renderLastResetEditor() {
-  const groups = lastResetGroups();
-  const providerOptions = groups.map(({ provider }) => ({
-    value: providerIdentity(provider),
-    label: `${provider.nodeName || provider.nodeId} / ${quotaDisplayName(provider)}`,
-  }));
-  const previousProviderKey = state.lastResetDraft?.providerKey;
-  const resolved = resolveLastResetChoice(Date.now(), state.lastResetDraft);
-  const group = resolved?.group
-    || groups.find(({ provider }) => providerIdentity(provider) === previousProviderKey)
-    || groups[0];
-  const providerKey = group ? providerIdentity(group.provider) : null;
-  const tierOptions = (group?.tiers || []).map((tier) => ({
-    value: tier.id,
-    label: `${tier.periodLabel} · ${tier.metric.label || tier.metric.key}`,
-  }));
-  const previousTierId = state.lastResetDraft?.tierId;
-  const tier = resolved?.group === group
-    ? resolved.tier
-    : group?.tiers.find((item) => item.id === previousTierId) || group?.tiers[0] || null;
-  state.lastResetDraft = group && tier
-    ? { providerKey, tierId: tier.id }
-    : null;
-  setResetSelectOptions(elements.lastResetProvider, providerOptions, providerKey);
-  setResetSelectOptions(elements.lastResetTier, tierOptions, tier?.id);
-
-  const choice = group && tier ? resolveLastResetChoice(Date.now(), state.lastResetDraft) : null;
-  const range = choice?.range;
-  elements.lastResetFrom.textContent = range
-    ? formatters.quotaDateTime.format(range.from * 1000)
-    : "—";
-  elements.lastResetTo.textContent = range
-    ? formatters.quotaDateTime.format(range.to * 1000)
-    : "—";
-  elements.lastResetError.textContent = t("filters.lastResetUnavailable");
-  elements.lastResetError.hidden = Boolean(range);
-  elements.applyRange.disabled = !range;
-}
-
 function pickerPreset() {
   return state.rangePresetDraft ?? state.rangePreset;
 }
 
-function renderPastResetEditor() {
-  const history = state.pastResetHistory;
-  const groups = pastResetGroups(history.response);
-  const choice = choosePastReset(groups, state.pastResetDraft);
-  if (!history.loading && !history.error) state.pastResetDraft = choice;
-  const group = groups.find((item) => item.id === choice?.providerKey);
-  const tier = group?.tiers.find((item) => item.id === choice?.tierId);
-  setResetSelectOptions(elements.pastResetProvider, groups.map((item) => ({
-    value: item.id, label: `${item.provider.nodeName || item.provider.nodeId} / ${providerName(item.provider, state.settings)}`,
-  })), choice?.providerKey);
-  setResetSelectOptions(elements.pastResetTier, (group?.tiers || []).map((item) => ({
-    value: item.id, label: `${item.periodLabel} · ${item.metric.label || item.metric.key}`,
-  })), choice?.tierId);
-  const nowMs = Date.now();
-  setResetSelectOptions(elements.pastResetCycle, (tier?.cycles || []).map((cycle) => ({
-    value: cycle.id,
-    label: `${formatters.dateTime.format(cycle.from * 1000)} → ${formatters.dateTime.format(cycle.endAt * 1000)}${cycle.endAt * 1000 > nowMs ? ` · ${t("filters.pastResetCurrent")}` : ""}`,
-  })), choice?.cycleId);
-  const range = resolvePastResetRange(choice?.cycle, nowMs);
-  elements.pastResetFrom.textContent = range ? formatters.dateTime.format(range.from * 1000) : "—";
-  elements.pastResetTo.textContent = range ? formatters.dateTime.format(range.to * 1000) : "—";
-  elements.pastResetStatus.textContent = history.loading ? t("filters.pastResetLoading")
-    : history.error ? t("filters.pastResetFailed") : range ? "" : t("filters.pastResetEmpty");
-  elements.pastResetStatus.hidden = !elements.pastResetStatus.textContent;
-  elements.pastResetRetry.hidden = !history.error;
+function renderLastResetEditor() {
+  const history = state.resetCycleHistory;
+  const groups = resetGroups();
+  const choice = resolveResetCycleChoice(groups, state.lastResetDraft);
+  if (choice.selection) state.lastResetDraft = choice.selection;
+  setResetSelectOptions(elements.lastResetProvider, groups.map(g => ({
+    value: g.id, label: `${g.provider.nodeName || g.provider.nodeId} / ${quotaDisplayName(g.provider)}`,
+  })), choice.group?.id);
+  setResetSelectOptions(elements.lastResetTier, (choice.group?.tiers || []).map(tier => ({
+    value: tier.id, label: `${tier.periodLabel} · ${tier.metric.label || tier.metric.key}`,
+  })), choice.tier?.id);
+  const options = (choice.tier?.cycles || []).map(cycle => ({ value: cycle.id,
+    label: `${formatters.quotaDateTime.format(cycle.from * 1000)} → ${formatters.quotaDateTime.format(cycle.endAt * 1000)}${cycle.endAt > Date.now() / 1000 ? ` · ${t("filters.pastResetCurrent")}` : ""}`,
+  }));
+  if (!choice.cycle) options.unshift({ value: "", label: "—" });
+  setResetSelectOptions(elements.resetCycleSelect, options, choice.cycle?.id || "");
+  elements.resetCycleSelect.disabled = history.loading || history.error || !choice.tier?.cycles.length;
+  for (const [button, mode] of [[elements.resetCycleCurrent, "current"], [elements.resetCycleLast, "last"]]) {
+    button.classList.toggle("active", choice.mode === mode);
+    button.setAttribute("aria-pressed", String(choice.mode === mode));
+  }
+  const range = choice.range;
+  elements.lastResetFrom.textContent = range ? formatters.quotaDateTime.format(range.from * 1000) : "—";
+  elements.lastResetTo.textContent = range ? formatters.quotaDateTime.format(range.to * 1000) : "—";
+  const key = history.loading ? "filters.pastResetLoading" : history.error ? "filters.pastResetFailed"
+    : !range ? (choice.mode === "last" ? "filters.lastCycleUnavailable" : "filters.lastResetUnavailable") : null;
+  elements.lastResetError.textContent = key ? t(key) : "";
+  elements.lastResetError.hidden = !key;
+  elements.resetCycleRetry.hidden = !history.error;
   elements.applyRange.disabled = history.loading || history.error || !range;
 }
 
 function updateRangePickerMode() {
-  const preset = pickerPreset();
-  const lastReset = preset === "last-reset";
-  const pastReset = preset === "past-resets";
-  elements.customRangeEditor.hidden = lastReset || pastReset;
-  for (const input of elements.customRangeEditor.querySelectorAll("input")) input.disabled = lastReset || pastReset;
-  elements.lastResetEditor.hidden = !lastReset;
-  elements.pastResetEditor.hidden = !pastReset;
-  if (lastReset) renderLastResetEditor();
-  else if (pastReset) renderPastResetEditor();
+  const reset = pickerPreset() === "last-reset";
+  $("customRangeTitle").textContent = t(reset ? "filters.rangeLastReset" : "filters.customTitle");
+  $("rangePickerEyebrow").textContent = reset ? "RESET CYCLE" : "CUSTOM RANGE";
+  elements.customRangeEditor.hidden = reset;
+  for (const input of elements.customRangeEditor.querySelectorAll("input")) input.disabled = reset;
+  elements.lastResetEditor.hidden = !reset;
+  if (reset) renderLastResetEditor();
   else elements.applyRange.disabled = false;
   if (state.rangePresetController) elements.applyRange.disabled = true;
 }
@@ -1529,14 +1830,14 @@ function updateRangePickerTrigger() {
   updateRangePickerMode();
 }
 
-function syncRangeInputs() {
+function syncRangeInputs(resetMonth = true) {
   const range = state.rangeDraft || defaultCustomRange();
   updateTimeInputPlaceholders();
   elements.customFromDate.value = dateInputValue(range.from);
   elements.customFromTime.value = timeInputValue(range.from, state.timeFormat);
   elements.customToDate.value = dateInputValue(range.to);
   elements.customToTime.value = timeInputValue(range.to, state.timeFormat);
-  state.rangeCalendarMonth = new Date(new Date(range.from * 1000).getFullYear(), new Date(range.from * 1000).getMonth(), 1);
+  if (resetMonth) state.rangeCalendarMonth = new Date(new Date(range.from * 1000).getFullYear(), new Date(range.from * 1000).getMonth(), 1);
   renderCalendar();
 }
 
@@ -1576,14 +1877,12 @@ function renderCalendar() {
     button.classList.toggle("in-range", day >= new Date(start.getFullYear(), start.getMonth(), start.getDate()) && day <= new Date(end.getFullYear(), end.getMonth(), end.getDate()));
     button.classList.toggle("endpoint", sameLocalDay(day, start) || sameLocalDay(day, end));
     button.addEventListener("click", () => {
-      const draft = readRangeInputs();
-      if (!Number.isFinite(draft.from) || !Number.isFinite(draft.to)) return;
-      const timestamp = setDateKeepTime(state.activeRangeField === "start" ? draft.from : draft.to, day);
-      state.rangeDraft = state.activeRangeField === "start"
-        ? { from: timestamp, to: draft.to }
-        : { from: draft.from, to: timestamp };
-      syncRangeInputs();
-      if (state.activeRangeField === "start") state.activeRangeField = "end";
+      const inputs = readRangeInputs();
+      const draft = Number.isFinite(inputs.from) && Number.isFinite(inputs.to) ? inputs : range;
+      state.rangeDraft = selectCalendarRange(draft, day, state.activeRangeField);
+      state.activeRangeField = state.activeRangeField === "start" ? "end" : "start";
+      elements.customRangeError.hidden = true;
+      syncRangeInputs(false);
     });
     elements.calendarDays.append(button);
   }
@@ -1596,28 +1895,27 @@ function openRangePicker() {
   }
   state.rangePresetDraft = state.rangePreset;
   state.lastResetDraft = state.lastResetSelection ? { ...state.lastResetSelection } : null;
-  state.pastResetDraft = state.pastResetSelection ? structuredClone(state.pastResetSelection) : null;
   state.rangeDraft = { ...(state.customRange || defaultCustomRange()) };
+  state.activeRangeField = "start";
   elements.customRangeError.hidden = true;
   syncRangeInputs();
   updateRangePickerTrigger();
   openDialog(elements.rangePickerDialog, elements.rangePickerTrigger);
-  if (pickerPreset() === "past-resets") pastResetLoader.load();
+  if (pickerPreset() === "last-reset") resetCycleLoader.load();
 }
 
 function closeRangePicker(discard = true) {
   state.rangePresetController?.abort();
   state.rangePresetController = null;
   if (discard) state.rangeDraft = null;
-  pastResetLoader.cancel();
+  resetCycleLoader.cancel();
   state.rangePresetDraft = null;
   state.lastResetDraft = null;
-  state.pastResetDraft = null;
   closeDialog(elements.rangePickerDialog, elements.rangePickerTrigger);
 }
 
 async function setRangePreset(preset) {
-  pastResetLoader.cancel();
+  resetCycleLoader.cancel();
   state.rangePresetController?.abort();
   state.rangePresetController = null;
   if (preset === "all") {
@@ -1633,7 +1931,7 @@ async function setRangePreset(preset) {
       state.rangePreset = "all";
       closeRangePicker();
       updateRangePickerTrigger();
-      refreshAll({ reloadFilters: true });
+      refreshAll({ reloadFilters: true, reason: "range" });
     } catch (error) {
       if (error.name !== "AbortError") showError(error);
     } finally {
@@ -1643,28 +1941,34 @@ async function setRangePreset(preset) {
     }
     return;
   }
-  if (["custom", "last-reset", "past-resets"].includes(preset)) {
+  if (["custom", "last-reset"].includes(preset)) {
+    if (preset === "last-reset" && pickerPreset() !== "last-reset") {
+      state.lastResetDraft = { ...state.lastResetSelection, mode: "current", cycleId: null, cycle: null };
+    }
     state.rangePresetDraft = preset;
     if (preset === "custom") {
       state.rangeDraft = { ...(state.customRange || defaultCustomRange()) };
+      state.activeRangeField = "start";
       syncRangeInputs();
     }
     updateRangePickerTrigger();
-    if (preset === "past-resets") pastResetLoader.load();
+    if (preset === "last-reset") resetCycleLoader.load();
     return;
   }
   state.rangePreset = preset;
   state.rangeDraft = null;
   closeRangePicker();
   updateRangePickerTrigger();
-  refreshAll({ reloadFilters: true });
+  refreshAll({ reloadFilters: true, reason: "range" });
 }
 
 function bucketTrigger() { return state.bucketTarget === "quota" ? $("quotaBucketTrigger") : elements.trendBucketTrigger; }
 function updateBucketPicker() {
-  elements.trendBucketLabel.textContent = state.trendBucket === "auto" ? t("trend.bucketAuto") : bucketDisplayLabel(state.trendBucket);
-  $("quotaGranularityLabel").textContent = state.quotaGranularity === "auto" ? t("trend.bucketAuto") : bucketDisplayLabel(state.quotaGranularity);
-  const bucket = state.bucketTarget === "quota" ? state.quotaGranularity : state.trendBucket;
+  elements.trendBucketLabel.textContent = state.chartBucket === "auto" ? t("trend.bucketAuto") : bucketDisplayLabel(state.chartBucket);
+  elements.trendBucketTrigger.title = elements.trendBucketLabel.textContent;
+  $("quotaGranularityLabel").textContent = state.chartBucket === "auto" ? t("trend.bucketAuto") : bucketDisplayLabel(state.chartBucket);
+  $("quotaBucketTrigger").title = $("quotaGranularityLabel").textContent;
+  const bucket = state.chartBucket;
   for (const button of elements.bucketPresetOptions.querySelectorAll("[data-bucket]")) {
     const active = button.dataset.bucket === bucket;
     button.classList.toggle("active", active);
@@ -1686,10 +1990,11 @@ function openBucketPicker(target = "trend") {
 }
 function closeBucketPicker() { closeDialog(elements.bucketPickerDialog, bucketTrigger()); }
 function setTrendBucket(bucket) {
-  const quota = state.bucketTarget === "quota";
-  if (quota) state.quotaGranularity = bucket; else state.trendBucket = bucket;
+  state.chartBucket = bucket;
   updateBucketPicker(); closeBucketPicker();
-  (quota ? refreshQuota() : refreshOverview()).catch((error) => { if (error.name !== "AbortError") showError(error); });
+  const range = state.overview?.range || selectedRange();
+  // Both endpoints share the same bucket choice, including Auto.
+  Promise.allSettled([refreshOverview(undefined, range), refreshQuota(undefined, range)]);
 }
 
 function updateFilterPlaceholders() {
@@ -1726,6 +2031,9 @@ function applyTranslations() {
   }
   for (const element of document.querySelectorAll("[data-i18n-aria-label]")) {
     element.setAttribute("aria-label", t(element.dataset.i18nAriaLabel));
+  }
+  for (const element of document.querySelectorAll("[data-i18n-title]")) {
+    element.title = t(element.dataset.i18nTitle);
   }
   elements.languageToggle.textContent = t("language.switchShort");
   elements.languageToggle.setAttribute("aria-label", t("language.switch"));
@@ -1770,7 +2078,7 @@ elements.languageToggle.addEventListener("click", () => {
   applyTranslations();
 });
 
-elements.refreshButton.addEventListener("click", () => refreshAll({ reloadFilters: true }));
+elements.refreshButton.addEventListener("click", () => refreshAll({ reloadFilters: true, revalidate: true }));
 elements.rangePickerTrigger.addEventListener("click", openRangePicker);
 elements.rangePresetOptions.addEventListener("click", (event) => {
   const button = event.target.closest("[data-range-preset]");
@@ -1780,21 +2088,11 @@ elements.rangePickerForm.addEventListener("submit", (event) => {
   event.preventDefault();
   let range;
   const preset = pickerPreset();
-  if (preset === "past-resets") {
-    if (state.pastResetHistory.loading || state.pastResetHistory.error) return;
-    range = resolvePastResetRange(state.pastResetDraft?.cycle);
-    if (!range) { renderPastResetEditor(); return; }
-    state.pastResetSelection = structuredClone(state.pastResetDraft);
-  } else if (preset === "last-reset") {
+  if (preset === "last-reset") {
+    if (state.resetCycleHistory.loading || state.resetCycleHistory.error) return;
     const choice = resolveLastResetChoice(Date.now(), state.lastResetDraft);
-    if (!choice?.range) {
-      renderLastResetEditor();
-      return;
-    }
-    state.lastResetSelection = {
-      providerKey: providerIdentity(choice.group.provider),
-      tierId: choice.tier.id,
-    };
+    if (!choice.range) { renderLastResetEditor(); return; }
+    state.lastResetSelection = structuredClone(choice.selection);
     range = choice.range;
   } else {
     range = readRangeInputs();
@@ -1806,37 +2104,36 @@ elements.rangePickerForm.addEventListener("submit", (event) => {
       return;
     }
   }
-  state.customRange = range;
-  state.rangePreset = ["last-reset", "past-resets"].includes(preset) ? preset : "custom";
+  if (preset !== "last-reset") state.customRange = range;
+  state.rangePreset = preset === "last-reset" ? preset : "custom";
   state.rangeDraft = null;
   closeRangePicker(false);
   updateRangePickerTrigger();
-  refreshAll({ reloadFilters: true });
+  refreshAll({ reloadFilters: true, reason: "range" });
 });
+function changeResetIdentity() {
+  const mode = state.lastResetDraft?.mode === "last" ? "last" : "current";
+  state.lastResetDraft = { providerKey: elements.lastResetProvider.value,
+    tierId: elements.lastResetTier.value, mode };
+  renderLastResetEditor();
+}
 elements.lastResetProvider.addEventListener("change", () => {
-  state.lastResetDraft = { providerKey: elements.lastResetProvider.value, tierId: null };
+  state.lastResetDraft = { providerKey: elements.lastResetProvider.value,
+    mode: state.lastResetDraft?.mode === "last" ? "last" : "current" };
   renderLastResetEditor();
 });
-elements.lastResetTier.addEventListener("change", () => {
-  state.lastResetDraft = {
-    providerKey: elements.lastResetProvider.value,
-    tierId: elements.lastResetTier.value,
-  };
+elements.lastResetTier.addEventListener("change", changeResetIdentity);
+for (const [button, mode] of [[elements.resetCycleCurrent, "current"], [elements.resetCycleLast, "last"]]) {
+  button.addEventListener("click", () => {
+    state.lastResetDraft = { ...state.lastResetDraft, mode, cycleId: null, cycle: null };
+    renderLastResetEditor();
+  });
+}
+elements.resetCycleSelect.addEventListener("change", () => {
+  state.lastResetDraft = { ...state.lastResetDraft, mode: "manual", cycleId: elements.resetCycleSelect.value };
   renderLastResetEditor();
 });
-elements.pastResetProvider.addEventListener("change", () => {
-  state.pastResetDraft = { providerKey: elements.pastResetProvider.value };
-  renderPastResetEditor();
-});
-elements.pastResetTier.addEventListener("change", () => {
-  state.pastResetDraft = { providerKey: elements.pastResetProvider.value, tierId: elements.pastResetTier.value };
-  renderPastResetEditor();
-});
-elements.pastResetCycle.addEventListener("change", () => {
-  state.pastResetDraft = { ...state.pastResetDraft, cycleId: elements.pastResetCycle.value };
-  renderPastResetEditor();
-});
-elements.pastResetRetry.addEventListener("click", () => pastResetLoader.load());
+elements.resetCycleRetry.addEventListener("click", () => resetCycleLoader.load());
 elements.closeRangePicker.addEventListener("click", () => closeRangePicker());
 elements.cancelRange.addEventListener("click", () => closeRangePicker());
 elements.rangePickerDialog.addEventListener("cancel", (event) => {
@@ -1861,9 +2158,11 @@ for (const input of [elements.customFromDate, elements.customFromTime, elements.
   });
 }
 for (const field of elements.rangePickerForm.querySelectorAll("[data-range-field]")) {
-  field.addEventListener("click", () => {
+  const activate = () => {
     state.activeRangeField = field.dataset.rangeField;
-  });
+  };
+  field.addEventListener("click", activate);
+  field.addEventListener("focusin", activate);
 }
 elements.trendBucketTrigger.addEventListener("click", () => openBucketPicker("trend"));
 $("quotaBucketTrigger").addEventListener("click", () => openBucketPicker("quota"));
@@ -1878,6 +2177,7 @@ elements.bucketPickerDialog.addEventListener("cancel", (event) => {
 });
 document.addEventListener("pointerdown", (event) => {
   const pickers = [
+    [$("historyReferenceDialog"), $("historyReferenceEdit"), closeHistoryDialog],
     [elements.rangePickerDialog, elements.rangePickerTrigger, closeRangePicker],
     [elements.bucketPickerDialog, bucketTrigger(), closeBucketPicker],
   ];
@@ -1905,9 +2205,81 @@ elements.rangePickerForm.addEventListener("invalid", () => {
 }, true);
 
 for (const select of [elements.nodeFilter, elements.appFilter, elements.providerFilter, elements.modelFilter, elements.sourceFilter]) {
-  select.addEventListener("change", () => refreshAll());
+  select.addEventListener("change", () => refreshAll({ reason: "filters" }));
 }
 
+$("trendCompare").addEventListener("change", () => {
+  const comparison = state.comparison;
+  comparison.enabled = $("trendCompare").checked;
+  chartInstances.trend?.clear();
+  if (comparison.enabled) {
+    comparison.savedMetric = elements.trendMetric.value;
+    elements.trendMetric.value = "totalCostUsd";
+    state.trendCumulative = true;
+    comparison.selection = state.lastResetSelection ? { ...state.lastResetSelection } : null;
+    comparison.estimatedQuota = true;
+    comparison.predictDefaultPending = selectedRangeIncludesNow();
+  } else {
+    comparison.predictDefaultPending = null;
+    historyQuotaLoader.cancel(); closeHistoryDialog();
+    estimatedQuotaLoader.cancel();
+    elements.trendMetric.value = comparison.savedMetric || "realTotalTokens";
+  }
+  renderTrend();
+  if (state.chartBucket === "auto") {
+    // Only Usage needs new aggregation when switching Auto mode. Reuse Quota.
+    refreshOverview(undefined, state.quota?.range || state.overview?.range || selectedRange())
+      .catch((error) => { if (error.name !== "AbortError") showError(error); });
+  }
+});
+$("comparisonProvider").addEventListener("change", () => {
+  state.comparison.selection = { providerKey: $("comparisonProvider").value, tierId: "" };
+  renderTrend();
+});
+$("comparisonTier").addEventListener("change", () => {
+  state.comparison.selection = { providerKey: $("comparisonProvider").value, tierId: $("comparisonTier").value };
+  renderTrend();
+});
+$("comparisonPredict").addEventListener("change", () => {
+  const key = comparisonPredictionId();
+  if (!key) return;
+  setQuotaPrediction(key, $("comparisonPredict").checked);
+  renderQuota();
+});
+$("comparisonEstimatedQuota").addEventListener("change", () => {
+  state.comparison.estimatedQuota = $("comparisonEstimatedQuota").checked;
+  if (!state.comparison.estimatedQuota) estimatedQuotaLoader.cancel();
+  renderTrend();
+});
+$("historyReferenceEdit").addEventListener("click", openHistoryDialog);
+$("historyReferenceCancel").addEventListener("click", closeHistoryDialog);
+$("historyReferenceDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeHistoryDialog(); });
+$("historyReferenceDialog").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") { event.preventDefault(); closeHistoryDialog(); }
+});
+$("historyReferenceSource").addEventListener("change", () => {
+  historyDraft.mode = $("historyReferenceSource").value; renderHistoryDialog();
+});
+$("historyReferenceAmount").addEventListener("input", () => {
+  historyDraft.amount = $("historyReferenceAmount").value; renderHistoryDialog();
+});
+$("historyReferenceCycle").addEventListener("change", () => {
+  historyDraft.cycleId = $("historyReferenceCycle").value;
+  historyDraft.identity = historyIdentity(historyContext()); renderHistoryDialog();
+});
+$("historyReferenceRetry").addEventListener("click", () => {
+  historyQuotaService.invalidate(); historyPreviewLoader.cancel(); historyQuotaLoader.cancel();
+  renderHistoryDialog(); renderTrend();
+});
+$("historyReferenceForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const context = historyContext();
+  if (!historyDraft || (historyDraft.mode !== "none"
+    && (!context || !historyPreviewLoader.ensure(context, historyDraft).reference))) return;
+  state.comparison.historyConfig = { ...historyDraft };
+  state.comparison.historyEnabled = historyDraft.mode !== "none";
+  closeHistoryDialog(); renderTrend();
+});
 elements.trendMetric.addEventListener("change", renderTrend);
 elements.trendCumulative.addEventListener("change", () => {
   state.trendCumulative = elements.trendCumulative.checked;
@@ -1931,6 +2303,12 @@ elements.breakdownTabs.addEventListener("click", (event) => {
   }
   renderBreakdown();
 });
+for (const id of ["eventTierFilter", "eventEffortFilter"]) {
+  $(id).addEventListener("change", () => {
+    state.eventCursor = null; state.events = []; renderEventRows([], false); elements.loadMore.hidden = true;
+    resource("events", (signal) => loadEvents({ signal }), () => {}).catch((error) => { if (error.name !== "AbortError") showError(error); });
+  });
+}
 elements.loadMore.addEventListener("click", () => loadEvents({ append: true }).catch(showError));
 
 document.addEventListener("visibilitychange", () => {
@@ -1942,7 +2320,6 @@ updateBucketPicker();
 applyTheme();
 applyTranslations();
 if (typeof ResizeObserver === "function") {
-  new ResizeObserver(syncBrandMarkSize).observe(elements.brandLockup);
   const chartResizeObserver = new ResizeObserver(() => {
     requestAnimationFrame(resizeCharts);
   });
@@ -1951,10 +2328,8 @@ if (typeof ResizeObserver === "function") {
   }
 }
 window.addEventListener("resize", () => {
-  syncBrandMarkSize();
   resizeCharts();
 });
-syncBrandMarkSize();
 initializeDashboard().catch(showError);
 setInterval(() => {
   if (!document.hidden) refreshAll();

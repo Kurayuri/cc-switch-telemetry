@@ -3,6 +3,12 @@ export const DAY_SECONDS = 24 * 60 * 60;
 export const MAX_RANGE_DAYS = 720;
 export const MAX_RANGE_SECONDS = MAX_RANGE_DAYS * DAY_SECONDS;
 
+export function rangeIncludesNow(range, nowMs = Date.now()) {
+  const now = Math.floor(nowMs / 1000);
+  return Number.isFinite(range?.from) && Number.isFinite(range?.to)
+    && range.from <= now && now <= range.to;
+}
+
 export const RANGE_PRESETS = ["today", "1h", "24h", "7d", "14d", "30d", "1y", "last-reset", "all"];
 
 export const BUCKET_PRESETS = [
@@ -31,10 +37,10 @@ export function addLocalDaysMs(timestampMs, days) {
 }
 
 export function defaultCustomRange(nowMs = Date.now()) {
-  const endMs = startOfLocalDayMs(nowMs);
+  const startMs = startOfLocalDayMs(nowMs);
   return {
-    from: Math.floor(addLocalDaysMs(endMs, -1) / 1000),
-    to: Math.floor(endMs / 1000),
+    from: Math.floor(startMs / 1000),
+    to: Math.floor(addLocalDaysMs(startMs, 1) / 1000) - 1,
   };
 }
 
@@ -103,60 +109,60 @@ export function timeInputValue(timestamp, timeFormat = "24h") {
   const date = new Date(Number(timestamp) * 1000);
   if (timeFormat === "12h") {
     const hour = date.getHours();
-    return `${pad(hour % 12 || 12)}:${pad(date.getMinutes())} ${hour >= 12 ? "PM" : "AM"}`;
+    return `${pad(hour % 12 || 12)}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${hour >= 12 ? "PM" : "AM"}`;
   }
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function parseTimeParts(timeValue, timeFormat) {
   const value = String(timeValue || "").trim();
   if (timeFormat === "12h") {
-    const match = value.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    const match = value.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)$/i);
     if (!match) return null;
     const hour = Number(match[1]);
     const minute = Number(match[2]);
-    if (hour < 1 || hour > 12 || minute > 59) return null;
-    const meridiem = match[3].toUpperCase();
-    return [hour % 12 + (meridiem === "PM" ? 12 : 0), minute];
+    const second = Number(match[3] || 0);
+    if (hour < 1 || hour > 12 || minute > 59 || second > 59) return null;
+    const meridiem = match[4].toUpperCase();
+    return [hour % 12 + (meridiem === "PM" ? 12 : 0), minute, second];
   }
-  const match = value.match(/^(\d{1,2}):(\d{2})$/);
+  const match = value.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
   if (!match) return null;
   const hour = Number(match[1]);
   const minute = Number(match[2]);
-  return hour <= 23 && minute <= 59 ? [hour, minute] : null;
+  const second = Number(match[3] || 0);
+  return hour <= 23 && minute <= 59 && second <= 59 ? [hour, minute, second] : null;
 }
 
 export function timeInputPlaceholder(timeFormat = "24h") {
-  return timeFormat === "12h" ? "hh:mm AM/PM" : "HH:mm";
+  return timeFormat === "12h" ? "hh:mm:ss AM/PM" : "HH:mm:ss";
 }
 
 export function parseDateTimeParts(dateValue, timeValue, timeFormat = "24h") {
   const [year, month, day] = String(dateValue).split("-").map(Number);
   const time = parseTimeParts(timeValue, timeFormat);
   if (!time || ![year, month, day].every(Number.isFinite)) return NaN;
-  const [hour, minute] = time;
-  const date = new Date(year, month - 1, day, hour, minute, 0, 0);
+  const [hour, minute, second] = time;
+  const date = new Date(year, month - 1, day, hour, minute, second, 0);
   if (
     date.getFullYear() !== year ||
     date.getMonth() !== month - 1 ||
     date.getDate() !== day ||
     date.getHours() !== hour ||
-    date.getMinutes() !== minute
+    date.getMinutes() !== minute ||
+    date.getSeconds() !== second
   ) return NaN;
   return Math.floor(date.getTime() / 1000);
 }
 
-export function setDateKeepTime(timestamp, day) {
-  const base = new Date(Number(timestamp) * 1000);
-  return Math.floor(new Date(
-    day.getFullYear(),
-    day.getMonth(),
-    day.getDate(),
-    base.getHours(),
-    base.getMinutes(),
-    0,
-    0,
-  ).getTime() / 1000);
+export function selectCalendarRange(range, day, field) {
+  const selected = defaultCustomRange(day.getTime());
+  if (field === "start") {
+    const end = defaultCustomRange(range.to * 1000).to;
+    return { from: selected.from, to: Math.max(selected.to, end) };
+  }
+  const start = defaultCustomRange(range.from * 1000);
+  return { from: Math.min(start.from, selected.from), to: Math.max(start.to, selected.to) };
 }
 
 export function sameLocalDay(left, right) {

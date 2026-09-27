@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   filterQuotaProviders,
+  estimatedQuota,
   quotaAmount,
   quotaAmountRange,
   quotaExhaustion,
@@ -19,6 +20,21 @@ import {
 const predictionPoints = (values) => values.map(([sampledAt, utilizationPercent, extra = {}]) => ({
   sampledAt, utilizationPercent, ...extra,
 }));
+
+test("estimated quota scales the page cost by used percentage", () => {
+  assert.equal(estimatedQuota({ utilizationPercent: 25 }, 20), 80);
+  assert.equal(estimatedQuota({ used: 1, total: 4 }, 20), 80);
+  assert.equal(estimatedQuota({ remaining: 3, total: 4 }, 20), 80);
+  assert.equal(estimatedQuota({ utilizationPercent: 100 }, 20), 20);
+  assert.equal(estimatedQuota({ utilizationPercent: 25 }, 0), 0);
+  for (const cost of [null, undefined, "", NaN, Infinity]) {
+    assert.equal(estimatedQuota({ utilizationPercent: 25 }, cost), null);
+  }
+  for (const metric of [{}, { utilizationPercent: 0 }, { remaining: 4 }]) {
+    assert.equal(estimatedQuota(metric, 20), null);
+  }
+  assert.equal(estimatedQuota({ utilizationPercent: 0.001 }, Number.MAX_VALUE), null);
+});
 
 test("exhaustion time stays separate from the reset-clipped prediction line", () => {
   for (const reset of [300, 540, 900]) {

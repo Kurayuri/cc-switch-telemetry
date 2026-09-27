@@ -5,7 +5,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{Datelike, TimeZone};
@@ -26,6 +26,8 @@ const DASHBOARD_JS: &str = include_str!("../web/app.js");
 const DASHBOARD_CHARTS_JS: &str = include_str!("../web/charts.js");
 const DASHBOARD_I18N_JS: &str = include_str!("../web/i18n.js");
 const DASHBOARD_RANGE_JS: &str = include_str!("../web/range.js");
+const DASHBOARD_HISTORY_QUOTA_JS: &str = include_str!("../web/history-quota.js");
+const DASHBOARD_ESTIMATED_QUOTA_JS: &str = include_str!("../web/estimated-quota.js");
 const DASHBOARD_PAST_RESETS_JS: &str = include_str!("../web/past-resets.js");
 const DASHBOARD_QUOTA_JS: &str = include_str!("../web/quota-view.js");
 const ECHARTS_JS: &str = include_str!("../web/vendor/echarts.esm.min.mjs");
@@ -122,8 +124,7 @@ impl Bucket {
         for seconds in [
             2_592_000, 86_400, 43_200, 21_600, 7_200, 3_600, 1_800, 900, 300, 60, 1,
         ] {
-            let points = (duration + seconds - 1) / seconds;
-            if points >= 10 {
+            if (duration + seconds - 1) / seconds >= 20 {
                 return Self::from_seconds(seconds);
             }
         }
@@ -188,6 +189,7 @@ pub struct SummaryResponse {
     pub real_total_tokens: i64,
     pub cache_hit_rate: f64,
     pub total_cost_usd: f64,
+    pub unadjusted_cost_requests: i64,
     pub avg_latency_ms: f64,
 }
 
@@ -214,6 +216,7 @@ pub struct TrendPoint {
     pub output_tokens: i64,
     pub real_total_tokens: i64,
     pub total_cost_usd: f64,
+    pub unadjusted_cost_requests: i64,
     pub avg_latency_ms: f64,
 }
 
@@ -226,6 +229,7 @@ struct TrendAggregate {
     cache_read_tokens: i64,
     output_tokens: i64,
     total_cost_usd: f64,
+    unadjusted_cost_requests: i64,
     latency_total_ms: f64,
 }
 
@@ -245,6 +249,7 @@ impl TrendAggregate {
             output_tokens: self.output_tokens,
             real_total_tokens: input_tokens + self.output_tokens,
             total_cost_usd: self.total_cost_usd,
+            unadjusted_cost_requests: self.unadjusted_cost_requests,
             avg_latency_ms: if self.total_requests > 0 {
                 self.latency_total_ms / self.total_requests as f64
             } else {
@@ -272,6 +277,7 @@ pub struct BreakdownItem {
     pub success_rate: f64,
     pub real_total_tokens: i64,
     pub total_cost_usd: f64,
+    pub unadjusted_cost_requests: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -303,6 +309,8 @@ pub struct EventsQuery {
     pub provider_id: Option<String>,
     pub model: Option<String>,
     pub data_source: Option<String>,
+    pub service_tier: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub limit: Option<usize>,
     pub before_created_at: Option<i64>,
     pub before_event_id: Option<String>,
@@ -326,6 +334,10 @@ pub struct EventCursor {
 #[serde(rename_all = "camelCase")]
 pub struct EventItem {
     pub event_id: String,
+    pub service_tier: Option<String>,
+    pub service_tier_source: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier_pricing_version: Option<i64>,
     pub request_id: String,
     pub created_at: i64,
     pub node_id: String,
@@ -341,6 +353,7 @@ pub struct EventItem {
     pub cache_creation_tokens: i64,
     pub real_total_tokens: i64,
     pub total_cost_usd: f64,
+    pub unadjusted_cost_requests: i64,
     pub latency_ms: i64,
     pub status_code: i64,
     pub is_streaming: bool,
@@ -458,6 +471,7 @@ fn resolve_query_with_history(
     }
     let bucket = match query.bucket.as_deref().unwrap_or("auto") {
         "auto" => Bucket::auto_for_range(to - from),
+        "quota-auto" => Bucket::from_seconds(crate::quota::automatic_bucket_seconds(to - from)),
         value => parse_bucket(value)?,
     };
     let estimated_points = (to - from + bucket.seconds() - 1) / bucket.seconds();
@@ -486,7 +500,7 @@ fn open_read_connection(path: &Path) -> anyhow::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     connection.busy_timeout(Duration::from_secs(2))?;
-    connection.execute_batch("PRAGMA query_only=ON;")?;
+    connection.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
     Ok(connection)
 }
 
@@ -549,7 +563,7 @@ fn fresh_input_sql(alias: &str) -> String {
     cc_switch_usage_core::sql::fresh_input(alias)
 }
 
-fn sql_string_literal(value: &str) -> String {
+pub(crate) fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
@@ -558,23 +572,82 @@ fn billing_cost_sql(
     model_expression: &str,
     multipliers: &[crate::settings::ModelBillingMultiplier],
 ) -> String {
+    billing_projection_sql(alias, model_expression, multipliers).0
+}
+
+// Allocate the original amount by reference-price weights. All-one factors
+// return the original amount exactly, even without a reference snapshot.
+pub(crate) fn billing_projection_sql(
+    alias: &str,
+    model_expression: &str,
+    multipliers: &[crate::settings::ModelBillingMultiplier],
+) -> (String, String) {
+    use crate::settings::BillingMode;
     let base = format!("CAST({alias}.total_cost_usd AS REAL)");
-    let cases = multipliers
-        .iter()
-        .filter(|entry| entry.multiplier != 1.0)
-        .map(|entry| {
-            format!(
-                "WHEN {model_expression} = {} THEN {base} * {}",
-                sql_string_literal(&entry.model),
+    let mut costs = Vec::new();
+    let mut unavailable = Vec::new();
+    for entry in multipliers {
+        let factors = entry.factors();
+        if factors.iter().all(|factor| *factor == 1.0) {
+            continue;
+        }
+        let model = sql_string_literal(&entry.model);
+        if entry.mode == BillingMode::Overall {
+            costs.push(format!(
+                "WHEN {model_expression}={model} THEN {base} * {}",
                 entry.multiplier
-            )
-        })
-        .collect::<Vec<_>>();
-    if cases.is_empty() {
-        base.clone()
-    } else {
-        format!("CASE {} ELSE {base} END", cases.join(" "))
+            ));
+            continue;
+        }
+        let tokens = [
+            if alias == "c" {
+                format!("MAX(0,{alias}.input_tokens)")
+            } else {
+                fresh_input_sql(alias)
+            },
+            format!("MAX(0,{alias}.cache_creation_tokens)"),
+            format!("MAX(0,{alias}.cache_read_tokens)"),
+            format!("MAX(0,{alias}.output_tokens)"),
+        ];
+        let prices = entry
+            .reference_pricing
+            .as_ref()
+            .map(|p| p.prices())
+            .unwrap_or([None; 4]);
+        let mut valid = Vec::new();
+        let mut weights = Vec::new();
+        let mut adjusted = Vec::new();
+        for ((tokens, price), factor) in tokens.iter().zip(prices).zip(factors) {
+            if price.is_none() {
+                valid.push(format!("({tokens})=0"));
+            }
+            let weight = format!("(CAST(({tokens}) AS REAL)*{})", price.unwrap_or(0.0));
+            adjusted.push(format!("({weight}*{factor})"));
+            weights.push(weight);
+        }
+        let denominator = format!("({})", weights.join("+"));
+        let numerator = format!("({})", adjusted.join("+"));
+        valid.push(format!(
+            "{denominator}>0 AND {denominator}<1.0e308 AND {numerator}<1.0e308"
+        ));
+        let valid = valid.join(" AND ");
+        costs.push(format!("WHEN {model_expression}={model} THEN CASE WHEN {valid} THEN {base}*({numerator}/{denominator}) ELSE {base} END"));
+        unavailable.push(format!(
+            "WHEN {model_expression}={model} THEN CASE WHEN {valid} THEN 0 ELSE 1 END"
+        ));
     }
+    (
+        if costs.is_empty() {
+            base.clone()
+        } else {
+            format!("CASE {} ELSE {base} END", costs.join(" "))
+        },
+        if unavailable.is_empty() {
+            "0".into()
+        } else {
+            format!("CASE {} ELSE 0 END", unavailable.join(" "))
+        },
+    )
 }
 
 fn accounting_source(query: &ResolvedQuery, include_rollups: bool, use_cache: bool) -> String {
@@ -587,10 +660,17 @@ fn accounting_source_with_multipliers(
     use_cache: bool,
     multipliers: &[crate::settings::ModelBillingMultiplier],
 ) -> String {
+    // Component costs are aggregated only after exact per-event projection.
     let fresh = cc_switch_usage_core::sql::fresh_input("d");
     let app = cc_switch_usage_core::sql::folded_app_type("d.app_type");
     let model = cc_switch_usage_core::sql::effective_model("d");
-    let detail_cost = billing_cost_sql("d", &model, multipliers);
+    let (detail_cost, detail_unadjusted) =
+        crate::billing_cache::projection_sql("d", &model, multipliers);
+    let valid_hour = crate::billing_cache::valid_hour_sql(
+        "cache_partition.node_id",
+        "cache_partition.hour_start",
+        multipliers,
+    );
     let detail_projection = format!(
         "SELECT d.node_id,d.created_at,{app} AS app_type,d.app_type AS provider_app_type,
                 d.provider_id,{model} AS model,d.request_model,d.pricing_model,
@@ -601,7 +681,8 @@ fn accounting_source_with_multipliers(
                 CASE WHEN d.status_code>=200 AND d.status_code<300 THEN 1 ELSE 0 END AS success_count,
                 CAST(d.latency_ms AS REAL) AS latency_total_ms,
                 d.created_at + 1 AS day_end_utc,0 AS source_class,
-                d.created_at AS first_event_at,d.created_at AS last_event_at"
+                d.created_at AS first_event_at,d.created_at AS last_event_at,
+                {detail_unadjusted} AS billing_unadjusted"
     );
     let full_start = if query.from.rem_euclid(crate::usage_cache::HOUR_SECONDS) == 0 {
         query.from
@@ -626,7 +707,7 @@ fn accounting_source_with_multipliers(
                ON d.node_id=cache_partition.node_id
               AND d.created_at>=cache_partition.hour_start
               AND d.created_at<cache_partition.hour_start+3600
-             WHERE cache_partition.state='dirty'
+             WHERE (cache_partition.state='dirty' OR NOT ({valid_hour}))
                AND cache_partition.hour_start>={full_start}
                AND cache_partition.hour_start<{full_end}"
         ));
@@ -645,7 +726,10 @@ fn accounting_source_with_multipliers(
             query.from, query.to
         )
     };
-    let cache_cost = billing_cost_sql("c", "c.model", multipliers);
+    let ordinary_cost = billing_cost_sql("c", "c.model", multipliers);
+    let cache_cost = format!(
+        "CASE WHEN c.billing_signature='base' THEN {ordinary_cost} ELSE c.adjusted_cost END"
+    );
     let cache = if use_cache {
         format!(
             " UNION ALL
@@ -655,14 +739,14 @@ fn accounting_source_with_multipliers(
                      CASE WHEN c.request_count>0
                           THEN c.latency_total_ms/c.request_count ELSE 0 END,
                      200,0,c.data_source,c.request_count,c.success_count,c.latency_total_ms,
-                     c.hour_start+3600,2,c.first_event_at,c.last_event_at
+                     c.hour_start+3600,2,c.first_event_at,c.last_event_at,c.unadjusted_requests
               FROM usage_cache_partitions AS cache_partition
                    INDEXED BY idx_usage_cache_partitions_state
               JOIN usage_hourly_cache AS c
                 ON cache_partition.node_id=c.node_id
                AND cache_partition.hour_start=c.hour_start
                AND cache_partition.state='clean'
-              WHERE c.hour_start>={full_start} AND c.hour_start<{full_end} "
+              WHERE c.hour_start>={full_start} AND c.hour_start<{full_end} AND {valid_hour} "
         )
     } else {
         String::new()
@@ -672,7 +756,7 @@ fn accounting_source_with_multipliers(
     }
     let rollup_app = cc_switch_usage_core::sql::folded_app_type("r.app_type");
     let rollup_model = cc_switch_usage_core::sql::effective_model("r");
-    let rollup_cost = billing_cost_sql("r", &rollup_model, multipliers);
+    let (rollup_cost, rollup_unadjusted) = billing_projection_sql("r", &rollup_model, multipliers);
     format!(
         "({detail}{cache}
          UNION ALL
@@ -682,7 +766,7 @@ fn accounting_source_with_multipliers(
                 r.cache_read_tokens,r.cache_creation_tokens,r.input_token_semantics,
                 {rollup_cost},r.avg_latency_ms,200,0,'rollup',r.request_count,
                 r.success_count,CAST(r.avg_latency_ms AS REAL)*r.request_count,
-                r.day_end_utc,1,r.day_start_utc,r.day_end_utc-1
+                r.day_end_utc,1,r.day_start_utc,r.day_end_utc-1,({rollup_unadjusted})*r.request_count
          FROM usage_daily_snapshots r)"
     )
 }
@@ -770,6 +854,7 @@ fn summary_from_row(
             real_total_tokens,
             cache_hit_rate: ratio(cache_read_tokens, cacheable),
             total_cost_usd: row.get(7)?,
+            unadjusted_cost_requests: row.get(13)?,
             avg_latency_ms: row.get(8)?,
         },
         CoverageResponse {
@@ -829,7 +914,8 @@ fn query_overview_with_multipliers(
                 MIN(l.first_event_at),
                 MAX(l.last_event_at),
                 COALESCE(MAX(CASE WHEN l.source_class IN (0,2) THEN 1 ELSE 0 END),0),
-                COALESCE(MAX(CASE WHEN l.source_class=1 THEN 1 ELSE 0 END),0)
+                COALESCE(MAX(CASE WHEN l.source_class=1 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(l.billing_unadjusted),0)
          FROM {source} l WHERE {where_sql}"
     );
     let (summary, coverage) = connection.query_row(
@@ -944,7 +1030,8 @@ fn query_trend_with_multipliers(
                 COALESCE(SUM(l.cache_read_tokens), 0),
                 COALESCE(SUM(l.output_tokens), 0),
                 COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0.0),
-                COALESCE(SUM(l.latency_total_ms), 0.0)
+                COALESCE(SUM(l.latency_total_ms), 0.0),
+                COALESCE(SUM(l.billing_unadjusted),0)
          FROM {source} l
          WHERE {where_sql}
          GROUP BY 1
@@ -963,6 +1050,7 @@ fn query_trend_with_multipliers(
                 output_tokens: row.get(6)?,
                 total_cost_usd: row.get(7)?,
                 latency_total_ms: row.get(8)?,
+                unadjusted_cost_requests: row.get(9)?,
             },
         ))
     })?;
@@ -1043,7 +1131,8 @@ fn query_breakdown_with_multipliers(
                 COALESCE(SUM(l.success_count),0),
                 COALESCE(SUM({real_total}), 0),
                 COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0.0),
-                COALESCE(SUM({fresh_input}), 0)
+                COALESCE(SUM({fresh_input}), 0),
+                COALESCE(SUM(l.billing_unadjusted),0)
          FROM {source} l
          LEFT JOIN nodes n ON n.uuid = l.node_id
          WHERE {where_sql}
@@ -1064,6 +1153,7 @@ fn query_breakdown_with_multipliers(
             success_rate: percentage(successful, requests),
             real_total_tokens: row.get(4)?,
             total_cost_usd: row.get(5)?,
+            unadjusted_cost_requests: row.get(7)?,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1085,7 +1175,8 @@ fn query_provider_breakdown_with_multipliers(
                 COALESCE(SUM(l.success_count),0),
                 COALESCE(SUM({real_total}), 0),
                 COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0.0),
-                COALESCE(SUM({fresh_input}), 0)
+                COALESCE(SUM({fresh_input}), 0),
+                COALESCE(SUM(l.billing_unadjusted),0)
          FROM {source} l
          LEFT JOIN provider_catalog p
            ON p.node_id = l.node_id
@@ -1107,6 +1198,7 @@ fn query_provider_breakdown_with_multipliers(
             success_rate: percentage(successful, requests),
             real_total_tokens: row.get(4)?,
             total_cost_usd: row.get(5)?,
+            unadjusted_cost_requests: row.get(7)?,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1178,6 +1270,7 @@ fn query_events(
     query_events_with_multipliers(path, query, limit, before, &[])
 }
 
+#[cfg(test)]
 fn query_events_with_multipliers(
     path: &Path,
     query: ResolvedQuery,
@@ -1185,17 +1278,44 @@ fn query_events_with_multipliers(
     before: Option<(i64, String)>,
     multipliers: &[crate::settings::ModelBillingMultiplier],
 ) -> anyhow::Result<EventsResponse> {
+    query_events_with_metadata(path, query, limit, before, multipliers, &None, &None)
+}
+
+fn query_events_with_metadata(
+    path: &Path,
+    query: ResolvedQuery,
+    limit: usize,
+    before: Option<(i64, String)>,
+    multipliers: &[crate::settings::ModelBillingMultiplier],
+    service_tier: &Option<String>,
+    reasoning_effort: &Option<String>,
+) -> anyhow::Result<EventsResponse> {
     let connection = open_read_connection(path)?;
     let fresh_input = fresh_input_sql("l");
     let real_total = format!(
         "({fresh_input} + l.output_tokens + l.cache_creation_tokens + l.cache_read_tokens)"
     );
-    let cost = billing_cost_sql(
+    let (cost, unadjusted) = crate::billing_cache::projection_sql(
         "l",
         &cc_switch_usage_core::sql::effective_model("l"),
         multipliers,
     );
     let (mut where_sql, mut values) = detail_where_clause(&query);
+    for (column, filter) in [
+        ("l.service_tier", service_tier),
+        ("l.reasoning_effort", reasoning_effort),
+    ] {
+        if let Some(value) = filter {
+            if value == "unknown" {
+                where_sql.push_str(&format!(" AND {column} IS NULL"));
+            } else if column == "l.service_tier" && value == "fast" {
+                where_sql.push_str(" AND (l.service_tier='fast' OR (l.service_tier='priority' AND l.model NOT LIKE 'claude-%'))");
+            } else {
+                where_sql.push_str(&format!(" AND {column}=?"));
+                values.push(Value::Text(value.clone()));
+            }
+        }
+    }
     if let Some((created_at, event_id)) = &before {
         where_sql.push_str(" AND (l.created_at < ? OR (l.created_at = ? AND l.event_id < ?))");
         values.push(Value::Integer(*created_at));
@@ -1210,7 +1330,8 @@ fn query_events_with_multipliers(
                 l.model, l.request_model, {fresh_input},
                 l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens,
                 {real_total}, {cost}, l.latency_ms,
-                l.status_code, l.is_streaming, l.data_source
+                l.status_code, l.is_streaming, l.data_source, {unadjusted},
+                l.service_tier,l.service_tier_source,l.reasoning_effort,l.service_tier_pricing_version
          FROM usage_events l
          LEFT JOIN nodes n ON n.uuid = l.node_id
          LEFT JOIN provider_catalog p
@@ -1224,6 +1345,10 @@ fn query_events_with_multipliers(
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), |row| {
         Ok(EventItem {
+            service_tier: row.get(21)?,
+            service_tier_source: row.get(22)?,
+            reasoning_effort: row.get(23)?,
+            service_tier_pricing_version: row.get(24)?,
             event_id: row.get(0)?,
             request_id: row.get(1)?,
             created_at: row.get(2)?,
@@ -1240,6 +1365,7 @@ fn query_events_with_multipliers(
             cache_creation_tokens: row.get(13)?,
             real_total_tokens: row.get(14)?,
             total_cost_usd: row.get(15)?,
+            unadjusted_cost_requests: row.get(20)?,
             latency_ms: row.get(16)?,
             status_code: row.get(17)?,
             is_streaming: row.get::<_, i64>(18)? != 0,
@@ -1271,23 +1397,25 @@ fn dashboard_billing_multipliers(
 async fn overview(
     State(state): State<ServerState>,
     Query(query): Query<DashboardQuery>,
-) -> Result<Json<OverviewResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let query = resolve_dashboard_query(&state, query).await?;
     let path = state.db_path.clone();
     let multipliers = dashboard_billing_multipliers(&state)?;
     let result = tokio::task::spawn_blocking(move || {
-        query_overview_with_multipliers(&path, query, &multipliers)
+        crate::performance::query_json(|| {
+            query_overview_with_multipliers(&path, query, &multipliers)
+        })
     })
     .await
     .map_err(|error| ApiError::Database(error.to_string()))?
     .map_err(|error| ApiError::Database(error.to_string()))?;
-    Ok(Json(result))
+    Ok(result)
 }
 
 async fn daily(
     State(state): State<ServerState>,
     Query(mut query): Query<DashboardQuery>,
-) -> Result<Json<DailyResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let now = chrono::Utc::now().timestamp();
     let offset = i64::from(query.tz_offset_minutes.unwrap_or(0)) * 60;
     let local_today_start = (now + offset).div_euclid(24 * 60 * 60) * 24 * 60 * 60 - offset;
@@ -1298,31 +1426,33 @@ async fn daily(
     let path = state.db_path.clone();
     let multipliers = dashboard_billing_multipliers(&state)?;
     let result = tokio::task::spawn_blocking(move || {
-        query_daily_with_multipliers(&path, query, &multipliers)
+        crate::performance::query_json(|| query_daily_with_multipliers(&path, query, &multipliers))
     })
     .await
     .map_err(|error| ApiError::Database(error.to_string()))?
     .map_err(|error| ApiError::Database(error.to_string()))?;
-    Ok(Json(result))
+    Ok(result)
 }
 
 async fn filters(
     State(state): State<ServerState>,
     Query(query): Query<DashboardQuery>,
-) -> Result<Json<FiltersResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let query = resolve_dashboard_query(&state, query).await?;
     let path = state.db_path.clone();
-    let result = tokio::task::spawn_blocking(move || query_filters(&path, query))
-        .await
-        .map_err(|error| ApiError::Database(error.to_string()))?
-        .map_err(|error| ApiError::Database(error.to_string()))?;
-    Ok(Json(result))
+    let result = tokio::task::spawn_blocking(move || {
+        crate::performance::query_json(|| query_filters(&path, query))
+    })
+    .await
+    .map_err(|error| ApiError::Database(error.to_string()))?
+    .map_err(|error| ApiError::Database(error.to_string()))?;
+    Ok(result)
 }
 
 async fn events(
     State(state): State<ServerState>,
     Query(query): Query<EventsQuery>,
-) -> Result<Json<EventsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let filter = resolve_dashboard_query(
         &state,
         DashboardQuery {
@@ -1357,15 +1487,54 @@ async fn events(
             ))
         }
     };
+    let service_tier = normalized_filter(query.service_tier, "service_tier")?;
+    let reasoning_effort = normalized_filter(query.reasoning_effort, "reasoning_effort")?;
+    for (value, choices) in [
+        (
+            &service_tier,
+            &[
+                "auto",
+                "default",
+                "flex",
+                "priority",
+                "fast",
+                "ultrafast",
+                "scale",
+                "unknown",
+            ][..],
+        ),
+        (
+            &reasoning_effort,
+            &[
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "unknown",
+            ][..],
+        ),
+    ] {
+        if value.as_deref().is_some_and(|v| !choices.contains(&v)) {
+            return Err(ApiError::BadRequest(
+                "invalid request metadata filter".into(),
+            ));
+        }
+    }
     let path = state.db_path.clone();
     let multipliers = dashboard_billing_multipliers(&state)?;
     let result = tokio::task::spawn_blocking(move || {
-        query_events_with_multipliers(&path, filter, limit, before, &multipliers)
+        crate::performance::query_json(|| {
+            query_events_with_metadata(
+                &path,
+                filter,
+                limit,
+                before,
+                &multipliers,
+                &service_tier,
+                &reasoning_effort,
+            )
+        })
     })
     .await
     .map_err(|error| ApiError::Database(error.to_string()))?
     .map_err(|error| ApiError::Database(error.to_string()))?;
-    Ok(Json(result))
+    Ok(result)
 }
 
 async fn local_only(
@@ -1474,6 +1643,22 @@ async fn quota_script(headers: HeaderMap) -> Response {
     )
 }
 
+async fn history_quota_script(headers: HeaderMap) -> Response {
+    static_response(
+        &headers,
+        "text/javascript; charset=utf-8",
+        DASHBOARD_HISTORY_QUOTA_JS,
+    )
+}
+
+async fn estimated_quota_script(headers: HeaderMap) -> Response {
+    static_response(
+        &headers,
+        "text/javascript; charset=utf-8",
+        DASHBOARD_ESTIMATED_QUOTA_JS,
+    )
+}
+
 async fn past_resets_script(headers: HeaderMap) -> Response {
     static_response(
         &headers,
@@ -1498,10 +1683,25 @@ pub fn routes() -> Router<ServerState> {
         .route("/dashboard/styles.css", get(styles))
         .route("/dashboard/favicon.svg", get(favicon))
         .route("/dashboard/app.js", get(script))
+        .route(
+            "/dashboard/requests.js",
+            get(|headers: HeaderMap| async move {
+                static_response(
+                    &headers,
+                    "text/javascript; charset=utf-8",
+                    include_str!("../web/requests.js"),
+                )
+            }),
+        )
         .route("/dashboard/charts.js", get(charts_script))
         .route("/dashboard/i18n.js", get(i18n_script))
         .route("/dashboard/range.js", get(range_script))
         .route("/dashboard/past-resets.js", get(past_resets_script))
+        .route("/dashboard/reset-cycle.js", get(|headers: HeaderMap| async move {
+            static_response(&headers, "text/javascript; charset=utf-8", include_str!("../web/reset-cycle.js"))
+        }))
+        .route("/dashboard/history-quota.js", get(history_quota_script))
+        .route("/dashboard/estimated-quota.js", get(estimated_quota_script))
         .route("/dashboard/quota-view.js", get(quota_script))
         .route("/dashboard/vendor/echarts.esm.min.mjs", get(echarts_script))
         .route("/v3/dashboard/overview", get(overview))
@@ -1510,6 +1710,10 @@ pub fn routes() -> Router<ServerState> {
         .route("/v3/dashboard/events", get(events))
         .route("/v3/dashboard/quota", get(crate::quota::dashboard))
         .route("/v3/dashboard/quota/at", get(crate::quota::at))
+        .route(
+            "/v3/dashboard/quota/cycle-summaries",
+            post(crate::quota_cycles::summaries),
+        )
         .route("/v3/dashboard/quota/resets", get(crate::quota::resets))
         .route("/v3/dashboard/time-bounds", get(time_bounds))
         .route("/v3/dashboard/settings", get(crate::settings::public_get))
@@ -1524,6 +1728,7 @@ pub fn routes() -> Router<ServerState> {
         .route("/v1/dashboard/filters", get(super::upgrade_required))
         .route("/v1/dashboard/events", get(super::upgrade_required))
         .route_layer(middleware::from_fn(local_only))
+        .layer(tower_http::compression::CompressionLayer::new().gzip(true))
 }
 
 #[cfg(test)]
@@ -1696,28 +1901,28 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(matches!(query.bucket, Bucket::FiveMinutes));
+        assert!(matches!(query.bucket, Bucket::Minute));
         let ten_hours = resolve_query(DashboardQuery {
             from: Some(0),
             to: Some(10 * 60 * 60),
             ..Default::default()
         })
         .unwrap();
-        assert!(matches!(ten_hours.bucket, Bucket::Hour));
+        assert!(matches!(ten_hours.bucket, Bucket::ThirtyMinutes));
         let seven_days = resolve_query(DashboardQuery {
             from: Some(0),
             to: Some(7 * 24 * 60 * 60),
             ..Default::default()
         })
         .unwrap();
-        assert!(matches!(seven_days.bucket, Bucket::TwelveHours));
+        assert!(matches!(seven_days.bucket, Bucket::SixHours));
         let ten_days = resolve_query(DashboardQuery {
             from: Some(0),
             to: Some(10 * 24 * 60 * 60),
             ..Default::default()
         })
         .unwrap();
-        assert!(matches!(ten_days.bucket, Bucket::Day));
+        assert!(matches!(ten_days.bucket, Bucket::TwelveHours));
         let short = resolve_query(DashboardQuery {
             from: Some(0),
             to: Some(5),
@@ -1760,6 +1965,43 @@ mod tests {
     }
 
     #[test]
+    fn regular_auto_uses_denser_buckets() {
+        for (duration, expected) in [
+            (5 * 3600, 900),
+            (86400, 3600),
+            (7 * 86400, 21600),
+            (30 * 86400, 86400),
+            (10, 1),
+        ] {
+            assert_eq!(Bucket::auto_for_range(duration).seconds(), expected);
+        }
+    }
+
+    #[test]
+    fn quota_auto_matches_quota_and_is_no_coarser_than_regular_auto() {
+        for duration in [3600, 86400, 7 * 86400, 30 * 86400, 365 * 86400] {
+            let quota_auto = resolve_query(DashboardQuery {
+                from: Some(0),
+                to: Some(duration),
+                bucket: Some("quota-auto".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                quota_auto.bucket.seconds(),
+                crate::quota::automatic_bucket_seconds(duration)
+            );
+            let regular = resolve_query(DashboardQuery {
+                from: Some(0),
+                to: Some(duration),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(regular.bucket.seconds() >= quota_auto.bucket.seconds());
+        }
+    }
+
+    #[test]
     fn trend_zero_fills_requested_range() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("telemetry.db");
@@ -1767,6 +2009,7 @@ mod tests {
         let query = resolve_query(DashboardQuery {
             from: Some(100),
             to: Some(160),
+            bucket: Some("1s".to_owned()),
             ..Default::default()
         })
         .unwrap();
@@ -1912,6 +2155,233 @@ mod tests {
     }
 
     #[test]
+    fn component_billing_preserves_tokens_and_allocates_before_aggregation() {
+        use crate::settings::{BillingMode, ModelBillingMultiplier};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let connection = init_db(&path).unwrap();
+        for (id, input, creation, read, output, semantics) in [
+            ("fresh", 100, 0, 0, 0, 2),
+            ("creation", 0, 100, 0, 0, 2),
+            ("read", 100, 0, 100, 0, 1),
+            ("output", 0, 0, 0, 100, 2),
+        ] {
+            insert_event(
+                &connection,
+                id,
+                101,
+                TestUsage {
+                    app_type: "codex",
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_read_tokens: read,
+                    cache_creation_tokens: creation,
+                    input_token_semantics: semantics,
+                    status_code: 200,
+                },
+            );
+        }
+        connection
+            .execute("UPDATE usage_events SET pricing_model='gpt-example'", [])
+            .unwrap();
+        let query = resolve_query(DashboardQuery {
+            from: Some(0),
+            to: Some(86400),
+            bucket: Some("1h".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let price = crate::pricing::ReferencePricing {
+            model: "gpt-example".into(),
+            resolved_model: "fixture/gpt-example".into(),
+            source: "fixture".into(),
+            fetched_at: 100,
+            fresh: Some(2.0),
+            creation: Some(4.0),
+            read: Some(0.5),
+            output: Some(8.0),
+        };
+        let mut entry = ModelBillingMultiplier {
+            model: "gpt-example".into(),
+            mode: BillingMode::Components,
+            multiplier: 999.0,
+            input_multiplier: 999.0,
+            fresh_multiplier: 2.0,
+            creation_multiplier: 3.0,
+            read_multiplier: 4.0,
+            reference_pricing: Some(price),
+            ..Default::default()
+        };
+        crate::usage_cache::ensure_schema(&connection).unwrap();
+        while crate::usage_cache::rebuild_one(&connection).unwrap() {}
+        let baseline = query_overview(&path, query.clone()).unwrap();
+        let overview =
+            query_overview_with_multipliers(&path, query.clone(), &[entry.clone()]).unwrap();
+        assert_eq!(overview.summary.total_cost_usd, 2.5);
+        assert_eq!(
+            overview.summary.real_total_tokens,
+            baseline.summary.real_total_tokens
+        );
+        assert_eq!(overview.summary.unadjusted_cost_requests, 0);
+        assert_eq!(
+            overview.trend.iter().map(|p| p.total_cost_usd).sum::<f64>(),
+            2.5
+        );
+        assert_eq!(overview.breakdowns.models[0].total_cost_usd, 2.5);
+        let daily = query_daily_with_multipliers(&path, query.clone(), &[entry.clone()]).unwrap();
+        assert_eq!(
+            daily.days.iter().map(|p| p.total_cost_usd).sum::<f64>(),
+            2.5
+        );
+        let events =
+            query_events_with_multipliers(&path, query.clone(), 10, None, &[entry.clone()])
+                .unwrap();
+        assert_eq!(
+            events.items.iter().map(|p| p.total_cost_usd).sum::<f64>(),
+            2.5
+        );
+        while crate::billing_cache::rebuild_batch(&connection, &[entry.clone()]).unwrap()
+            | crate::usage_cache::rebuild_one_before(&connection, None, &[entry.clone()]).unwrap()
+        {
+        }
+        let cached =
+            query_overview_with_multipliers(&path, query.clone(), &[entry.clone()]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&cached).unwrap(),
+            serde_json::to_value(&overview).unwrap()
+        );
+        assert!(
+            connection
+                .query_row("SELECT COUNT(*) FROM usage_billing_cache", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        entry.output_multiplier = 2.0;
+        assert_eq!(
+            query_overview_with_multipliers(&path, query.clone(), &[entry.clone()])
+                .unwrap()
+                .summary
+                .total_cost_usd,
+            2.75
+        );
+        entry.output_multiplier = 1.0;
+        entry.reference_pricing.as_mut().unwrap().creation = None;
+        let incomplete =
+            query_overview_with_multipliers(&path, query.clone(), &[entry.clone()]).unwrap();
+        assert_eq!(incomplete.summary.total_cost_usd, 2.0);
+        assert_eq!(incomplete.summary.unadjusted_cost_requests, 1);
+        while crate::billing_cache::rebuild_batch(&connection, &[entry.clone()]).unwrap()
+            | crate::usage_cache::rebuild_one_before(&connection, None, &[entry.clone()]).unwrap()
+        {
+        }
+        let warm_incomplete =
+            query_overview_with_multipliers(&path, query.clone(), &[entry.clone()]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&warm_incomplete).unwrap(),
+            serde_json::to_value(&incomplete).unwrap()
+        );
+        assert_eq!(
+            incomplete
+                .trend
+                .iter()
+                .map(|p| p.unadjusted_cost_requests)
+                .sum::<i64>(),
+            1
+        );
+        entry.reference_pricing.as_mut().unwrap().creation = Some(4.0);
+        entry.fresh_multiplier = 0.0;
+        entry.creation_multiplier = 0.0;
+        entry.read_multiplier = 0.0;
+        assert_eq!(
+            query_overview_with_multipliers(&path, query.clone(), &[entry.clone()])
+                .unwrap()
+                .summary
+                .total_cost_usd,
+            0.25
+        );
+        let prices = entry.reference_pricing.as_mut().unwrap();
+        prices.fresh = Some(0.0);
+        prices.creation = Some(0.0);
+        prices.read = Some(0.0);
+        prices.output = Some(0.0);
+        let zero_weights =
+            query_overview_with_multipliers(&path, query.clone(), &[entry.clone()]).unwrap();
+        assert_eq!(zero_weights.summary.total_cost_usd, 1.0);
+        assert_eq!(zero_weights.summary.unadjusted_cost_requests, 4);
+        entry.reference_pricing = None;
+        entry.fresh_multiplier = 1.0;
+        entry.creation_multiplier = 1.0;
+        entry.read_multiplier = 1.0;
+        let unchanged = query_overview_with_multipliers(&path, query, &[entry]).unwrap();
+        assert_eq!(
+            unchanged.summary.total_cost_usd,
+            baseline.summary.total_cost_usd
+        );
+        assert_eq!(unchanged.summary.unadjusted_cost_requests, 0);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT SUM(CAST(total_cost_usd AS REAL)) FROM usage_events",
+                    [],
+                    |r| r.get::<_, f64>(0)
+                )
+                .unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn component_billing_uses_rollup_composition_and_reports_missing_weights() {
+        use crate::settings::{BillingMode, ModelBillingMultiplier};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let connection = init_db(&path).unwrap();
+        connection.execute("INSERT INTO usage_daily_snapshots
+          (snapshot_key,node_id,date,app_type,provider_id,model,request_model,pricing_model,
+           request_count,success_count,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,
+           input_token_semantics,total_cost_usd,avg_latency_ms,day_start_utc,day_end_utc,received_at)
+          VALUES ('snapshot','node','1970-01-01','codex','provider','base','','gpt-example',
+           10,10,300,100,100,100,1,'10',20,0,86400,86400)", []).unwrap();
+        let query = resolve_query(DashboardQuery {
+            from: Some(0),
+            to: Some(86400),
+            bucket: Some("1d".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut entry = ModelBillingMultiplier {
+            model: "gpt-example".into(),
+            mode: BillingMode::Components,
+            fresh_multiplier: 2.0,
+            creation_multiplier: 3.0,
+            read_multiplier: 4.0,
+            reference_pricing: Some(crate::pricing::ReferencePricing {
+                model: "gpt-example".into(),
+                resolved_model: "fixture/gpt-example".into(),
+                source: "fixture".into(),
+                fetched_at: 100,
+                fresh: Some(2.0),
+                creation: Some(4.0),
+                read: Some(0.5),
+                output: Some(8.0),
+            }),
+            ..Default::default()
+        };
+        let expected = 10.0 * (400.0 + 1200.0 + 200.0 + 800.0) / (200.0 + 400.0 + 50.0 + 800.0);
+        let overview =
+            query_overview_with_multipliers(&path, query.clone(), &[entry.clone()]).unwrap();
+        assert!((overview.summary.total_cost_usd - expected).abs() < 1e-10);
+        assert!(overview.coverage.includes_rollups);
+        let daily = query_daily_with_multipliers(&path, query.clone(), &[entry.clone()]).unwrap();
+        assert!((daily.days[0].total_cost_usd - expected).abs() < 1e-10);
+        entry.reference_pricing.as_mut().unwrap().read = None;
+        let incomplete = query_overview_with_multipliers(&path, query, &[entry]).unwrap();
+        assert_eq!(incomplete.summary.total_cost_usd, 10.0);
+        assert_eq!(incomplete.summary.unadjusted_cost_requests, 10);
+    }
+
+    #[test]
     fn model_billing_multipliers_apply_to_read_only_dashboard_results() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("telemetry.db");
@@ -1962,6 +2432,7 @@ mod tests {
         let multipliers = vec![crate::settings::ModelBillingMultiplier {
             model: "gpt-5".to_owned(),
             multiplier: 2.0,
+            ..Default::default()
         }];
         let overview = query_overview_with_multipliers(&path, query.clone(), &multipliers).unwrap();
         assert_eq!(overview.summary.total_cost_usd, 0.75);
@@ -2041,6 +2512,7 @@ mod tests {
         let multipliers = vec![crate::settings::ModelBillingMultiplier {
             model: "model-a".to_owned(),
             multiplier: 2.0,
+            ..Default::default()
         }];
         let adjusted_raw =
             query_overview_with_multipliers(&path, query.clone(), &multipliers).unwrap();
@@ -2209,6 +2681,7 @@ mod tests {
             &[crate::settings::ModelBillingMultiplier {
                 model: "gpt-5".to_owned(),
                 multiplier: 2.0,
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -2527,5 +3000,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+    #[test]
+    fn request_metadata_filters_preserve_pagination_and_aggregate_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = init_db(&path).unwrap();
+        for (id, model, tier, effort) in [
+            ("a", "gpt-5.5", Some("fast"), Some("high")),
+            ("b", "gpt-5.5", Some("priority"), Some("high")),
+            ("c", "claude-opus-5", Some("priority"), Some("high")),
+            ("d", "gpt-5.5", None, None),
+        ] {
+            insert_event(
+                &db,
+                id,
+                100,
+                TestUsage {
+                    app_type: "codex",
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    input_token_semantics: 2,
+                    status_code: 200,
+                },
+            );
+            db.execute("UPDATE usage_events SET model=?2,service_tier=?3,reasoning_effort=?4 WHERE event_id=?1",rusqlite::params![id,model,tier,effort]).unwrap();
+        }
+        let query = resolve_query(DashboardQuery {
+            from: Some(99),
+            to: Some(101),
+            ..Default::default()
+        })
+        .unwrap();
+        let first = query_events_with_metadata(
+            &path,
+            query.clone(),
+            1,
+            None,
+            &[],
+            &Some("fast".into()),
+            &Some("high".into()),
+        )
+        .unwrap();
+        assert_eq!(first.items[0].event_id, "b");
+        assert_eq!(first.items[0].service_tier.as_deref(), Some("priority"));
+        let cursor = first.next_cursor.unwrap();
+        let next = query_events_with_metadata(
+            &path,
+            query.clone(),
+            1,
+            Some((cursor.before_created_at, cursor.before_event_id)),
+            &[],
+            &Some("fast".into()),
+            &Some("high".into()),
+        )
+        .unwrap();
+        assert_eq!(next.items[0].event_id, "a");
+        assert!(next.next_cursor.is_none());
+        let unknown = query_events_with_metadata(
+            &path,
+            query.clone(),
+            50,
+            None,
+            &[],
+            &Some("unknown".into()),
+            &None,
+        )
+        .unwrap();
+        assert_eq!(unknown.items[0].event_id, "d");
+        assert_eq!(query_events(&path, query, 50, None).unwrap().items.len(), 4);
     }
 }

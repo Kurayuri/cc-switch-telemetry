@@ -4,6 +4,8 @@
 //! pricing DAO, or the destination schema. They emit stable usage records and
 //! leave persistence, deduplication, and pricing to the caller.
 
+mod codex;
+pub mod metadata;
 mod pi;
 #[cfg(test)]
 mod provenance;
@@ -18,8 +20,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const IMPORTER_SOURCE_COMMIT: &str = "3217f72596f2d1c0f879f0a05f83803825d9809f";
-pub const IMPORTER_REVISION: &str = "cc-switch-3217f725:session-usage-v3-six-source";
+pub const IMPORTER_SOURCE_COMMIT: &str = "87d966b7f887adfe0e9856ee0f7e93cc8efc874f";
+pub const IMPORTER_REVISION: &str = "cc-switch-87d966b7:session-usage-v4-fast";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageIdentity {
@@ -37,6 +39,10 @@ pub struct UsageRecord {
     pub model: String,
     pub request_model: String,
     pub pricing_model: Option<String>,
+    pub service_tier: Option<String>,
+    pub service_tier_source: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier_pricing_version: Option<i64>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -85,7 +91,7 @@ where
         &mut report,
         &should_scan,
     )?;
-    import_codex_files(&config.codex_dir, &mut report, &should_scan)?;
+    codex::import(&config.codex_dir, &mut report, &should_scan)?;
     import_gemini_files(&config.gemini_dir.join("tmp"), &mut report, &should_scan)?;
     import_opencode(&config.opencode_db, &mut report, &should_scan)?;
     import_grok_tree(&config.grok_dir, &mut report, &should_scan)?;
@@ -148,214 +154,6 @@ fn collect_direct_jsonl(root: &Path, files: &mut Vec<PathBuf>) {
             .map(|entry| entry.path())
             .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl")),
     );
-}
-
-fn import_codex_files(
-    root: &Path,
-    report: &mut ImportReport,
-    should_scan: &impl Fn(&Path) -> bool,
-) -> anyhow::Result<()> {
-    let mut files = Vec::new();
-    collect_codex_sessions(&root.join("sessions"), &mut files, 0);
-    if let Ok(entries) = fs::read_dir(root.join("archived_sessions")) {
-        files.extend(
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl")),
-        );
-    }
-    files.retain(|path| {
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(is_rollout_filename)
-    });
-    files.sort();
-    let mut parsed = Vec::new();
-    for path in files {
-        let Some(thread_id) = filename_uuid(&path) else {
-            continue;
-        };
-        let records = parse_codex_file(&path, &thread_id)?;
-        let info = codex_file_info(&path, &thread_id)?;
-        parsed.push((path, thread_id, records, info));
-    }
-    for index in 0..parsed.len() {
-        let (path, thread_id, records, info) = &parsed[index];
-        if !should_scan(path) {
-            continue;
-        }
-        report.files_scanned += 1;
-        report.scanned_paths.push(path.clone());
-        if !info.meta_seen || info.meta_id.as_deref() != Some(thread_id) {
-            report.skipped += 1;
-            continue;
-        }
-        let replay_events = if let Some(parent) = info.parent_id.as_deref() {
-            let parent_index = parsed.iter().position(|(_, id, _, _)| id == parent);
-            let Some(parent_index) = parent_index else {
-                report.skipped += 1;
-                continue;
-            };
-            let Some(cutoff) = info.root_timestamp else {
-                report.skipped += 1;
-                continue;
-            };
-            let parent_signatures = parsed[parent_index]
-                .3
-                .events
-                .iter()
-                .filter(|event| event.timestamp.is_none_or(|timestamp| timestamp <= cutoff))
-                .map(|event| event.signature.as_str())
-                .collect::<Vec<_>>();
-            matching_codex_prefix(&info.events, &parent_signatures)
-        } else {
-            0
-        };
-        let skip_records = info
-            .events
-            .iter()
-            .take(replay_events)
-            .filter(|event| event.billable)
-            .count();
-        if skip_records >= records.len() {
-            report.skipped += records.len() as u64;
-        } else {
-            report
-                .records
-                .extend(records.iter().skip(skip_records).cloned());
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-struct CodexFileInfo {
-    meta_seen: bool,
-    meta_id: Option<String>,
-    parent_id: Option<String>,
-    root_timestamp: Option<i64>,
-    events: Vec<CodexEventSignature>,
-}
-
-#[derive(Debug)]
-struct CodexEventSignature {
-    signature: String,
-    timestamp: Option<i64>,
-    billable: bool,
-}
-
-fn codex_file_info(path: &Path, _thread_id: &str) -> anyhow::Result<CodexFileInfo> {
-    let content = fs::read_to_string(path)?;
-    let mut info = CodexFileInfo {
-        meta_seen: false,
-        meta_id: None,
-        parent_id: None,
-        root_timestamp: None,
-        events: Vec::new(),
-    };
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        match value.get("type").and_then(Value::as_str) {
-            Some("session_meta") if !info.meta_seen => {
-                info.meta_seen = true;
-                info.root_timestamp = value
-                    .get("timestamp")
-                    .and_then(|value| event_timestamp(Some(value)));
-                let payload = value.get("payload").unwrap_or(&Value::Null);
-                info.meta_id = payload
-                    .get("id")
-                    .or_else(|| payload.get("thread_id"))
-                    .or_else(|| payload.get("threadId"))
-                    .and_then(Value::as_str)
-                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                    .map(|value| value.hyphenated().to_string());
-                let fork = payload.get("forked_from_id").and_then(Value::as_str);
-                let spawn = payload
-                    .pointer("/source/subagent/thread_spawn/parent_thread_id")
-                    .and_then(Value::as_str);
-                info.parent_id = match (fork, spawn) {
-                    (Some(fork), Some(spawn)) if fork != spawn => None,
-                    (Some(value), _) | (_, Some(value)) => uuid::Uuid::parse_str(value)
-                        .ok()
-                        .map(|value| value.hyphenated().to_string()),
-                    _ => None,
-                };
-            }
-            Some("event_msg")
-                if value.pointer("/payload/type").and_then(Value::as_str)
-                    == Some("token_count") =>
-            {
-                let Some(counters) = value
-                    .pointer("/payload/info/total_token_usage")
-                    .or_else(|| value.pointer("/payload/info/last_token_usage"))
-                else {
-                    continue;
-                };
-                let input = number(counters, &["input_tokens", "input"]);
-                let cached = number(counters, &["cached_input_tokens", "cached_input", "cached"]);
-                let output = number(counters, &["output_tokens", "output"]);
-                info.events.push(CodexEventSignature {
-                    signature: format!("{input}:{cached}:{output}"),
-                    timestamp: event_timestamp(value.get("timestamp")),
-                    billable: input + cached + output > 0,
-                });
-            }
-            _ => {}
-        }
-    }
-    Ok(info)
-}
-
-fn matching_codex_prefix(child: &[CodexEventSignature], parent: &[&str]) -> usize {
-    let mut parent_index = 0;
-    let mut matched = 0;
-    for event in child {
-        let Some(relative) = parent[parent_index..]
-            .iter()
-            .position(|signature| *signature == event.signature)
-        else {
-            break;
-        };
-        parent_index += relative + 1;
-        matched += 1;
-    }
-    matched
-}
-
-fn collect_codex_sessions(root: &Path, files: &mut Vec<PathBuf>, depth: usize) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && depth < 3 {
-            collect_codex_sessions(&path, files, depth + 1);
-        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
-            files.push(path);
-        }
-    }
-}
-
-fn is_rollout_filename(name: &str) -> bool {
-    let Some(stem) = name.strip_suffix(".jsonl") else {
-        return false;
-    };
-    stem.starts_with("rollout-") && filename_uuid_from_stem(stem).is_some()
-}
-
-fn filename_uuid(path: &Path) -> Option<String> {
-    filename_uuid_from_stem(path.file_stem()?.to_str()?)
-}
-
-fn filename_uuid_from_stem(stem: &str) -> Option<String> {
-    let start = stem.len().checked_sub(36)?;
-    let suffix = stem.get(start..)?;
-    uuid::Uuid::parse_str(suffix)
-        .ok()
-        .map(|id| id.hyphenated().to_string())
 }
 
 fn collect_named_files(root: &Path, name: &str, files: &mut Vec<PathBuf>) {
@@ -443,6 +241,10 @@ fn import_gemini_file(path: &Path, report: &mut ImportReport) -> anyhow::Result<
             model: model.clone(),
             request_model: model,
             pricing_model: None,
+            service_tier: None,
+            service_tier_source: None,
+            reasoning_effort: None,
+            service_tier_pricing_version: None,
             input_tokens: input,
             output_tokens: output,
             cache_read_tokens: cached,
@@ -622,6 +424,7 @@ fn parse_claude_file(path: &Path, _thread_id: &str) -> anyhow::Result<Vec<UsageR
         let Some((input, output, cached, written)) = usage(&value) else {
             continue;
         };
+        let metadata = metadata::UsageMetadata::default().with_response(message);
         records.push(UsageRecord {
             request_id: format!("session:{message_id}"),
             app_type: "claude".into(),
@@ -631,6 +434,10 @@ fn parse_claude_file(path: &Path, _thread_id: &str) -> anyhow::Result<Vec<UsageR
             model: string(message, &["model"], "unknown"),
             request_model: string(message, &["model"], "unknown"),
             pricing_model: None,
+            service_tier: metadata.service_tier,
+            service_tier_source: metadata.service_tier_source,
+            reasoning_effort: metadata.reasoning_effort,
+            service_tier_pricing_version: Some(2),
             input_tokens: input,
             output_tokens: output,
             cache_read_tokens: cached,
@@ -647,169 +454,6 @@ fn parse_claude_file(path: &Path, _thread_id: &str) -> anyhow::Result<Vec<UsageR
         });
     }
     Ok(records)
-}
-
-#[derive(Default, Clone, Copy)]
-struct Counters {
-    input: i64,
-    cached: i64,
-    output: i64,
-}
-
-fn parse_codex_file(path: &Path, thread_id: &str) -> anyhow::Result<Vec<UsageRecord>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read Codex session {}", path.display()))?;
-    let mut model = "unknown".to_owned();
-    let mut previous = Counters::default();
-    let mut has_previous = false;
-    let mut index = 0_u64;
-    let mut records = Vec::new();
-    let mut session_meta_seen = false;
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        match value.get("type").and_then(Value::as_str) {
-            Some("session_meta") if !session_meta_seen => {
-                session_meta_seen = true;
-                let payload = value.get("payload").unwrap_or(&Value::Null);
-                if payload
-                    .get("id")
-                    .or_else(|| payload.get("thread_id"))
-                    .or_else(|| payload.get("threadId"))
-                    .and_then(Value::as_str)
-                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
-                    .is_none_or(|id| id.hyphenated().to_string() != thread_id)
-                {
-                    return Ok(Vec::new());
-                }
-            }
-            Some("turn_context") => {
-                model = string(
-                    value.get("payload").unwrap_or(&Value::Null),
-                    &["model"],
-                    &model,
-                );
-            }
-            Some("event_msg")
-                if value.pointer("/payload/type").and_then(Value::as_str)
-                    == Some("token_count") =>
-            {
-                let Some(info) = value.pointer("/payload/info") else {
-                    continue;
-                };
-                if let Some(next) = info
-                    .get("model")
-                    .or_else(|| info.get("model_name"))
-                    .and_then(Value::as_str)
-                {
-                    model = normalize_codex_model(next);
-                }
-                let (current, cumulative) = if let Some(last) = info.get("last_token_usage") {
-                    (last, false)
-                } else if let Some(total) = info.get("total_token_usage") {
-                    (total, true)
-                } else {
-                    continue;
-                };
-                let counters = Counters {
-                    input: number(current, &["input_tokens", "input"]),
-                    cached: number(current, &["cached_input_tokens", "cached_input", "cached"]),
-                    output: number(current, &["output_tokens", "output"]),
-                };
-                let delta = if cumulative {
-                    let value = if has_previous {
-                        if counters.input < previous.input
-                            || counters.cached < previous.cached
-                            || counters.output < previous.output
-                        {
-                            // Codex can restart cumulative counters when a session is resumed
-                            // or compacted. The new counters represent the first request after
-                            // that reset; subtracting the old baseline would create negative
-                            // usage and lose the real request.
-                            counters
-                        } else {
-                            Counters {
-                                input: counters.input - previous.input,
-                                cached: counters.cached - previous.cached,
-                                output: counters.output - previous.output,
-                            }
-                        }
-                    } else {
-                        counters
-                    };
-                    previous = counters;
-                    has_previous = true;
-                    value
-                } else {
-                    counters
-                };
-                let delta = Counters {
-                    input: delta.input.max(0),
-                    cached: delta.cached.max(0),
-                    output: delta.output.max(0),
-                };
-                if delta.input + delta.cached + delta.output == 0 {
-                    continue;
-                }
-                index += 1;
-                records.push(UsageRecord {
-                    request_id: format!("codex_session:thread-v1:{thread_id}:{index}"),
-                    app_type: "codex".into(),
-                    provider_id: "_codex_session".into(),
-                    provider_type: "codex_session".into(),
-                    data_source: "codex_session".into(),
-                    model: model.clone(),
-                    request_model: model.clone(),
-                    pricing_model: None,
-                    input_tokens: delta.input,
-                    output_tokens: delta.output,
-                    cache_read_tokens: delta.cached.min(delta.input),
-                    cache_creation_tokens: 0,
-                    input_token_semantics: 0,
-                    created_at: timestamp(value.get("timestamp")),
-                    session_id: Some(thread_id.to_owned()),
-                    source_path: path.into(),
-                    is_streaming: true,
-                    status_code: 200,
-                    latency_ms: 0,
-                    reported_total_cost_usd: None,
-                    identity: None,
-                });
-            }
-            _ => {}
-        }
-    }
-    if !session_meta_seen {
-        return Ok(Vec::new());
-    }
-    Ok(records)
-}
-
-fn normalize_codex_model(raw: &str) -> String {
-    let mut model = raw.to_ascii_lowercase();
-    if let Some(index) = model.rfind('/') {
-        model = model[index + 1..].to_owned();
-    }
-    if model.len() >= 11 {
-        let suffix = &model[model.len() - 11..];
-        if suffix.as_bytes().first() == Some(&b'-')
-            && suffix[1..5].chars().all(|c| c.is_ascii_digit())
-            && suffix.as_bytes().get(5) == Some(&b'-')
-            && suffix[6..8].chars().all(|c| c.is_ascii_digit())
-            && suffix.as_bytes().get(8) == Some(&b'-')
-            && suffix[9..11].chars().all(|c| c.is_ascii_digit())
-        {
-            model.truncate(model.len() - 11);
-        }
-    }
-    if model.len() >= 9 {
-        let (base, suffix) = model.split_at(model.len() - 8);
-        if base.ends_with('-') && suffix.chars().all(|c| c.is_ascii_digit()) {
-            model.truncate(model.len() - 9);
-        }
-    }
-    model
 }
 
 fn import_opencode(
@@ -880,6 +524,10 @@ fn import_opencode(
             model: model.clone(),
             request_model: model,
             pricing_model: None,
+            service_tier: None,
+            service_tier_source: None,
+            reasoning_effort: None,
+            service_tier_pricing_version: None,
             input_tokens: input,
             output_tokens: output,
             cache_read_tokens: cached,
@@ -979,6 +627,10 @@ fn import_grok_tree(
                     model: model.clone(),
                     request_model: model,
                     pricing_model: None,
+                    service_tier: None,
+                    service_tier_source: None,
+                    reasoning_effort: None,
+                    service_tier_pricing_version: None,
                     input_tokens: input,
                     output_tokens: output,
                     cache_read_tokens: cached,
@@ -1006,12 +658,16 @@ mod tests {
     #[test]
     fn codex_cumulative_usage_becomes_deltas() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout.jsonl");
         let thread = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
+        let sessions = dir.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let path = sessions.join(format!("rollout-{thread}.jsonl"));
         fs::write(&path, format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-30T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3}}}}}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-30T00:00:01Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":15,\"cached_input_tokens\":4,\"output_tokens\":5}}}}}}}}"
         )).unwrap();
-        let records = parse_codex_file(&path, thread).unwrap();
+        let mut report = ImportReport::default();
+        codex::import(dir.path(), &mut report, &|_| true).unwrap();
+        let records = report.records;
         assert_eq!(
             records
                 .iter()
@@ -1025,12 +681,16 @@ mod tests {
     #[test]
     fn codex_prefers_last_usage_over_reset_cumulative_totals() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout.jsonl");
         let thread = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
+        let sessions = dir.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let path = sessions.join(format!("rollout-{thread}.jsonl"));
         fs::write(&path, format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-30T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3}},\"total_token_usage\":{{\"input_tokens\":5000000,\"cached_input_tokens\":4900000,\"output_tokens\":30000}}}}}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-31T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":25,\"cached_input_tokens\":4,\"output_tokens\":5}},\"total_token_usage\":{{\"input_tokens\":25,\"cached_input_tokens\":4,\"output_tokens\":5}}}}}}}}"
         )).unwrap();
-        let records = parse_codex_file(&path, thread).unwrap();
+        let mut report = ImportReport::default();
+        codex::import(dir.path(), &mut report, &|_| true).unwrap();
+        let records = report.records;
         assert_eq!(
             records
                 .iter()
@@ -1045,14 +705,18 @@ mod tests {
     }
 
     #[test]
-    fn codex_cumulative_fallback_treats_counter_decrease_as_reset() {
+    fn codex_cumulative_fallback_matches_upstream_high_water() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout.jsonl");
         let thread = "019c6e27-e55b-73d1-87d8-4e01f1f75043";
+        let sessions = dir.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let path = sessions.join(format!("rollout-{thread}.jsonl"));
         fs::write(&path, format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\"}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-30T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":100,\"cached_input_tokens\":80,\"output_tokens\":10}}}}}}}}\n{{\"type\":\"event_msg\",\"timestamp\":\"2026-07-31T00:00:00Z\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":25,\"cached_input_tokens\":4,\"output_tokens\":5}}}}}}}}"
         )).unwrap();
-        let records = parse_codex_file(&path, thread).unwrap();
+        let mut report = ImportReport::default();
+        codex::import(dir.path(), &mut report, &|_| true).unwrap();
+        let records = report.records;
         assert_eq!(
             records
                 .iter()
@@ -1062,7 +726,7 @@ mod tests {
                     record.output_tokens
                 ))
                 .collect::<Vec<_>>(),
-            vec![(100, 80, 10), (25, 4, 5)]
+            vec![(100, 80, 10)]
         );
     }
 
@@ -1163,5 +827,15 @@ mod tests {
         );
         assert_eq!(report.files_scanned, 6);
         assert_eq!(report.scanned_paths.len(), 6);
+    }
+    #[test]
+    fn claude_fast_metadata_uses_the_provider_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        fs::write(&path,serde_json::json!({"type":"assistant","timestamp":"2026-09-26T10:00:00Z","message":{"id":"m","model":"claude-opus-5","usage":{"input_tokens":100,"output_tokens":10,"speed":"fast"}}}).to_string()).unwrap();
+        let records = parse_claude_file(&path, "thread").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].service_tier.as_deref(), Some("fast"));
+        assert_eq!(records[0].service_tier_source.as_deref(), Some("response"));
     }
 }

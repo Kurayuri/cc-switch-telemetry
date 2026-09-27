@@ -60,10 +60,12 @@ export function pastResetGroups(response, nowMs = Date.now()) {
   })).filter((group) => group.tiers.length);
 }
 
-export function choosePastReset(groups, selection) {
+export function choosePastReset(groups, selection, nowMs = Date.now()) {
   const group = groups.find((item) => item.id === selection?.providerKey) || groups[0];
   const tier = group?.tiers.find((item) => item.id === selection?.tierId) || group?.tiers[0];
-  const cycle = tier?.cycles.find((item) => item.id === selection?.cycleId) || tier?.cycles[0];
+  const cycle = tier?.cycles.find((item) => item.id === selection?.cycleId)
+    || tier?.cycles.find((item) => (item.endAt ?? item.resetsAt) * 1000 <= nowMs)
+    || tier?.cycles[0];
   return cycle ? { providerKey: group.id, tierId: tier.id, cycleId: cycle.id, cycle } : null;
 }
 

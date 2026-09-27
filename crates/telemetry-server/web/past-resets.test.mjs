@@ -73,8 +73,8 @@ test("historical and current 5h/7d cycles retain separate provider and metric id
   assert.equal(five.cycles.length, 2, "no fabricated cycles in observation gaps");
   assert.deepEqual(resolvePastResetRange(five.cycles[0], now * 1000), { from: now + 100 - 18000, to: now });
   assert.equal(groups[0].tiers[1].periodSeconds, 604800);
-  const latest = choosePastReset(groups, null);
-  assert.equal(latest.cycleId, String(now + 100));
+  const latest = choosePastReset(groups, null, now * 1000);
+  assert.equal(latest.cycleId, String(now - 86400));
   const old = choosePastReset(groups, { ...latest, cycleId: String(now - 86400) });
   assert.equal(old.cycle.resetsAt, now - 86400);
   assert.equal(choosePastReset(groups, { providerKey: groups[1].id }).providerKey, groups[1].id);
@@ -132,4 +132,19 @@ test("failed requests can be retried", async () => {
   assert.equal(latest.error, true);
   await loader.load();
   assert.deepEqual(latest, { loading: false, error: false, response: { providers: [] } });
+});
+
+
+test("past reset defaults prefer completed cycles but retain explicit current choices", () => {
+  const completed = { id: "old", from: now - 200, endAt: now - 100 };
+  const current = { id: "current", from: now - 100, endAt: now + 100 };
+  const groups = [{ id: "provider", tiers: [
+    { id: "tier", cycles: [current, completed] },
+    { id: "current-only", cycles: [current] },
+  ] }];
+  assert.equal(choosePastReset(groups, null, now * 1000).cycle, completed);
+  assert.equal(choosePastReset(groups, { cycleId: "missing" }, now * 1000).cycle, completed);
+  assert.equal(choosePastReset(groups, { cycleId: "current" }, now * 1000).cycle, current);
+  assert.equal(choosePastReset(groups, { tierId: "current-only" }, now * 1000).cycle, current);
+  assert.equal(choosePastReset(groups, null, (now + 100) * 1000).cycle, current);
 });

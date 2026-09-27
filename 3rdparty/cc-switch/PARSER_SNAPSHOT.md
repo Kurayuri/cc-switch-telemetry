@@ -3,12 +3,12 @@
 This directory contains a source snapshot used to derive and audit
 `crates/session-usage-core`. The six parser modules below were copied byte for
 byte from cc-switch commit
-`3217f72596f2d1c0f879f0a05f83803825d9809f` (v3.20.1).
+`87d966b7f887adfe0e9856ee0f7e93cc8efc874f` (build/codex-fast-fix, codexfix.3).
 
 | File | SHA-256 |
 | --- | --- |
-| `src-tauri/src/services/session_usage.rs` | `7ae348e46f259d19195d8de4f42bea48dd6963ad77441aff94d05d52c44621f9` |
-| `src-tauri/src/services/session_usage_codex.rs` | `eadb325ca4b408c9a330784d3e6e6bca86b235cf0e5ce9a4568c82596e055d03` |
+| `src-tauri/src/services/session_usage.rs` | `f159e9ebb92fc57d99070cedc479a29ba0b3a1a42653c426b81a6725bd0f0e9e` |
+| `src-tauri/src/services/session_usage_codex.rs` | `8a2925ede70a1603068bb97b4dbb177f45cea3c6649c6845307c1d5ea687315c` |
 | `src-tauri/src/services/session_usage_gemini.rs` | `a5b158271a984325d29a6b3fbba99429d96a9729482c99d64cf73cbd82dbf727` |
 | `src-tauri/src/services/session_usage_grokbuild.rs` | `269f0b3250a89b5d562fa1bab41ea1c4aedb7f61f50af961712697b8a8adba55` |
 | `src-tauri/src/services/session_usage_opencode.rs` | `5b423f4deffab6f330e1dfb68852d3a72e26f6c0095417935a1db5545f4bb516` |

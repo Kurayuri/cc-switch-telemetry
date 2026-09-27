@@ -105,43 +105,7 @@ struct ModelsDevCost {
     cache_write: Option<serde_json::Number>,
 }
 
-fn pricing_candidates(model: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut add = |s: String| {
-        if !s.is_empty() && !out.contains(&s) {
-            out.push(s);
-        }
-    };
-    let base = model
-        .rsplit_once('/')
-        .map_or(model, |(_, v)| v)
-        .split(':')
-        .next()
-        .unwrap_or(model)
-        .trim()
-        .replace('@', "-")
-        .to_ascii_lowercase();
-    add(base.clone());
-    if let Some(pos) = base.rfind("claude-") {
-        if pos > 0 {
-            add(base[pos..].to_string());
-        }
-    }
-    for prefix in ["openai.", "anthropic.", "google.", "bedrock.", "global."] {
-        if let Some(v) = base.strip_prefix(prefix) {
-            add(v.to_string());
-        }
-    }
-    if let Some((head, suffix)) = base.rsplit_once('-') {
-        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            add(head.to_string());
-        }
-    }
-    if let Some(v) = base.strip_suffix("-thinking") {
-        add(v.to_string());
-    }
-    out
-}
+use cc_switch_usage_core::pricing_candidates;
 
 #[cfg(not(test))]
 async fn load_pricing() -> anyhow::Result<HashMap<String, Pricing>> {
@@ -228,7 +192,7 @@ fn calculate_cost(record: &UsageRecord, pricing: Option<&Pricing>) -> ([String; 
     let Some(p) = pricing else {
         return (["0".into(), "0".into(), "0".into(), "0".into()], "0".into());
     };
-    let cost = cc_switch_usage_core::calculate_cost(
+    let mut cost = cc_switch_usage_core::calculate_cost(
         &record.app_type,
         cc_switch_usage_core::TokenCounts {
             input_tokens: record.input_tokens,
@@ -239,6 +203,13 @@ fn calculate_cost(record: &UsageRecord, pricing: Option<&Pricing>) -> ([String; 
         p,
         Decimal::ONE,
     );
+    if let Some(factors) = cc_switch_usage_core::fast_pricing::factors(
+        record.pricing_model.as_deref().unwrap_or(&record.model),
+        record.service_tier.as_deref(),
+        0,
+    ) {
+        cc_switch_usage_core::fast_pricing::apply(&mut cost, factors, Decimal::ONE);
+    }
     (
         [
             cost.input_cost.to_string(),
@@ -327,6 +298,22 @@ pub fn init_local_ledger(path: &Path) -> anyhow::Result<()> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
+    let columns = conn
+        .prepare("PRAGMA table_info(proxy_request_logs)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, kind) in [
+        ("service_tier", "TEXT"),
+        ("service_tier_source", "TEXT"),
+        ("reasoning_effort", "TEXT"),
+        ("service_tier_pricing_version", "INTEGER"),
+    ] {
+        if !columns.iter().any(|c| c == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE proxy_request_logs ADD COLUMN {name} {kind}"
+            ))?;
+        }
+    }
     let expected = expected_revision();
     let had_detail = existed
         && conn.query_row(
@@ -343,6 +330,36 @@ pub fn init_local_ledger(path: &Path) -> anyhow::Result<()> {
             expected.as_str()
         }],
     )?;
+    let cursor_columns = conn
+        .prepare("PRAGMA table_info(session_log_sync)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !cursor_columns.iter().any(|c| c == "last_file_size") {
+        conn.execute_batch("ALTER TABLE session_log_sync ADD COLUMN last_file_size INTEGER")?;
+    }
+    // Only this known predecessor is safe for an additive upgrade. Keep existing
+    // rollups, upload hashes, source binding and compaction barriers.
+    let previous: String = conn.query_row(
+        "SELECT value FROM ledger_meta WHERE key='importer_revision'",
+        [],
+        |r| r.get(0),
+    )?;
+    if previous == "cc-switch-3217f725:session-usage-v3-six-source:unified-app-key-v3" {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO ledger_meta(key,value) VALUES ('codex_fast_reconcile','1')",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM session_log_sync WHERE file_path GLOB '*/rollout-*.jsonl'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE ledger_meta SET value=?1 WHERE key='importer_revision'",
+            [expected_revision()],
+        )?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -562,31 +579,51 @@ pub fn sync_cc_switch(
 async fn sync_into(path: &Path, config: &LocalUsageConfig) -> anyhow::Result<RebuildSummary> {
     let mut conn = Connection::open(path)?;
     verify_revision(&conn)?;
-    let mut sync_paths = std::collections::HashMap::<String, i64>::new();
+    let mut sync_paths = std::collections::HashMap::<String, (i64, Option<u64>)>::new();
     {
         let mut statement =
-            conn.prepare("SELECT file_path, last_modified FROM session_log_sync")?;
+            conn.prepare("SELECT file_path, last_modified, last_file_size FROM session_log_sync")?;
         let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, Option<u64>>(2)?),
+            ))
         })?;
-        for row in rows.flatten() {
+        for row in rows {
+            let row = row?;
             sync_paths.insert(row.0, row.1);
         }
     }
     let pricing = load_pricing().await?;
-    let report = session_usage_core::import_all_filtered(&config.sources(), |source| {
-        let modified = fs::metadata(source)
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
-            .unwrap_or(0);
-        modified
-            > sync_paths
-                .get(&source.to_string_lossy().to_string())
-                .copied()
-                .unwrap_or(0)
+    let reconcile_codex: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ledger_meta WHERE key='codex_fast_reconcile')",
+        [],
+        |r| r.get(0),
+    )?;
+    let scanned_stamps = std::cell::RefCell::new(HashMap::new());
+    let mut report = session_usage_core::import_all_filtered(&config.sources(), |source| {
+        let stamp = file_stamp(source);
+        scanned_stamps.borrow_mut().insert(source.to_owned(), stamp);
+        let previous = sync_paths
+            .get(&source.to_string_lossy().to_string())
+            .copied();
+        (reconcile_codex
+            && source
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rollout-")))
+            || previous != Some((stamp.0, Some(stamp.1)))
     })?;
+    for path in &report.scanned_paths {
+        if scanned_stamps
+            .borrow()
+            .get(path)
+            .is_some_and(|stamp| file_stamp(path) != *stamp)
+            && !report.deferred_paths.contains(path)
+        {
+            report.deferred_paths.push(path.clone());
+        }
+    }
     let mut summary = RebuildSummary {
         imported: 0,
         skipped: report.skipped,
@@ -599,9 +636,53 @@ async fn sync_into(path: &Path, config: &LocalUsageConfig) -> anyhow::Result<Reb
             summary.skipped += 1;
         }
     }
+    if reconcile_codex {
+        reconcile_codex_upgrade(&transaction, &report)?;
+    }
+    record_scan_metadata(&transaction, report, &scanned_stamps.into_inner())?;
     transaction.commit()?;
-    record_scan_metadata(&conn, report)?;
     Ok(summary)
+}
+
+// A parser upgrade can remove formerly counted replay events. Reconcile only
+// successfully resolved Codex files, never another collector or compacted days.
+fn reconcile_codex_upgrade(conn: &Connection, report: &ImportReport) -> anyhow::Result<()> {
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS codex_seen(request_id TEXT PRIMARY KEY); DELETE FROM codex_seen;")?;
+    for record in &report.records {
+        if record.app_type == "codex" {
+            conn.execute(
+                "INSERT OR IGNORE INTO codex_seen VALUES (?1)",
+                [&record.request_id],
+            )?;
+        }
+    }
+    for path in &report.scanned_paths {
+        if report.deferred_paths.contains(path) {
+            continue;
+        }
+        let Some(stem) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| s.starts_with("rollout-"))
+        else {
+            continue;
+        };
+        let Some(id) = stem
+            .get(stem.len().saturating_sub(36)..)
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        else {
+            continue;
+        };
+        let prefix = format!("codex_session:thread-v1:{}:", id.hyphenated());
+        conn.execute("DELETE FROM proxy_request_logs WHERE last_collector='local' AND app_type='codex' AND data_source='codex_session' AND substr(request_id,1,length(?1))=?1 AND NOT EXISTS(SELECT 1 FROM codex_seen s WHERE s.request_id=proxy_request_logs.request_id)", [prefix])?;
+    }
+    if report.deferred_paths.is_empty() {
+        conn.execute(
+            "DELETE FROM ledger_meta WHERE key='codex_fast_reconcile'",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_record(
@@ -645,10 +726,50 @@ fn insert_record(
         .filter(|m| !is_placeholder(m))
         .or_else(|| (!is_placeholder(&record.model)).then_some(record.model.as_str()))
         .or(Some(record.request_model.as_str()));
-    let cost = calculate_cost(
+    let mut cost = calculate_cost(
         record,
         model_for_pricing.and_then(|m| find_pricing(pricing, m)),
     );
+    // Metadata backfill must not reprice retained requests at today's rates.
+    let prior = conn.query_row("SELECT input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd,total_cost_usd,service_tier,service_tier_pricing_version FROM proxy_request_logs WHERE app_type=?1 AND request_id=?2 AND last_collector=?3 AND model=?4 AND COALESCE(pricing_model,'')=?5 AND input_tokens=?6 AND output_tokens=?7 AND cache_read_tokens=?8 AND cache_creation_tokens=?9 AND input_token_semantics=?10",
+        params![record.app_type,record.request_id,collector,record.model,record.pricing_model.as_deref().unwrap_or(""),record.input_tokens,record.output_tokens,record.cache_read_tokens,record.cache_creation_tokens,record.input_token_semantics],
+        |r| Ok(([r.get::<_,String>(0)?,r.get(1)?,r.get(2)?,r.get(3)?],r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<i64>>(6)?))).optional()?;
+    if let Some((components, total, tier, version)) = prior {
+        let parsed = components
+            .iter()
+            .map(|v| v.parse::<Decimal>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let original = total.parse::<Decimal>()?;
+        let sum: Decimal = parsed.iter().sum();
+        cost = (components, total);
+        if (sum - original).abs() <= Decimal::new(1, 10) {
+            let model = record.pricing_model.as_deref().unwrap_or(&record.model);
+            let old = if version == Some(2) {
+                cc_switch_usage_core::fast_pricing::factors(model, tier.as_deref(), 0)
+                    .map(|f| f.0)
+                    .unwrap_or(Decimal::ONE)
+            } else {
+                Decimal::ONE
+            };
+            let new = cc_switch_usage_core::fast_pricing::factors(
+                model,
+                record.service_tier.as_deref(),
+                0,
+            )
+            .map(|f| f.0)
+            .unwrap_or(Decimal::ONE);
+            if old != new {
+                let adjusted = parsed
+                    .into_iter()
+                    .map(|v| v * new / old)
+                    .collect::<Vec<_>>();
+                cost = (
+                    std::array::from_fn(|i| adjusted[i].to_string()),
+                    adjusted.iter().sum::<Decimal>().to_string(),
+                );
+            }
+        }
+    }
     let total = record
         .reported_total_cost_usd
         .as_deref()
@@ -662,6 +783,10 @@ fn insert_record(
         &record.model,
         Some(&record.request_model),
         record.pricing_model.as_deref(),
+        record.service_tier.as_deref(),
+        record.service_tier_source.as_deref(),
+        record.reasoning_effort.as_deref(),
+        record.service_tier_pricing_version,
         record.input_tokens,
         record.output_tokens,
         record.cache_read_tokens,
@@ -689,6 +814,10 @@ fn insert_event(conn: &Connection, event: &UsageEvent, collector: &str) -> anyho
         &event.model,
         event.request_model.as_deref(),
         event.pricing_model.as_deref(),
+        event.service_tier.as_deref(),
+        event.service_tier_source.as_deref(),
+        event.reasoning_effort.as_deref(),
+        event.service_tier_pricing_version,
         event.input_tokens,
         event.output_tokens,
         event.cache_read_tokens,
@@ -716,6 +845,10 @@ fn insert_values(
     model: &str,
     request_model: Option<&str>,
     pricing_model: Option<&str>,
+    service_tier: Option<&str>,
+    service_tier_source: Option<&str>,
+    reasoning_effort: Option<&str>,
+    service_tier_pricing_version: Option<i64>,
     input_tokens: i64,
     output_tokens: i64,
     cache_read_tokens: i64,
@@ -750,10 +883,14 @@ fn insert_values(
             input_token_semantics, input_cost_usd, output_cost_usd, cache_read_cost_usd,
             cache_creation_cost_usd, total_cost_usd, latency_ms, first_token_ms, duration_ms,
             status_code, error_message, session_id, provider_type, is_streaming,
-            cost_multiplier, created_at, data_source, last_collector
+            cost_multiplier, created_at, data_source, last_collector, service_tier,service_tier_source,reasoning_effort,service_tier_pricing_version
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, NULL, NULL, ?18, NULL, ?19, ?20, ?21, '1.0', ?22, ?23, ?24)
+                   ?17, NULL, NULL, ?18, NULL, ?19, ?20, ?21, '1.0', ?22, ?23, ?24, ?25, ?26, ?27, ?28)
         ON CONFLICT(app_type,request_id) DO UPDATE SET
+            service_tier = excluded.service_tier,
+            service_tier_source = excluded.service_tier_source,
+            reasoning_effort = excluded.reasoning_effort,
+            service_tier_pricing_version = excluded.service_tier_pricing_version,
             provider_id = excluded.provider_id,
             app_type = excluded.app_type,
             model = excluded.model,
@@ -775,7 +912,8 @@ fn insert_values(
             created_at = excluded.created_at,
             data_source = excluded.data_source,
             last_collector = excluded.last_collector
-        WHERE proxy_request_logs.provider_id IS NOT excluded.provider_id
+        WHERE proxy_request_logs.service_tier IS NOT excluded.service_tier OR proxy_request_logs.service_tier_source IS NOT excluded.service_tier_source OR proxy_request_logs.reasoning_effort IS NOT excluded.reasoning_effort OR proxy_request_logs.service_tier_pricing_version IS NOT excluded.service_tier_pricing_version
+               OR proxy_request_logs.provider_id IS NOT excluded.provider_id
                OR proxy_request_logs.model IS NOT excluded.model
                OR proxy_request_logs.request_model IS NOT excluded.request_model
                OR proxy_request_logs.pricing_model IS NOT excluded.pricing_model
@@ -815,6 +953,10 @@ fn insert_values(
             created_at,
             data_source,
             collector,
+            service_tier,
+            service_tier_source,
+            reasoning_effort,
+            service_tier_pricing_version,
         ],
     )?;
     Ok(changed > 0)
@@ -1165,7 +1307,27 @@ pub fn read_rollups(path: &Path) -> anyhow::Result<Vec<RollupSnapshot>> {
     Ok(snapshots)
 }
 
-fn record_scan_metadata(conn: &Connection, report: ImportReport) -> anyhow::Result<()> {
+fn file_stamp(path: &Path) -> (i64, u64) {
+    fs::metadata(path)
+        .ok()
+        .map(|m| {
+            (
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0),
+                m.len(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn record_scan_metadata(
+    conn: &Connection,
+    report: ImportReport,
+    stamps: &HashMap<PathBuf, (i64, u64)>,
+) -> anyhow::Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
@@ -1181,16 +1343,16 @@ fn record_scan_metadata(conn: &Connection, report: ImportReport) -> anyhow::Resu
         {
             continue;
         }
-        let modified = fs::metadata(&path)
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
-            .unwrap_or(0);
+        let Some(&(modified, size)) = stamps.get(&path) else {
+            continue;
+        };
+        if file_stamp(&path) != (modified, size) {
+            continue;
+        }
         conn.execute(
-            "INSERT INTO session_log_sync(file_path,last_modified,last_line_offset,last_synced_at)
-             VALUES (?1,?2,0,?3) ON CONFLICT(file_path) DO UPDATE SET last_modified=excluded.last_modified,last_synced_at=excluded.last_synced_at",
-            params![path.to_string_lossy(), modified, now],
+            "INSERT INTO session_log_sync(file_path,last_modified,last_line_offset,last_synced_at,last_file_size)
+             VALUES (?1,?2,0,?3,?4) ON CONFLICT(file_path) DO UPDATE SET last_modified=excluded.last_modified,last_synced_at=excluded.last_synced_at,last_file_size=excluded.last_file_size",
+            params![path.to_string_lossy(), modified, now, size],
         )?;
     }
     Ok(())
@@ -1562,6 +1724,24 @@ mod tests {
         let verified = crate::verify_cc_switch_mirror(&source_config, &local.database).unwrap();
         assert_eq!(verified.detail_rows, 2);
         assert_eq!(verified.rollup_rows, 2);
+        source_conn.execute_batch("ALTER TABLE proxy_request_logs ADD COLUMN service_tier TEXT; ALTER TABLE proxy_request_logs ADD COLUMN service_tier_source TEXT; ALTER TABLE proxy_request_logs ADD COLUMN reasoning_effort TEXT; ALTER TABLE proxy_request_logs ADD COLUMN service_tier_pricing_version INTEGER; PRAGMA user_version=21; UPDATE proxy_request_logs SET service_tier='fast',service_tier_source='response',reasoning_effort='high',service_tier_pricing_version=2,total_cost_usd='2.5' WHERE request_id='request-a';").unwrap();
+        assert_eq!(
+            sync_cc_switch(&source_config, &local.database)
+                .unwrap()
+                .imported,
+            1
+        );
+        let enriched = crate::read_events(&mirror_config, &Cursor::default()).unwrap();
+        assert_eq!(enriched[0].service_tier.as_deref(), Some("fast"));
+        assert_eq!(enriched[0].total_cost_usd, "2.5");
+        assert_eq!(enriched[0].created_at, 10);
+        assert_eq!(
+            sync_cc_switch(&source_config, &local.database)
+                .unwrap()
+                .imported,
+            0
+        );
+        crate::verify_cc_switch_mirror(&source_config, &local.database).unwrap();
         source_conn
             .execute(
                 "UPDATE proxy_request_logs SET input_tokens=99 WHERE request_id='request-a'",
@@ -1569,5 +1749,172 @@ mod tests {
             )
             .unwrap();
         assert!(crate::verify_cc_switch_mirror(&source_config, &local.database).is_err());
+    }
+    #[test]
+    fn fast_backfill_preserves_historical_prices_reported_totals_and_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        init_local_ledger(&path).unwrap();
+        let db = Connection::open(&path).unwrap();
+        let mut record = UsageRecord {
+            request_id: "fast-row".into(),
+            app_type: "codex".into(),
+            provider_id: "p".into(),
+            provider_type: "codex_session".into(),
+            data_source: "codex_session".into(),
+            model: "gpt-5.5".into(),
+            request_model: "gpt-5.5".into(),
+            pricing_model: None,
+            service_tier: None,
+            service_tier_source: None,
+            reasoning_effort: None,
+            service_tier_pricing_version: None,
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            input_token_semantics: 1,
+            created_at: 100,
+            session_id: None,
+            source_path: PathBuf::from("rollout.jsonl"),
+            is_streaming: true,
+            status_code: 200,
+            latency_ms: 0,
+            reported_total_cost_usd: None,
+            identity: None,
+        };
+        let mut pricing = HashMap::from([(
+            "gpt-5.5".into(),
+            Pricing {
+                input_cost_per_million: Decimal::ONE,
+                output_cost_per_million: Decimal::ONE,
+                cache_read_cost_per_million: Decimal::ONE,
+                cache_creation_cost_per_million: Decimal::ONE,
+            },
+        )]);
+        assert!(insert_record(&db, &record, &pricing, "local").unwrap());
+        record.service_tier = Some("priority".into());
+        record.service_tier_source = Some("request".into());
+        record.reasoning_effort = Some("high".into());
+        record.service_tier_pricing_version = Some(2);
+        pricing.get_mut("gpt-5.5").unwrap().input_cost_per_million = Decimal::from(100);
+        assert!(insert_record(&db, &record, &pricing, "local").unwrap());
+        let total = || {
+            db.query_row("SELECT CAST(total_cost_usd AS REAL) FROM proxy_request_logs WHERE request_id='fast-row'",[],|r| r.get::<_,f64>(0)).unwrap()
+        };
+        assert_eq!(total(), 2.5);
+        assert!(!insert_record(&db, &record, &pricing, "local").unwrap());
+        assert_eq!(total(), 2.5);
+        db.execute("UPDATE proxy_request_logs SET total_cost_usd='7.0'", [])
+            .unwrap();
+        record.service_tier = Some("default".into());
+        insert_record(&db, &record, &pricing, "local").unwrap();
+        assert_eq!(total(), 7.0);
+        db.execute("INSERT INTO compaction_barriers VALUES (200,300)", [])
+            .unwrap();
+        record.request_id = "pruned".into();
+        record.created_at = 250;
+        assert!(!insert_record(&db, &record, &pricing, "local").unwrap());
+    }
+
+    #[test]
+    fn known_importer_upgrade_preserves_barriers_and_non_codex_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        init_local_ledger(&path).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute("UPDATE ledger_meta SET value='cc-switch-3217f725:session-usage-v3-six-source:unified-app-key-v3' WHERE key='importer_revision'",[]).unwrap();
+        db.execute_batch("INSERT INTO compaction_barriers VALUES (1,2); INSERT INTO session_log_sync(file_path,last_modified,last_line_offset,last_synced_at) VALUES ('/codex/rollout-123.jsonl',1,1,1),('/claude/session.jsonl',1,1,1);").unwrap();
+        init_local_ledger(&path).unwrap();
+        verify_revision(&db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM compaction_barriers", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT file_path FROM session_log_sync", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "/claude/session.jsonl"
+        );
+        init_local_ledger(&path).unwrap();
+        verify_revision(&db).unwrap();
+    }
+    #[test]
+    fn upgrade_reconciliation_and_scan_cursors_are_atomic_and_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        init_local_ledger(&path).unwrap();
+        let mut db = Connection::open(&path).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let deferred_id = "00000000-0000-4000-8000-000000000002";
+        let file = dir.path().join(format!("rollout-{id}.jsonl"));
+        fs::write(&file, "").unwrap();
+        let deferred = dir.path().join(format!("rollout-{deferred_id}.jsonl"));
+        fs::write(&deferred, "").unwrap();
+        for (thread, index, collector) in [
+            (id, 1, "local"),
+            (id, 2, "cc-switch"),
+            (deferred_id, 1, "local"),
+        ] {
+            db.execute("INSERT INTO proxy_request_logs(request_id,app_type,provider_id,model,created_at,last_collector,data_source) VALUES (?1,'codex','p','gpt-5.5',100,?2,'codex_session')",params![format!("codex_session:thread-v1:{thread}:{index}"),collector]).unwrap();
+        }
+        db.execute(
+            "INSERT INTO ledger_meta VALUES ('codex_fast_reconcile','1')",
+            [],
+        )
+        .unwrap();
+        let stamps = HashMap::from([
+            (file.clone(), file_stamp(&file)),
+            (deferred.clone(), file_stamp(&deferred)),
+        ]);
+        let report = || ImportReport {
+            scanned_paths: vec![file.clone(), deferred.clone()],
+            deferred_paths: vec![deferred.clone()],
+            ..Default::default()
+        };
+        {
+            let tx = db.transaction().unwrap();
+            reconcile_codex_upgrade(&tx, &report()).unwrap();
+            record_scan_metadata(&tx, report(), &stamps).unwrap();
+            // Simulate interruption before commit: neither cursors nor data advance.
+        }
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM session_log_sync", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let tx = db.transaction().unwrap();
+        reconcile_codex_upgrade(&tx, &report()).unwrap();
+        record_scan_metadata(&tx, report(), &stamps).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM session_log_sync", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ledger_meta WHERE key='codex_fast_reconcile')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap());
     }
 }

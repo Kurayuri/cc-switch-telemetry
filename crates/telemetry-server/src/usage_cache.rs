@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const HOUR_SECONDS: i64 = 3_600;
@@ -121,7 +121,11 @@ pub(crate) fn mark_node_dirty(connection: &Connection, node_id: &str) -> rusqlit
     Ok(())
 }
 
-fn rebuild_one_before(connection: &Connection, before_hour: Option<i64>) -> anyhow::Result<bool> {
+pub(crate) fn rebuild_one_before(
+    connection: &Connection,
+    before_hour: Option<i64>,
+    multipliers: &[crate::settings::ModelBillingMultiplier],
+) -> anyhow::Result<bool> {
     let partition = match before_hour {
         Some(before_hour) => connection
             .query_row(
@@ -148,12 +152,14 @@ fn rebuild_one_before(connection: &Connection, before_hour: Option<i64>) -> anyh
     let fresh = cc_switch_usage_core::sql::fresh_input("e");
     let app = cc_switch_usage_core::sql::folded_app_type("e.app_type");
     let model = cc_switch_usage_core::sql::effective_model("e");
+    let signature = crate::billing_cache::signature_sql(&model, multipliers);
+    let (cost, unadjusted) = crate::billing_cache::projection_sql("e", &model, multipliers);
     let sql = format!(
         "INSERT INTO usage_hourly_cache (
            node_id,hour_start,app_type,provider_app_type,provider_id,model,
            request_model,pricing_model,data_source,request_count,success_count,
            input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,
-           total_cost_usd,latency_total_ms,first_event_at,last_event_at
+           total_cost_usd,latency_total_ms,first_event_at,last_event_at,billing_signature,adjusted_cost,unadjusted_requests
          )
          SELECT e.node_id,?2,{app},e.app_type,e.provider_id,{model},
                 e.request_model,e.pricing_model,e.data_source,
@@ -163,7 +169,7 @@ fn rebuild_one_before(connection: &Connection, before_hour: Option<i64>) -> anyh
                 COALESCE(SUM(e.cache_read_tokens),0),
                 COALESCE(SUM(e.cache_creation_tokens),0),
                 CAST(COALESCE(SUM(CAST(e.total_cost_usd AS REAL)),0) AS TEXT),
-                COALESCE(SUM(e.latency_ms),0),MIN(e.created_at),MAX(e.created_at)
+                COALESCE(SUM(e.latency_ms),0),MIN(e.created_at),MAX(e.created_at),{signature},SUM({cost}),SUM({unadjusted})
          FROM usage_events e
          WHERE e.node_id=?1 AND e.created_at>=?2 AND e.created_at<?3
          GROUP BY e.node_id,{app},e.app_type,e.provider_id,{model},
@@ -186,28 +192,42 @@ fn rebuild_one_before(connection: &Connection, before_hour: Option<i64>) -> anyh
 
 #[cfg(test)]
 pub(crate) fn rebuild_one(connection: &Connection) -> anyhow::Result<bool> {
-    rebuild_one_before(connection, None)
+    rebuild_one_before(connection, None, &[])
 }
 
-pub(crate) fn spawn_worker(db: Arc<Mutex<Connection>>) {
+pub(crate) fn spawn_worker(state: crate::ServerState) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
     handle.spawn(async move {
         loop {
-            let rebuilt = match db.try_lock() {
-                Ok(connection) => match rebuild_one_before(
-                    &connection,
-                    Some(hour_start(chrono::Utc::now().timestamp())),
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        eprintln!("usage cache rebuild failed: {error}");
-                        false
-                    }
-                },
-                Err(_) => false,
-            };
+            let worker_db = Arc::clone(&state.db);
+            let settings_state = state.clone();
+            let rebuilt = tokio::task::spawn_blocking(move || {
+                let Ok(settings) = crate::settings::read(&settings_state) else {
+                    return false;
+                };
+                let multipliers = &settings.dashboard_defaults.model_billing_multipliers;
+                let Ok(connection) = worker_db.try_lock() else {
+                    return false;
+                };
+                let result = (|| -> anyhow::Result<bool> {
+                    let quota = crate::quota::rebuild_reset_cache(&connection)?;
+                    let billing = crate::billing_cache::rebuild_batch(&connection, multipliers)?;
+                    let usage = rebuild_one_before(
+                        &connection,
+                        Some(hour_start(chrono::Utc::now().timestamp())),
+                        multipliers,
+                    )?;
+                    Ok(quota || usage || billing)
+                })();
+                result.unwrap_or_else(|err| {
+                    eprintln!("projection rebuild failed: {err}");
+                    false
+                })
+            })
+            .await
+            .unwrap_or(false);
             tokio::time::sleep(if rebuilt {
                 Duration::from_millis(100)
             } else {

@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#0b1020">
   <meta name="description" content="CC Switch request usage and telemetry dashboard">
   <title>CC Switch Telemetry</title>
-  <link rel="icon" href="/dashboard/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/dashboard/favicon.svg?v=2" type="image/svg+xml">
   <link rel="stylesheet" href="/dashboard/styles.css">
   <script type="module" src="/dashboard/app.js"></script>
 </head>
@@ -91,7 +91,7 @@
         <form id="rangePickerForm">
           <div class="dialog-heading">
             <div>
-              <p class="eyebrow">CUSTOM RANGE</p>
+              <p id="rangePickerEyebrow" class="eyebrow">CUSTOM RANGE</p>
               <h2 id="customRangeTitle" data-i18n="filters.customTitle">Custom time range</h2>
             </div>
             <button id="closeRangePicker" class="icon-button" type="button" aria-label="Close" data-i18n-aria-label="action.cancel">×</button>
@@ -105,12 +105,11 @@
             <button type="button" class="range-preset-button" data-range-preset="30d" data-i18n="filters.range30d">Last 30 days</button>
             <button type="button" class="range-preset-button" data-range-preset="1y" data-i18n="filters.range1y">Last calendar year</button>
             <button type="button" class="range-preset-button" data-range-preset="all" data-i18n="filters.rangeAll">All time</button>
-            <button type="button" class="range-preset-button" data-range-preset="last-reset" data-i18n="filters.rangeLastReset">Last reset</button>
-            <button type="button" class="range-preset-button" data-range-preset="past-resets" data-i18n="filters.rangePastResets">Past Resets</button>
+            <button type="button" class="range-preset-button" data-range-preset="last-reset" data-i18n="filters.rangeLastReset">Reset cycle</button>
             <button type="button" id="customRangePreset" class="range-preset-button active" data-range-preset="custom" data-i18n="filters.custom">Custom</button>
           </div>
           <div id="customRangeEditor" class="custom-range-editor">
-            <p class="range-picker-hint muted" data-i18n="filters.customHint">Choose dates and times. The first default is the latest complete local day.</p>
+            <p class="range-picker-hint muted" data-i18n="filters.customHint">Defaults to today, 00:00:00–23:59:59. Click a start date, then an end date; click again to start a new range.</p>
             <div class="custom-range-layout">
               <div class="custom-range-fields">
                 <label class="range-field-card" data-range-field="start">
@@ -135,7 +134,7 @@
             </div>
           </div>
           <div id="lastResetEditor" class="last-reset-editor" hidden>
-            <p class="range-picker-hint muted" data-i18n="filters.lastResetHint">Choose a quota provider and reset tier. The range starts one tier period before the next reset and ends now.</p>
+            <p class="range-picker-hint muted" data-i18n="filters.lastResetHint">Choose a current, previous, or recorded reset cycle.</p>
             <div class="last-reset-fields">
               <label>
                 <span data-i18n="filters.lastResetProvider">Quota Provider</span>
@@ -145,6 +144,13 @@
                 <span data-i18n="filters.lastResetTier">Reset tier</span>
                 <select id="lastResetTier"></select>
               </label>
+              <div class="reset-cycle-field">
+                <div class="reset-cycle-shortcuts">
+                  <button id="resetCycleCurrent" type="button" class="range-preset-button" data-i18n="filters.currentCycle">Current cycle</button>
+                  <button id="resetCycleLast" type="button" class="range-preset-button" data-i18n="filters.lastCycle">Last cycle</button>
+                </div>
+                <label><span data-i18n="filters.pastResetCycle">Cycle</span><select id="resetCycleSelect"></select></label>
+              </div>
             </div>
             <div class="last-reset-preview" aria-live="polite">
               <div class="last-reset-preview-item">
@@ -156,22 +162,10 @@
                 <strong id="lastResetTo">—</strong>
               </div>
             </div>
-            <p id="lastResetError" class="dialog-error" role="alert" hidden></p>
+            <p id="lastResetError" class="dialog-error" role="status" hidden></p>
+            <button id="resetCycleRetry" type="button" class="button secondary" data-i18n="filters.pastResetRetry" hidden>Retry</button>
           </div>
-          <div id="pastResetEditor" class="last-reset-editor" hidden>
-            <p class="range-picker-hint muted" data-i18n="filters.pastResetHint">Choose a recorded cycle with nonzero usage. A current cycle ends now.</p>
-            <div class="last-reset-fields">
-              <label><span data-i18n="filters.lastResetProvider">Quota Provider</span><select id="pastResetProvider"></select></label>
-              <label><span data-i18n="filters.lastResetTier">Reset tier</span><select id="pastResetTier"></select></label>
-              <label class="past-reset-cycle"><span data-i18n="filters.pastResetCycle">Cycle</span><select id="pastResetCycle"></select></label>
-            </div>
-            <div class="last-reset-preview" aria-live="polite">
-              <div class="last-reset-preview-item"><span data-i18n="filters.start">Start</span><strong id="pastResetFrom">—</strong></div>
-              <div class="last-reset-preview-item"><span data-i18n="filters.end">End</span><strong id="pastResetTo">—</strong></div>
-            </div>
-            <p id="pastResetStatus" class="range-picker-hint muted" role="status" hidden></p>
-            <button id="pastResetRetry" type="button" class="button secondary" data-i18n="filters.pastResetRetry" hidden>Retry</button>
-          </div>
+
           <div class="dialog-actions">
             <button id="cancelRange" class="button secondary" type="button" data-i18n="action.cancel">Cancel</button>
             <button id="applyRange" class="button primary" type="submit" data-i18n="action.applyRange">Apply range</button>
@@ -210,6 +204,30 @@
         </form>
       </dialog>
 
+        <dialog id="historyReferenceDialog" class="bucket-picker-dialog" aria-labelledby="historyReferenceTitle">
+          <form id="historyReferenceForm">
+            <div class="dialog-heading"><h2 id="historyReferenceTitle" data-i18n="history.title">Historical quota reference</h2></div>
+            <div class="history-reference-fields">
+              <label><span data-i18n="history.source">Reference source</span><select id="historyReferenceSource">
+                <option value="none" data-i18n="history.none">None</option>
+                <option value="full" data-i18n="history.full">Previous full-quota cycle</option>
+                <option value="previous" data-i18n="history.previous">Previous cycle</option>
+                <option value="cycle" data-i18n="history.cycle">Choose Reset cycle</option>
+                <option value="manual" data-i18n="history.manual">Manual amount</option>
+              </select></label>
+              <label id="historyReferenceAmountField" hidden><span data-i18n="history.amount">Quota amount (USD)</span><input id="historyReferenceAmount" type="number" min="0" step="any" inputmode="decimal"></label>
+              <label id="historyReferenceCycleField" hidden><span data-i18n="filters.pastResetCycle">Cycle</span><select id="historyReferenceCycle"></select></label>
+            </div>
+            <p class="range-picker-hint muted" data-i18n="history.hint">The reference amount represents 100%. Full means an ended cycle that reached 100%.</p>
+            <div id="historyReferencePreview" class="history-reference-preview" role="status" aria-live="polite"></div>
+            <div class="dialog-actions">
+              <button id="historyReferenceRetry" type="button" class="button secondary" data-i18n="filters.pastResetRetry" hidden>Retry</button>
+              <button id="historyReferenceCancel" type="button" class="button secondary" data-i18n="action.cancel">Cancel</button>
+              <button id="historyReferenceApply" type="submit" class="button primary" data-i18n="history.apply">Apply</button>
+            </div>
+          </form>
+        </dialog>
+
       <section class="kpi-grid" aria-label="Key metrics" data-i18n-aria-label="kpi.aria">
         <article class="kpi-card requests-card">
           <div class="kpi-heading"><span class="kpi-icon requests-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M5 5.75h14M5 12h14M5 18.25h9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="3.5" cy="5.75" r=".75" fill="currentColor"/><circle cx="3.5" cy="12" r=".75" fill="currentColor"/><circle cx="3.5" cy="18.25" r=".75" fill="currentColor"/></svg></span><span class="kpi-label" data-i18n="kpi.requests">Requests</span></div>
@@ -237,7 +255,7 @@
           </div>
         </article>
         <article class="kpi-card cost-card">
-          <div class="kpi-heading"><span class="kpi-icon cost-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3.5v17M16 7.25c-.65-1.1-1.85-1.75-3.5-1.75-2.2 0-3.5 1.1-3.5 2.75 0 4.25 7 2.25 7 6.5 0 1.65-1.35 2.75-3.75 2.75-1.8 0-3.1-.7-3.75-1.9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span><span class="kpi-label" data-i18n="kpi.cost">Estimated cost</span></div>
+          <div class="kpi-heading"><span class="kpi-icon cost-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3.5v17M16 7.25c-.65-1.1-1.85-1.75-3.5-1.75-2.2 0-3.5 1.1-3.5 2.75 0 4.25 7 2.25 7 6.5 0 1.65-1.35 2.75-3.75 2.75-1.8 0-3.1-.7-3.75-1.9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span><span class="kpi-label" data-i18n="kpi.cost">Est. cost</span></div>
           <strong id="kpiCost">—</strong>
           <small id="kpiCostAdjustment" class="cost-adjustment" hidden></small>
           <div class="cost-top-label" data-i18n="kpi.topModels">Top models by cost</div>
@@ -256,35 +274,50 @@
       </section>
 
       <section class="panel chart-panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">TREND</p>
-            <h2 data-i18n="trend.title">Usage trend</h2>
-          </div>
-          <div class="trend-controls">
-            <label class="metric-picker">
-              <span class="sr-only" data-i18n="trend.metricAria">Trend metric</span>
-              <select id="trendMetric">
-                <option value="realTotalTokens" data-i18n="kpi.tokens">Token</option>
-                <option value="totalRequests" data-i18n="kpi.requests">Requests</option>
-                <option value="totalCostUsd" data-i18n="kpi.cost">Estimated cost</option>
-                <option value="avgLatencyMs" data-i18n="kpi.latency">Average latency</option>
-              </select>
-            </label>
-            <label id="trendCumulativeToggle" class="trend-cumulative-toggle">
-              <input id="trendCumulative" type="checkbox">
-              <span data-i18n="trend.cumulative">Show cumulative data for range</span>
-            </label>
-            <label class="bucket-picker">
-              <span class="sr-only" data-i18n="trend.bucketAria">Time granularity</span>
-              <button id="trendBucketTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
-                <span id="trendBucketLabel">Auto</span>
-                <svg class="picker-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m7 9 5 5 5-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-            </label>
-            <span id="resolvedBucket" class="resolved-bucket muted" aria-live="polite"></span>
+        <p class="eyebrow">TREND</p>
+        <div class="trend-heading">
+          <h2 data-i18n="trend.title">Usage trend</h2>
+          <div class="trend-toolbar">
+            <div class="trend-controls">
+              <label class="metric-picker">
+                <span class="sr-only" data-i18n="trend.metricAria">Trend metric</span>
+                <select id="trendMetric">
+                  <option value="realTotalTokens" data-i18n="kpi.tokens">Token</option>
+                  <option value="totalRequests" data-i18n="kpi.requests">Requests</option>
+                  <option value="totalCostUsd" data-i18n="kpi.cost">Est. cost</option>
+                  <option value="avgLatencyMs" data-i18n="kpi.latency">Average latency</option>
+                </select>
+              </label>
+              <label class="trend-cumulative-toggle">
+                <input id="trendCompare" type="checkbox">
+                <span data-i18n="compare.toggle">Compare Quota</span>
+              </label>
+              <label id="trendCumulativeToggle" class="trend-cumulative-toggle" title="Cumulative usage within the selected time range" data-i18n-title="trend.cumulativeHint">
+                <input id="trendCumulative" type="checkbox" aria-label="Cumulative usage within the selected time range" data-i18n-aria-label="trend.cumulativeHint">
+                <span data-i18n="trend.cumulativeLabel">Cumulative</span>
+              </label>
+              <label class="bucket-picker">
+                <span class="sr-only" data-i18n="trend.bucketAria">Time granularity</span>
+                <button id="trendBucketTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-expanded="false">
+                  <span id="trendBucketLabel">Auto</span>
+                  <svg class="picker-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m7 9 5 5 5-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+              </label>
+              <span id="resolvedBucket" class="resolved-bucket muted" aria-live="polite"></span>
+            </div>
+            <div id="comparisonControls" class="comparison-controls" hidden>
+              <label><span class="sr-only" data-i18n="compare.provider">Quota Provider</span><select id="comparisonProvider" title="Quota Provider" data-i18n-title="compare.provider"></select></label>
+              <label><span class="sr-only" data-i18n="compare.tier">Quota window</span><select id="comparisonTier" title="Quota window" data-i18n-title="compare.tier"></select></label>
+              <label class="trend-cumulative-toggle comparison-predict"><input id="comparisonPredict" type="checkbox"><span data-i18n="quota.predict">Predict</span></label>
+              <label class="trend-cumulative-toggle comparison-predict" title="Quota estimate based on cycle cost and utilization" data-i18n-title="compare.estimateHint"><input id="comparisonEstimatedQuota" type="checkbox" aria-label="Quota estimate based on cycle cost and utilization" data-i18n-aria-label="compare.estimateHint"><span data-i18n="compare.estimateLabel">Est. quota</span></label>
+              <div class="history-reference-controls">
+                <button id="historyReferenceEdit" class="button secondary history-reference-summary" type="button" aria-haspopup="dialog" aria-controls="historyReferenceDialog" aria-expanded="false">History</button>
+              </div>
+            </div>
           </div>
         </div>
+        <p id="comparisonStatus" class="coverage muted" role="status" hidden></p>
+        <p id="estimatedQuotaStatus" class="coverage muted" role="status" hidden></p>
         <div id="trendEmpty" class="empty-state" hidden data-i18n="trend.empty">No trend data for the current filters</div>
         <div id="trendChart" class="trend-chart echarts-chart" role="img" aria-label="Usage trend chart" data-i18n-aria-label="trend.chartAria"></div>
         <p id="coverageText" class="coverage muted">Data coverage: —</p>
@@ -301,7 +334,7 @@
         <div class="quota-controls">
           <label>
             <span data-i18n="quota.node">Node</span>
-            <select id="quotaNodeFilter"><option value="" data-i18n="quota.allNodes">All quota nodes</option></select>
+            <select id="quotaNodeFilter"><option value="" data-i18n="quota.allNodes">All nodes</option></select>
           </label>
           <label>
             <span data-i18n="quota.provider">Provider</span>
@@ -312,7 +345,7 @@
             <div id="quotaMetricFilter" class="quota-picker"></div>
           </label>
           <label class="quota-granularity-control">
-            <span data-i18n="quota.granularity">Quota granularity</span>
+            <span data-i18n="quota.granularityShort">Granularity</span>
             <button id="quotaBucketTrigger" class="picker-trigger" type="button" aria-haspopup="dialog" aria-controls="bucketPickerDialog" aria-expanded="false" data-i18n-aria-label="quota.granularity"><span id="quotaGranularityLabel">Auto</span></button>
           </label>
           <button id="restoreQuotaDefaults" class="button secondary quota-restore-button" type="button" data-i18n="quota.restoreDefaults">Restore defaults</button>
@@ -336,7 +369,7 @@
               <select id="dailyMetric">
                 <option value="realTotalTokens" data-i18n="kpi.tokens">Token</option>
                 <option value="totalRequests" data-i18n="kpi.requests">Requests</option>
-                <option value="totalCostUsd" data-i18n="kpi.cost">Estimated cost</option>
+                <option value="totalCostUsd" data-i18n="kpi.cost">Est. cost</option>
               </select>
             </label>
             <div class="daily-legend" aria-hidden="true"><span data-i18n="daily.less">Less</span><i class="daily-level-0"></i><i class="daily-level-1"></i><i class="daily-level-2"></i><i class="daily-level-3"></i><i class="daily-level-4"></i><span data-i18n="daily.more">More</span></div>
@@ -363,7 +396,7 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th data-i18n="breakdown.name">Name</th><th data-i18n="breakdown.requests">Requests</th><th data-i18n="kpi.tokens">Token</th><th data-i18n="kpi.successRate">Success rate</th><th data-i18n="kpi.cost">Estimated cost</th></tr></thead>
+            <thead><tr><th data-i18n="breakdown.name">Name</th><th data-i18n="breakdown.requests">Requests</th><th data-i18n="kpi.tokens">Token</th><th data-i18n="kpi.successRate">Success rate</th><th data-i18n="kpi.cost">Est. cost</th></tr></thead>
             <tbody id="breakdownRows"></tbody>
           </table>
         </div>
@@ -376,7 +409,7 @@
             <p class="eyebrow">RECENT EVENTS</p>
             <h2 data-i18n="events.title">Recent requests</h2>
           </div>
-          <span class="muted" data-i18n="events.order">Newest events first</span>
+          <div class="event-filters"><label><span data-i18n="events.tier"></span><select id="eventTierFilter"><option value="" data-i18n="events.all">All</option><option value="unknown" data-i18n="events.unknown">Unknown</option><option value="auto">Auto</option><option value="default">Standard</option><option value="flex">Flex</option><option value="priority">Priority</option><option value="fast">Fast</option><option value="ultrafast">Ultrafast</option><option value="scale">Scale</option></select></label><label><span data-i18n="events.effort"></span><select id="eventEffortFilter"><option value="" data-i18n="events.all">All</option><option value="unknown" data-i18n="events.unknown">Unknown</option><option value="none">None</option><option value="minimal">Minimal</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Xhigh</option><option value="max">Max</option><option value="ultra">Ultra</option></select></label></div>
         </div>
         <div class="table-wrap event-table">
           <table>

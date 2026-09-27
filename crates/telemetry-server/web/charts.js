@@ -91,6 +91,7 @@ export function accumulateTrendPoints(points) {
   let cacheReadTokens = 0;
   let outputTokens = 0;
   let totalCostUsd = 0;
+  let unadjustedCostRequests = 0;
   let latencyTotalMs = 0;
   return (points || []).map((point) => {
     const requests = Number(point.totalRequests) || 0;
@@ -101,6 +102,7 @@ export function accumulateTrendPoints(points) {
     cacheReadTokens += Number(point.cacheReadTokens) || 0;
     outputTokens += Number(point.outputTokens) || 0;
     totalCostUsd += Number(point.totalCostUsd) || 0;
+    unadjustedCostRequests += Number(point.unadjustedCostRequests) || 0;
     latencyTotalMs += (Number(point.avgLatencyMs) || 0) * requests;
     const inputTokens = freshInputTokens + cacheCreationTokens + cacheReadTokens;
     return {
@@ -115,6 +117,7 @@ export function accumulateTrendPoints(points) {
       outputTokens,
       realTotalTokens: inputTokens + outputTokens,
       totalCostUsd,
+      unadjustedCostRequests,
       avgLatencyMs: totalRequests > 0 ? latencyTotalMs / totalRequests : 0,
       cacheHitRate: inputTokens > 0 ? cacheReadTokens / inputTokens : 0,
     };
@@ -139,6 +142,10 @@ export function buildTrendOption({
     value: [Number(point.bucketStart) * 1_000, Number(point[metric] || 0)],
     source: point,
   }));
+  const maximum = data.reduce((max, point) => {
+    const value = point.value[1];
+    return Number.isFinite(value) ? Math.max(max, value) : max;
+  }, 0);
   const rangeFrom = Number(range.from) * 1_000;
   const rangeTo = Math.max(Number(range.to) * 1_000, rangeFrom + 1_000);
   return {
@@ -168,9 +175,14 @@ export function buildTrendOption({
       ...axisLine(palette),
       type: "value",
       min: 0,
+      max: maximum > 0 ? maximum : 1,
       splitNumber: 4,
+      // Clear comparison ticks when ECharts merges the ordinary trend option.
+      axisTick: { show: false, customValues: null },
+      splitLine: { ...axisLine(palette).splitLine, customValues: null },
       axisLabel: {
         ...axisLine(palette).axisLabel,
+        customValues: null, showMinLabel: null, showMaxLabel: null,
         formatter: (value) => formatValue(Number(value)),
       },
     },
@@ -180,7 +192,7 @@ export function buildTrendOption({
       type: "line",
       data,
       encode: { x: 0, y: 1 },
-      showSymbol: data.length <= 240,
+      showSymbol: data.length <= 120,
       symbol: "circle",
       symbolSize: 7,
       sampling: "lttb",
@@ -280,7 +292,7 @@ export function dailyCalendarLayout(range, chartWidth = 1120) {
 export function buildQuotaOption({
   plots,
   range,
-  amountRange,
+  amountRange = { minimum: 0, maximum: 1 },
   chartWidth = 840,
   palette,
   formatAxis,
@@ -333,6 +345,7 @@ export function buildQuotaOption({
       type: "line",
       yAxisIndex: actual.yAxisIndex,
       data: [plot.prediction.start, plot.prediction.end].map((point) => ({
+        id: point === plot.prediction.start ? "start" : "end",
         value: [point.at * 1000, point.value], axis: plot.axis, prediction: true,
       })),
       encode: { x: 0, y: 1 },
@@ -557,4 +570,166 @@ export function calendarAxisOptions(range, width, formatAxis, axisLabel = {}) {
     axisLabel: { ...axisLabel, hideOverlap: false, showMinLabel: true, showMaxLabel: true,
       formatter: (value) => labels.has(Number(value)) ? formatAxis(Number(value)) : "" },
   };
+}
+
+function trendBucketEnd(start, bucket, fallback) {
+  let end = NaN;
+  if (bucket === "1mo") {
+    const date = new Date(start * 1000);
+    end = Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1) / 1000;
+  } else {
+    const match = /^(\d+)(s|m|h|d)$/.exec(bucket || "");
+    if (match) end = start + Number(match[1]) * ({ s: 1, m: 60, h: 3600, d: 86400 })[match[2]];
+  }
+  return Number.isFinite(end) ? Math.min(end, fallback) : fallback;
+}
+
+function latestComparisonAnchor(points, metric, range, quotaPlot) {
+  const usage = (points || []).map((point) => ({
+    at: Number(point.bucketStart),
+    value: Number(point[metric] || 0),
+  })).filter((point) => Number.isFinite(point.at) && Number.isFinite(point.value))
+    .sort((left, right) => left.at - right.at);
+  const quota = (quotaPlot?.segments || []).flatMap((segment) => segment.map((point) => {
+    const value = quotaPlot.value(point);
+    return { at: Number(point.sampledAt), value: value == null ? NaN : Number(value) };
+  })).filter((point) => Number.isFinite(point.at) && Number.isFinite(point.value))
+    .sort((left, right) => left.at - right.at);
+  let quotaIndex = quota.length - 1;
+  for (let usageIndex = usage.length - 1; usageIndex >= 0 && quotaIndex >= 0; usageIndex--) {
+    const point = usage[usageIndex];
+    const fallback = usage[usageIndex + 1]?.at ?? Number(range?.to);
+    const end = trendBucketEnd(point.at, range?.bucket, fallback);
+    if (!Number.isFinite(end) || end <= point.at) continue;
+    while (quotaIndex >= 0 && quota[quotaIndex].at >= end) quotaIndex--;
+    if (quotaIndex >= 0 && quota[quotaIndex].at >= point.at) {
+      return { usage: point.value, utilization: quota[quotaIndex].value };
+    }
+  }
+  return null;
+}
+
+function alignComparisonAxes(option, points, metric, range, quotaPlot) {
+  const anchor = latestComparisonAnchor(points, metric, range, quotaPlot);
+  if (!(anchor?.usage > 0) || !(anchor.utilization > 0)) return;
+  const usageMaximum = Number(option.yAxis[0].max);
+  const utilizationMaximum = Number(option.yAxis[1].max);
+  if (!(usageMaximum > 0) || !(utilizationMaximum > 0)) return;
+  const usageScale = usageMaximum / anchor.usage;
+  const utilizationScale = utilizationMaximum / anchor.utilization;
+  if (usageScale >= utilizationScale) {
+    option.yAxis[1].max = anchor.utilization * usageScale;
+  } else {
+    option.yAxis[0].max = anchor.usage * utilizationScale;
+  }
+}
+
+function comparisonUtilizationTicks(maximum, includeFullQuota) {
+  // Keep roughly five ordinary intervals, optionally protecting full quota.
+  const target = maximum / 5;
+  const magnitude = 10 ** Math.floor(Math.log10(target));
+  const step = [1, 2, 5, 10].map((factor) => factor * magnitude).find((value) => value >= target);
+  const gap = maximum * 0.06;
+  const candidates = [maximum];
+  for (let index = 0; index <= Math.floor(maximum / step); index++) candidates.push(index * step);
+  const ticks = includeFullQuota ? [100] : [];
+  for (const value of candidates.sort((a, b) => a - b)) {
+    if (ticks.every((tick) => Math.abs(tick - value) >= gap)) ticks.push(value);
+  }
+  return ticks.sort((a, b) => a - b);
+}
+
+function alignComparisonTicks(option, includeFullQuota, palette) {
+  const maximum = option.yAxis[1].max;
+  const ticks = comparisonUtilizationTicks(maximum, includeFullQuota);
+  for (const [index, axis] of option.yAxis.entries()) {
+    const values = index === 1 ? ticks : ticks.map((value) => value / maximum * axis.max);
+    axis.axisTick = { show: true, customValues: values, lineStyle: { color: palette.muted } };
+    axis.axisLabel = { ...axis.axisLabel, customValues: values,
+      hideOverlap: false, showMinLabel: true, showMaxLabel: true };
+    // Only one grid is drawn, at exactly the same heights as every y-axis tick.
+    axis.splitLine = { ...axis.splitLine, show: index === 0, customValues: index === 0 ? values : null };
+  }
+}
+
+// Overlay exactly the same historical quota series used by Codex quota history.
+// Usage retains its own timestamps, filters, buckets and cumulative values.
+export function buildComparisonOption({ quotaPlot, usageLabel, quotaLabel,
+  usageRange, estimatedQuotaPlot, estimatedQuotaEnabled = false,
+  historyReference, historyReferenceEnabled = false, formatHistoryReferenceTooltip, formatMoney = String, formatEstimatedQuotaTooltip,
+  formatQuotaTooltip, formatPredictionTooltip, ...trendOptions }) {
+  const option = buildTrendOption(trendOptions);
+  const { palette, range, formatAxis, formatValue, formatTooltip } = trendOptions;
+  option.grid = { ...option.grid, top: 58 };
+  option.legend = { type: "scroll", top: 0, textStyle: { color: palette.text } };
+  const quotaMaximum = (quotaPlot?.segments || []).reduce((maximum, segment) =>
+    segment.reduce((value, point) => Math.max(value, Number(quotaPlot.value(point)) || 0), maximum),
+    Math.max(0, quotaPlot?.prediction?.start.value || 0, quotaPlot?.prediction?.end.value || 0));
+  option.yAxis = [
+    { ...option.yAxis, name: usageLabel, nameTextStyle: { color: palette.accent, align: "left" } },
+    { ...axisLine(palette), type: "value", min: 0,
+      max: estimatedQuotaEnabled || historyReferenceEnabled ? Math.max(100, quotaMaximum) : quotaMaximum || 1, position: "right",
+      name: quotaLabel, nameTextStyle: { color: quotaPlot?.color || palette.muted, align: "right" },
+      // Explicit nulls clear custom values from ECharts' previous merged option.
+      axisTick: { show: false, customValues: null },
+      axisLabel: { ...axisLine(palette).axisLabel, customValues: null, showMinLabel: null, showMaxLabel: null,
+        formatter: (value) => `${Math.round(Number(value))}%` },
+      splitLine: { show: false } },
+  ];
+  option.series[0].name = usageLabel;
+  option.series[0].yAxisIndex = 0;
+  if (quotaPlot) {
+    const quota = buildQuotaOption({ plots: [quotaPlot], range, palette, formatAxis,
+      formatAmount: formatValue, percentAxisName: quotaLabel });
+    option.series.push(...quota.series.map((series) => ({ ...series, yAxisIndex: 1 })));
+  }
+  const reference = historyReference?.amount > 0 && Number.isFinite(historyReference.amount) ? historyReference : null;
+  if (estimatedQuotaPlot || reference) {
+    const maximum = (estimatedQuotaPlot?.points || []).reduce((max, point) =>
+      Number.isFinite(point.value) ? Math.max(max, point.value) : max, reference?.amount || 0);
+    const costMetric = trendOptions.metric === "totalCostUsd";
+    if (costMetric) {
+      option.yAxis[0].max = Math.max(option.yAxis[0].max, maximum);
+    } else {
+      option.grid.right = 32;
+      if (trendOptions.chartWidth < 480) option.yAxis[1].name = "%";
+      option.yAxis.push({ ...axisLine(palette), type: "value", min: 0, max: maximum || 1,
+        position: "right", offset: 56, name: "USD", splitNumber: 4,
+        nameTextStyle: { color: estimatedQuotaPlot?.color || reference?.color, align: "right" },
+        axisLabel: { ...axisLine(palette).axisLabel, formatter: formatMoney },
+        splitLine: { show: false } });
+    }
+    if (estimatedQuotaPlot) option.series.push({ id: "estimated-quota", name: estimatedQuotaPlot.name, type: "line",
+      yAxisIndex: costMetric ? 0 : 2, encode: { x: 0, y: 1 },
+      data: estimatedQuotaPlot.points.map((point) => ({ id: `${point.cycleFrom ?? "gap"}:${point.at}`, value: [point.at * 1000, point.value],
+        estimate: point })),
+      connectNulls: false, showSymbol: estimatedQuotaPlot.points.length <= 120, symbolSize: 5,
+      lineStyle: { color: estimatedQuotaPlot.color, type: "dashed", width: 2 },
+      itemStyle: { color: estimatedQuotaPlot.color },
+    });
+  }
+  if (reference) {
+    const dollarIndex = trendOptions.metric === "totalCostUsd" ? 0 : 2;
+    const maximum = Math.max(100, option.yAxis[1].max, option.yAxis[dollarIndex].max / reference.amount * 100);
+    option.yAxis[1].max = maximum;
+    option.yAxis[dollarIndex].max = reference.amount * maximum / 100;
+    option.series.push({ id: "history-quota", name: reference.name, type: "line", yAxisIndex: dollarIndex,
+      data: [range.from, range.to].map((at) => ({ value: [at * 1000, reference.amount], reference })),
+      showSymbol: false, lineStyle: { color: reference.color, type: "dashed", width: 2 },
+      itemStyle: { color: reference.color },
+      endLabel: { show: true, formatter: () => formatMoney(reference.amount), distance: -8,
+        align: "right", verticalAlign: "bottom", color: reference.color },
+    });
+  } else if (!historyReferenceEnabled) {
+    alignComparisonAxes(option, trendOptions.points, trendOptions.metric,
+      usageRange || trendOptions.range, quotaPlot);
+  }
+  alignComparisonTicks(option, estimatedQuotaEnabled || historyReferenceEnabled, palette);
+  option.tooltip = tooltipOptions(palette, (params) => (Array.isArray(params) ? params : [params])
+    .filter((item) => item?.data?.source || item?.data?.prediction || item?.data?.estimate?.value != null || item?.data?.reference)
+    .map((item) => item.data.reference ? (formatHistoryReferenceTooltip?.(item.data.reference) || formatMoney(item.data.reference.amount))
+      : item.data.estimate ? formatEstimatedQuotaTooltip(item.data.estimate)
+      : item.data.prediction ? formatPredictionTooltip(item.data) : item.seriesId === "usage-trend"
+      ? formatTooltip(item.data.source) : formatQuotaTooltip(item.data.source)).join("<br>"));
+  return option;
 }

@@ -58,6 +58,14 @@ export function quotaAmount(metric) {
   return optionalQuotaNumber(metric?.total);
 }
 
+export function estimatedQuota(metric, totalCostUsd) {
+  const cost = optionalQuotaNumber(totalCostUsd);
+  const percentage = quotaPercentage(metric);
+  if (cost == null || percentage == null || percentage <= 0) return null;
+  const estimate = cost / (percentage / 100);
+  return Number.isFinite(estimate) ? estimate : null;
+}
+
 export function quotaMetricValue(metric) {
   return quotaPercentage(metric) ?? quotaAmount(metric);
 }

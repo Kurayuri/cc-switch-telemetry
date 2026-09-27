@@ -107,6 +107,10 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<UsageEvent> {
         model: row.get("model")?,
         request_model: row.get("request_model")?,
         pricing_model: row.get("pricing_model")?,
+        service_tier: row.get("service_tier")?,
+        service_tier_source: row.get("service_tier_source")?,
+        reasoning_effort: row.get("reasoning_effort")?,
+        service_tier_pricing_version: row.get("service_tier_pricing_version")?,
         input_tokens: row.get("input_tokens")?,
         output_tokens: row.get("output_tokens")?,
         cache_read_tokens: row.get("cache_read_tokens")?,
@@ -127,12 +131,27 @@ pub fn read_events(config: &ClientConfig, cursor: &Cursor) -> anyhow::Result<Vec
     )
     .context("open cc-switch db read-only")?;
     conn.busy_timeout(Duration::from_secs(2))?;
-    let has_input_semantics = conn
+    let columns = conn
         .prepare("PRAGMA table_info(proxy_request_logs)")?
         .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_input_semantics = columns
         .iter()
         .any(|column| column == "input_token_semantics");
+    let metadata_columns = [
+        "service_tier",
+        "service_tier_source",
+        "reasoning_effort",
+        "service_tier_pricing_version",
+    ]
+    .map(|name| {
+        if columns.iter().any(|c| c == name) {
+            name.to_string()
+        } else {
+            format!("NULL AS {name}")
+        }
+    })
+    .join(",");
     let semantics_column = if has_input_semantics {
         "input_token_semantics"
     } else {
@@ -141,7 +160,7 @@ pub fn read_events(config: &ClientConfig, cursor: &Cursor) -> anyhow::Result<Vec
     let sql = format!(
         "SELECT request_id, created_at, app_type, provider_id, model, request_model, \
          pricing_model, input_tokens, output_tokens, cache_read_tokens, \
-         cache_creation_tokens, {semantics_column}, total_cost_usd, latency_ms, \
+         cache_creation_tokens, {semantics_column}, {metadata_columns}, total_cost_usd, latency_ms, \
          status_code, is_streaming, data_source FROM proxy_request_logs \
          WHERE (created_at > ?1 OR (created_at = ?1 AND \
                 (app_type > ?2 OR (app_type = ?2 AND request_id > ?3)))) \

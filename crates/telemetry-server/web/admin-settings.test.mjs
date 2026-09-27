@@ -14,8 +14,8 @@ test("admin exposes persisted dashboard range, reset tier, and time format contr
   assert.match(html, /value="12h"/);
   assert.match(html, /id="settingsModelBillingMultipliers"/);
   assert.match(html, /id="addModelBillingMultiplier"/);
-  assert.match(html, /按模型分别设置/);
-  assert.match(html, /不会改写数据库/);
+  assert.match(html, /每个模型选择整体/);
+  assert.match(html, /不改变 Token 数量或原始数据库/);
   assert.match(html, /class="settings-section settings-defaults"/);
   assert.match(html, /class="settings-section settings-billing"/);
   assert.match(html, /class="settings-section settings-provider-section"/);
@@ -36,4 +36,13 @@ test("admin exposes persisted dashboard range, reset tier, and time format contr
   assert.match(app, /quotaTierPeriodSeconds/);
   assert.match(app, /settingsForm\.addEventListener\("submit"/);
   assert.ok(html.indexOf('id="settingsResetProvider"') < html.indexOf('id="settingsModelBillingMultipliers"'));
+});
+
+
+test("billing factors select exactly one mode", async () => {
+  const { billingFactors } = await import("./quota-settings.js");
+  const entry = { multiplier: 9, freshMultiplier: 3, creationMultiplier: 4, readMultiplier: 0, outputMultiplier: 5 };
+  assert.deepEqual(billingFactors(entry), [9,9,9,9]);
+  assert.deepEqual(billingFactors({ ...entry, mode: "components" }), [3,4,0,5]);
+  assert.deepEqual(billingFactors({ mode: "components" }), [1,1,1,1]);
 });

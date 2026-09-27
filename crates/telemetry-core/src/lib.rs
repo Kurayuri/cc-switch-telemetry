@@ -15,6 +15,14 @@ pub struct UsageEvent {
     pub request_model: Option<String>,
     #[serde(default)]
     pub pricing_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_pricing_version: Option<i64>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -242,6 +250,8 @@ pub struct QuotaMetric {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaProviderState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_code: Option<String>,
     pub app_type: String,
     pub provider_id: String,
     pub provider_name: String,

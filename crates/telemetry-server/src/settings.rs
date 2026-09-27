@@ -40,7 +40,75 @@ pub struct DashboardDefaults {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelBillingMultiplier {
     pub model: String,
+    #[serde(default = "one")]
     pub multiplier: f64,
+    #[serde(default)]
+    pub mode: BillingMode,
+    #[serde(default = "one", skip_serializing)]
+    pub input_multiplier: f64,
+    #[serde(default = "one")]
+    pub fresh_multiplier: f64,
+    #[serde(default = "one")]
+    pub creation_multiplier: f64,
+    #[serde(default = "one")]
+    pub read_multiplier: f64,
+    #[serde(default = "one")]
+    pub output_multiplier: f64,
+    #[serde(default)]
+    pub reference_pricing: Option<crate::pricing::ReferencePricing>,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BillingMode {
+    #[default]
+    Overall,
+    // Accepted only for migration of previously saved settings.
+    Input,
+    Components,
+}
+
+impl Default for ModelBillingMultiplier {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            multiplier: 1.0,
+            mode: BillingMode::Overall,
+            input_multiplier: 1.0,
+            fresh_multiplier: 1.0,
+            creation_multiplier: 1.0,
+            read_multiplier: 1.0,
+            output_multiplier: 1.0,
+            reference_pricing: None,
+        }
+    }
+}
+
+impl ModelBillingMultiplier {
+    pub fn factors(&self) -> [f64; 4] {
+        match self.mode {
+            BillingMode::Overall => [self.multiplier; 4],
+            BillingMode::Input => [
+                self.input_multiplier,
+                self.input_multiplier,
+                self.input_multiplier,
+                1.0,
+            ],
+            BillingMode::Components => [
+                self.fresh_multiplier,
+                self.creation_multiplier,
+                self.read_multiplier,
+                self.output_multiplier,
+            ],
+        }
+    }
+    pub fn component_adjustment(&self) -> bool {
+        self.mode != BillingMode::Overall && self.factors().iter().any(|value| *value != 1.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,10 +205,29 @@ fn normalize(mut settings: Settings) -> anyhow::Result<Settings> {
         entry.model = entry.model.trim().to_owned();
         anyhow::ensure!(
             valid_text(&entry.model)
-                && entry.multiplier.is_finite()
-                && (0.0..=1000.0).contains(&entry.multiplier),
+                && [
+                    entry.multiplier,
+                    entry.input_multiplier,
+                    entry.fresh_multiplier,
+                    entry.creation_multiplier,
+                    entry.read_multiplier,
+                    entry.output_multiplier
+                ]
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1000.0).contains(value)),
             "invalid model billing multiplier"
         );
+        if entry.mode == BillingMode::Input {
+            entry.mode = BillingMode::Components;
+            entry.fresh_multiplier = entry.input_multiplier;
+            entry.creation_multiplier = entry.input_multiplier;
+            entry.read_multiplier = entry.input_multiplier;
+            entry.output_multiplier = 1.0;
+        }
+        entry.input_multiplier = 1.0;
+        if let Some(prices) = &entry.reference_pricing {
+            prices.validate(&entry.model)?;
+        }
         anyhow::ensure!(
             models.insert(entry.model.clone()),
             "duplicate model billing multiplier"
@@ -362,10 +449,19 @@ pub(crate) async fn admin_put(
     if let Err(response) = admin::require_admin(&state, &headers) {
         return *response;
     }
-    let settings = match normalize(settings) {
+    let mut settings = match normalize(settings) {
         Ok(settings) => settings,
         Err(error) => return failure(StatusCode::BAD_REQUEST, error),
     };
+    for entry in &mut settings.dashboard_defaults.model_billing_multipliers {
+        if entry.component_adjustment() && entry.reference_pricing.is_none() {
+            // An unavailable catalog/model must not replace original billing
+            // with invented prices. The read projection reports these records.
+            entry.reference_pricing = crate::pricing::reference_price(&entry.model, false)
+                .await
+                .ok();
+        }
+    }
     match save(&state, settings) {
         Ok(settings) => Json(settings).into_response(),
         Err(error) => failure(StatusCode::SERVICE_UNAVAILABLE, error),
@@ -393,6 +489,64 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn legacy_input_mode_migrates_to_four_components() {
+        let mut settings = Settings::default();
+        settings.dashboard_defaults.model_billing_multipliers =
+            vec![serde_json::from_value(serde_json::json!({
+                "model": "example", "mode": "input", "inputMultiplier": 2,
+                "outputMultiplier": 9
+            }))
+            .unwrap()];
+        let normalized = normalize(settings).unwrap();
+        let entry = &normalized.dashboard_defaults.model_billing_multipliers[0];
+        assert_eq!(entry.mode, BillingMode::Components);
+        assert_eq!(entry.factors(), [2.0, 2.0, 2.0, 1.0]);
+        let json = serde_json::to_value(entry).unwrap();
+        assert_eq!(json["mode"], "components");
+        assert!(json.get("inputMultiplier").is_none());
+    }
+
+    #[test]
+    fn billing_modes_round_trip_and_validate_every_factor_and_snapshot() {
+        let legacy: ModelBillingMultiplier =
+            serde_json::from_str(r#"{"model":"example","multiplier":2}"#).unwrap();
+        assert_eq!(legacy.mode, BillingMode::Overall);
+        assert_eq!(legacy.factors(), [2.0; 4]);
+        let mut settings = Settings::default();
+        let entry: ModelBillingMultiplier = serde_json::from_value(serde_json::json!({
+            "model":"example", "mode":"components", "multiplier":99,
+            "freshMultiplier":0,"creationMultiplier":0.5,"readMultiplier":1000,"outputMultiplier":2,
+            "referencePricing":{"model":"example","resolvedModel":"provider/example","source":"fixture", "fetchedAt":100,
+                "fresh":2,"creation":4,"read":0.5,"output":8}
+        })).unwrap();
+        assert_eq!(entry.factors(), [0.0, 0.5, 1000.0, 2.0]);
+        settings.dashboard_defaults.model_billing_multipliers = vec![entry.clone()];
+        let normalized = normalize(settings.clone()).unwrap();
+        let round_trip: Settings =
+            serde_json::from_value(serde_json::to_value(normalized).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.dashboard_defaults.model_billing_multipliers,
+            vec![entry]
+        );
+        settings.dashboard_defaults.model_billing_multipliers[0].output_multiplier = -1.0;
+        assert!(normalize(settings.clone()).is_err());
+        settings.dashboard_defaults.model_billing_multipliers[0].output_multiplier = 2.0;
+        settings.dashboard_defaults.model_billing_multipliers[0].read_multiplier = -1.0;
+        assert!(normalize(settings.clone()).is_err());
+        settings.dashboard_defaults.model_billing_multipliers[0].read_multiplier = 1.0;
+        settings.dashboard_defaults.model_billing_multipliers[0]
+            .reference_pricing
+            .as_mut()
+            .unwrap()
+            .model = "other".into();
+        assert!(normalize(settings).is_err());
+        assert!(serde_json::from_value::<ModelBillingMultiplier>(
+            serde_json::json!({"model":"example","mode":"multiply"})
+        )
+        .is_err());
+    }
+
+    #[test]
     fn persistence_validation_and_corrupt_files() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
@@ -410,19 +564,21 @@ mod tests {
             .dashboard_defaults
             .model_billing_multipliers
             .is_empty());
-        let mut settings = Settings::default();
-        settings.quota_provider_aliases = vec![
-            ProviderAlias {
-                node_id: "a".into(),
-                provider_id: "same".into(),
-                alias: " Alpha ".into(),
-            },
-            ProviderAlias {
-                node_id: "b".into(),
-                provider_id: "same".into(),
-                alias: "Beta".into(),
-            },
-        ];
+        let mut settings = Settings {
+            quota_provider_aliases: vec![
+                ProviderAlias {
+                    node_id: "a".into(),
+                    provider_id: "same".into(),
+                    alias: " Alpha ".into(),
+                },
+                ProviderAlias {
+                    node_id: "b".into(),
+                    provider_id: "same".into(),
+                    alias: "Beta".into(),
+                },
+            ],
+            ..Default::default()
+        };
         settings.quota_defaults.providers = Some(vec![ProviderSelection {
             node_id: "a".into(),
             provider_id: "same".into(),
@@ -438,10 +594,12 @@ mod tests {
             ModelBillingMultiplier {
                 model: " gpt-5 ".into(),
                 multiplier: 1.25,
+                ..Default::default()
             },
             ModelBillingMultiplier {
                 model: "claude-sonnet".into(),
                 multiplier: 0.8,
+                ..Default::default()
             },
         ];
         settings.dashboard_defaults.last_reset = Some(DashboardLastReset {
@@ -472,10 +630,12 @@ mod tests {
                 ModelBillingMultiplier {
                     model: "gpt-5".into(),
                     multiplier: 1.25,
+                    ..Default::default()
                 },
                 ModelBillingMultiplier {
                     model: "claude-sonnet".into(),
                     multiplier: 0.8,
+                    ..Default::default()
                 },
             ]
         );
@@ -498,18 +658,21 @@ mod tests {
         invalid.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
             model: "gpt-5".into(),
             multiplier: -0.01,
+            ..Default::default()
         }];
         assert!(normalize(invalid).is_err());
         let mut invalid = Settings::default();
         invalid.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
             model: "gpt-5".into(),
             multiplier: 1000.01,
+            ..Default::default()
         }];
         assert!(normalize(invalid).is_err());
         let mut invalid = Settings::default();
         invalid.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
             model: "gpt-5".into(),
             multiplier: f64::NAN,
+            ..Default::default()
         }];
         assert!(normalize(invalid).is_err());
         let mut invalid = Settings::default();
@@ -517,10 +680,12 @@ mod tests {
             ModelBillingMultiplier {
                 model: "gpt-5".into(),
                 multiplier: 1.0,
+                ..Default::default()
             },
             ModelBillingMultiplier {
                 model: " gpt-5 ".into(),
                 multiplier: 2.0,
+                ..Default::default()
             },
         ];
         assert!(normalize(invalid).is_err());
@@ -528,6 +693,7 @@ mod tests {
         invalid.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
             model: "  ".into(),
             multiplier: 1.0,
+            ..Default::default()
         }];
         assert!(normalize(invalid).is_err());
         let mut invalid = Settings::default();
@@ -599,6 +765,7 @@ mod tests {
         settings.dashboard_defaults.model_billing_multipliers = vec![ModelBillingMultiplier {
             model: "gpt-5".into(),
             multiplier: 1.25,
+            ..Default::default()
         }];
         let saved = app
             .clone()
@@ -640,7 +807,12 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["settings"]
                 ["dashboardDefaults"]["modelBillingMultipliers"],
-            serde_json::json!([{"model": "gpt-5", "multiplier": 1.25}])
+            serde_json::to_value(vec![ModelBillingMultiplier {
+                model: "gpt-5".into(),
+                multiplier: 1.25,
+                ..Default::default()
+            }])
+            .unwrap()
         );
         for (peer, expected) in [
             ("127.0.0.1:1234", StatusCode::OK),

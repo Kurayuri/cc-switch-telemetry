@@ -405,9 +405,13 @@ fn upsert_event(
              event_id,node_id,request_id,created_at,app_type,provider_id,model,
              request_model,pricing_model,input_tokens,output_tokens,cache_read_tokens,
              cache_creation_tokens,input_token_semantics,total_cost_usd,latency_ms,
-             status_code,is_streaming,data_source,content_hash,received_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+             status_code,is_streaming,data_source,content_hash,received_at,service_tier,service_tier_source,reasoning_effort,service_tier_pricing_version
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
          ON CONFLICT(node_id,app_type,request_id) DO UPDATE SET
+             service_tier=excluded.service_tier,
+             service_tier_source=excluded.service_tier_source,
+             reasoning_effort=excluded.reasoning_effort,
+             service_tier_pricing_version=excluded.service_tier_pricing_version,
              event_id=excluded.event_id,
              created_at=excluded.created_at,
              app_type=excluded.app_type,
@@ -448,7 +452,11 @@ fn upsert_event(
             event.is_streaming as i64,
             event.data_source,
             content_hash,
-            chrono::Utc::now().timestamp()
+            chrono::Utc::now().timestamp(),
+            event.service_tier,
+            event.service_tier_source,
+            event.reasoning_effort,
+            event.service_tier_pricing_version,
         ],
     )?;
     if existing.is_some() {
@@ -958,6 +966,10 @@ mod tests {
             model: "model".to_owned(),
             request_model: None,
             pricing_model: None,
+            service_tier: None,
+            service_tier_source: None,
+            reasoning_effort: None,
+            service_tier_pricing_version: None,
             input_tokens: 10,
             output_tokens: 2,
             cache_read_tokens: 1,
@@ -1022,5 +1034,42 @@ mod tests {
             .unwrap();
         assert_eq!(corrected.0, event_id("node-a", "codex", "shared-request"));
         assert_eq!(corrected.1, "provider-corrected");
+    }
+    #[test]
+    fn metadata_only_mutation_changes_hash_and_persists_without_repricing() {
+        let mut db = crate::init_db(":memory:").unwrap();
+        let tx = db.transaction().unwrap();
+        let mut row = event("codex", "p");
+        let mut result = SyncCommitResponse::default();
+        let old = content_hash(&row).unwrap();
+        upsert_event(&tx, "n", &row, &old, &mut result).unwrap();
+        row.service_tier = Some("fast".into());
+        row.reasoning_effort = Some("xhigh".into());
+        row.service_tier_source = Some("request".into());
+        row.service_tier_pricing_version = Some(2);
+        let new = content_hash(&row).unwrap();
+        assert_ne!(old, new);
+        upsert_event(&tx, "n", &row, &new, &mut result).unwrap();
+        upsert_event(&tx, "n", &row, &new, &mut result).unwrap();
+        let stored: (String, String, String, i64) = tx
+            .query_row(
+                "SELECT service_tier,reasoning_effort,total_cost_usd,created_at FROM usage_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("fast".into(), "xhigh".into(), "0.1".into(), 100));
+        assert_eq!(
+            (result.inserted, result.updated, result.unchanged),
+            (1, 1, 1)
+        );
+        let legacy = serde_json::to_value(event("codex", "p")).unwrap();
+        assert!(legacy.get("serviceTier").is_none());
+        assert_eq!(
+            serde_json::from_value::<UsageEvent>(legacy)
+                .unwrap()
+                .service_tier,
+            None
+        );
     }
 }

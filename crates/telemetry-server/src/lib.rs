@@ -1,7 +1,12 @@
 mod admin;
+mod billing_cache;
 mod dashboard;
 pub mod nodes;
+mod performance;
+pub(crate) mod pricing;
 mod quota;
+mod quota_cache;
+mod quota_cycles;
 pub(crate) mod settings;
 mod sync_v2;
 mod usage_cache;
@@ -65,15 +70,16 @@ impl ServerState {
         let db = Arc::new(Mutex::new(db));
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
         spawn_write_worker(Arc::clone(&db), write_rx);
-        usage_cache::spawn_worker(Arc::clone(&db));
-        Self {
+        let state = Self {
             db,
             db_path,
             settings: Arc::new(Mutex::new(None)),
             admin_password,
             admin_sessions: Arc::new(Mutex::new(HashMap::new())),
             write_tx,
-        }
+        };
+        usage_cache::spawn_worker(state.clone());
+        state
     }
 }
 
@@ -305,9 +311,21 @@ pub fn init_db(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     migrate_v3_schema(&mut conn)?;
+    ensure_column(&conn, "usage_events", "service_tier", "TEXT")?;
+    ensure_column(&conn, "usage_events", "service_tier_source", "TEXT")?;
+    ensure_column(&conn, "usage_events", "reasoning_effort", "TEXT")?;
+    ensure_column(
+        &conn,
+        "usage_events",
+        "service_tier_pricing_version",
+        "INTEGER",
+    )?;
+
     nodes::ensure_schema(&conn)?;
     quota::ensure_schema(&conn)?;
+    quota_cache::ensure_schema(&conn)?;
     usage_cache::ensure_schema(&conn)?;
+    billing_cache::ensure_schema(&conn)?;
     Ok(conn)
 }
 
@@ -622,8 +640,8 @@ fn process_events(
                  event_id,node_id,request_id,created_at,app_type,provider_id,model,
                  request_model,pricing_model,input_tokens,output_tokens,
                  cache_read_tokens,cache_creation_tokens,input_token_semantics,
-                 total_cost_usd,latency_ms,status_code,is_streaming,data_source,received_at
-             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 total_cost_usd,latency_ms,status_code,is_streaming,data_source,received_at, service_tier,service_tier_source,reasoning_effort,service_tier_pricing_version
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 &generated_event_id,
                 &node_id,
@@ -644,7 +662,11 @@ fn process_events(
                 event.status_code,
                 event.is_streaming as i64,
                 event.data_source,
-                now
+                now,
+                event.service_tier,
+                event.service_tier_source,
+                event.reasoning_effort,
+                event.service_tier_pricing_version,
             ],
         );
         match result {
@@ -1171,7 +1193,7 @@ mod tests {
                    received_at INTEGER NOT NULL,
                    UNIQUE(node_id,request_id)
                  );
-                 INSERT INTO usage_events SELECT * FROM usage_events_v3_fixture;
+                 INSERT INTO usage_events SELECT event_id,node_id,request_id,created_at,app_type,provider_id,model,request_model,pricing_model,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,input_token_semantics,total_cost_usd,latency_ms,status_code,is_streaming,data_source,content_hash,received_at FROM usage_events_v3_fixture;
                  DROP TABLE usage_events_v3_fixture;
                  CREATE TABLE sync_generations (
                    generation_id TEXT PRIMARY KEY,

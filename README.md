@@ -31,7 +31,7 @@ cross-`data_source` adjudication out of the Server.
   only the corresponding `proxy_request_logs`. The two tables together remain
   the complete local history.
 - The repository includes a byte-identical snapshot of all six cc-switch parser
-  modules at commit `3217f72596f2d1c0f879f0a05f83803825d9809f`; the
+  modules at commit `87d966b7f887adfe0e9856ee0f7e93cc8efc874f`; the
   Tauri-free `session-usage-core` adapter owns the executable local-mode path.
   Exact mode remains the parity authority because it also includes cc-switch's
   application-level transactions, cursor recovery, pricing, and source
@@ -46,6 +46,40 @@ metadata and can be corrected without creating another logical request.
 The server is the only writer of the central SQLite database. A client token
 maps to one server-managed node UUID; node identity is never accepted from an
 upload body.
+
+## Fast accounting compatibility
+
+The importer and fixed Fast tariff policy are pinned to cc-switch
+`build/codex-fast-fix` at `87d966b7` (schema 21). Exact `cc-switch` mode preserves
+stored costs without applying Fast factors again. Local modes use the pinned
+model/tier rules, including dated GPT snapshots, with no guessed aliases or
+context-length surcharge. Historical metadata enrichment uses retained component
+prices; independently reported totals and already compacted days are preserved.
+The Codex adapter merges paginated parents, checks finalized fork boundaries and
+retries deferred children without advancing their durable cursors. Cursor/data
+writes commit together. The known previous importer revision upgrades additively;
+a one-time reconciliation removes obsolete local Codex replay rows only after
+successful parsing. Other collector rows, daily rollups and upload baselines remain.
+
+Protocol v3 adds optional `serviceTier`, `serviceTierSource`, `reasoningEffort`,
+and `serviceTierPricingVersion` event fields, plus optional `diagnosticCode` on
+quota provider states. **Upgrade the Server before Clients**: the new Server
+accepts missing fields from old Clients, while old Servers reject new fields.
+Event hashes include present metadata so amendments to old timestamps propagate.
+Missing values remain unknown. Request/response tier sources remain distinct;
+a requested tier is not confirmation of provider billing.
+
+`GET /v3/dashboard/events` accepts `service_tier` and `reasoning_effort`.
+These filters affect request detail only, including pagination; KPI, trend,
+daily/breakdown totals and historical quota references keep their existing scope.
+The `unknown` choice matches absent metadata. `fast` matches Fast and non-Claude
+Priority, following the pinned cc-switch request-list rule. Other tier/effort
+choices are exact matches. Compressed historical days have no request detail to
+filter and are not reconstructed.
+
+Quota collection now uses the cc-switch fix4 local API. Historical
+`cli_schema_incompatible` states remain readable; current API failures use the
+fixed `quota_api_unavailable` diagnostic. No credentials or raw errors are uploaded.
 
 ## Workspace layout
 
@@ -144,20 +178,24 @@ only counts plus the first mismatching key; it does not modify either database.
 
 ### Codex quota history
 
-Quota collection is deliberately separate from request accounting. On startup
-the client immediately enumerates all `app_type='codex'` providers from
-`CC_SWITCH_DB`, then queries them sequentially every minute with:
+The client polls the **cc-switch fix4 local quota API** every 60 seconds. Keep
+cc-switch running on the same node. It discovers the authenticated loopback
+endpoint through `quota-api.json` beside `CC_SWITCH_DB`; override the path with
+`CC_SWITCH_QUOTA_API_FILE` on both applications when needed. The file is mode
+0600 and contains a short-lived local capability: never upload or share it.
 
-```text
-cc-switch-cli --app codex provider quota PROVIDER_ID --json
-```
+Provider discovery and quota reads use `/v1/quota/providers` and
+`/v1/quota/query`. cc-switch owns provider-to-account mapping, managed OAuth
+refresh, native subscription and saved usage-script queries, and outbound proxy
+configuration. Telemetry receives only quota fields and public status codes.
+It does not invoke `cc-switch-cli`, read source quota credentials, or require a
+particular source database schema for quota collection. There is no CLI fallback.
 
-`cc-switch-cli` remains responsible for official subscription, Codex OAuth,
-and custom Usage Query credential/account routing. Telemetry checks the JSON
-`status`, `available`, and `result` fields even when the command exits zero,
-then retains only allowlisted normalized metrics. It never stores or uploads
-account IDs, credential messages, raw errors, provider settings, or Usage Query
-extras/invalid messages.
+Closing cc-switch makes the quota API unavailable; the client records failure
+states for known providers without fabricating fresh samples from old values.
+The next polling cycle re-reads discovery, so cc-switch restarts and token/port
+rotation recover automatically. Upgrade the telemetry server first to accept
+the `quota_api_unavailable` diagnostic, then upgrade clients and cc-switch.
 
 Every successful sample is committed to the independent local quota database
 before upload. Neither the local database nor the central quota tables have an
@@ -183,15 +221,15 @@ independent, non-reconstructable source of historical quota samples.
 | `TELEMETRY_SERVER_URL` | client | `http://127.0.0.1:8787` | Server base URL. |
 | `CC_SWITCH_DB` | exact client | `$HOME/.cc-switch/cc-switch.db` | Read-only source database path. |
 | `TELEMETRY_LOCAL_USAGE_DB` | client | `./data/local-usage.db` | Durable mirror/import ledger and upload-hash baseline. |
-| `CC_SWITCH_CLI` | quota client | PATH, then `$HOME/.local/bin/cc-switch-cli` | Explicit executable path override for the supported quota command. |
+| `CC_SWITCH_QUOTA_API_FILE` | cc-switch / quota client | `quota-api.json` in the cc-switch config directory / beside `CC_SWITCH_DB` | Local API discovery file; no CLI dependency. |
 | `TELEMETRY_QUOTA_DB` | quota client | `./data/quota-history.db` | Independent, durable, non-pruning quota history and per-remote upload cursors. |
 | `TELEMETRY_QUOTA_INTERVAL_SECONDS` | quota client | `60` | Sequential quota polling period; `0` disables quota collection. |
 | `TELEMETRY_MODELS_DEV_URL` | local client | `https://models.dev/api.json` | Raw-mode pricing endpoint override. |
 | `TELEMETRY_CLAUDE_DIR`, `TELEMETRY_CODEX_DIR`, `TELEMETRY_GEMINI_DIR`, `TELEMETRY_OPENCODE_DB`, `TELEMETRY_GROK_DIR` | local client | tool defaults | Claude, Codex, Gemini, OpenCode, and Grok raw-source overrides. |
 | `TELEMETRY_PI_SESSION_DIR` | local client | `$HOME/.pi/agent/sessions` | Pi flat or project-directory session root. |
 
-Reqwest also follows standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
-`NO_PROXY` variables.
+Remote HTTP requests follow standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+and `NO_PROXY` variables. Local quota API calls bypass proxies and redirects.
 
 ## Dashboard semantics
 
@@ -264,6 +302,7 @@ Loopback-only Dashboard endpoints:
 - `GET /v3/dashboard/quota?from=&to=&bucket=&node_id=&provider_id=`
 - `GET /v3/dashboard/time-bounds` — earliest stored usage detail, daily rollup, or quota observation.
 - `GET /v3/dashboard/quota/resets` — chronological reset runs including zero usage, grouped by node/provider/tier; independent of chart range and buckets.
+- `POST /v3/dashboard/quota/cycle-summaries` — read-only raw-sample summaries for 1–128 ended cycles. Body: `nodeId`, `providerId`, `metricKey`, `metricKind`, nullable `unit`, and `cycles: [{from,to,resetsAt}]`. Response: `cycles` with those boundaries plus `reachedFull`, nullable `sampledAt`, and nullable `utilizationPercent`; cycle intervals are `[from,to)` with a 60-second Reset-anchor tolerance.
 
 Authenticated Admin log lifecycle endpoints:
 
@@ -383,7 +422,96 @@ only the two custom range time inputs: `HH:mm` in 24-hour mode or
 `hh:mm AM/PM` in 12-hour mode. Each model multiplier defaults to `1` when it
 is not configured, accepts `0` to `1000`, and changes only the Dashboard's
 read-only cost presentation (summary, trend, daily view, breakdowns, and
-events); it does not rewrite SQLite data.
+events); it does not rewrite SQLite data or Token counts.
+
+Each model selects exactly one billing mode: `overall` (legacy default) or
+`components` (separate Fresh, Creation, Read, and Output multipliers).
+Inactive mode values never stack. Legacy `input` settings migrate to components
+with the same factor for Fresh, Creation, and Read, and Output at 1×. Admin fetches a reference-price snapshot from the same
+models.dev catalog used by the collector (`TELEMETRY_MODELS_DEV_URL` can override
+the catalog). The authenticated `GET /admin/api/model-pricing?model=...` endpoint
+returns `model`, `resolvedModel`, `source`, `fetchedAt`, and USD-per-million
+`fresh`, `creation`, `read`, `output` prices; missing prices remain null.
+`refresh=true` bypasses the 24-hour catalog cache. Snapshots are saved with the
+model's settings and only change when explicitly updated; Dashboard queries do
+not fetch live prices. Saving an active non-overall entry without a snapshot attempts server-side
+resolution. If unavailable or ambiguous, it retains a null snapshot and original
+costs, with an Admin save notice and Dashboard fallback counts; prices are never guessed.
+
+For each record, `weight = normalized category tokens × reference unit price`;
+`display cost = original cost × sum(weight × selected factor) / sum(weight)`.
+All-one factors preserve the original cost exactly. Missing required prices or
+zero/invalid weights retain the original amount and increment
+`unadjustedCostRequests` in summaries, buckets, breakdowns and events; the UI
+shows the fallback. Adjustments happen before aggregation, bypassing hourly cost
+caches for active component adjustments. Legacy daily rollups use their own
+aggregate token composition, so their component amounts are estimates.
+
+For example, a model entry can use
+`{"model":"gpt-5","mode":"overall","multiplier":2}` or
+`{"model":"gpt-5","mode":"components","freshMultiplier":2,"creationMultiplier":1,"readMultiplier":0.5,"outputMultiplier":2}`.
+The save response includes the resolved `referencePricing` snapshot and default
+fields. Old `{model,multiplier}` entries continue to mean overall mode.
+
+Usage Trend offers a session-only **Compare Quota** switch. Enabling it defaults
+to Estimated cost using the existing Usage filters and checks the cumulative
+and Predict checkboxes on each enable; both remain freely toggleable. Both charts share the
+same manual granularity. In Compare, Usage Auto uses Quota history's bucket rule
+(`bucket=quota-auto`); outside Compare, Usage Auto selects the coarsest preset yielding at least 20 buckets (or 1-second buckets for shorter ranges). Switching Compare with Auto reloads only the Usage overview.
+The Usage axis starts at zero and includes accumulated values in cumulative mode
+and the Estimated quota curve when sharing the cost axis; empty or all-zero data
+uses an upper bound of 1.
+The selected Quota Provider/window defaults to Last reset and overlays the same
+raw percentage history shown in Codex quota history, including reset drops and
+data gaps. With Predict off, the overlay reuses loaded Quota data without a separate comparison fetch. Disabling restores the previous
+Usage metric. The comparison percentage axis includes the visible actual and predicted
+quota maximum (with a 1% upper bound for empty/all-zero data). After those base
+ranges are calculated, the latest Usage bucket containing an actual utilization
+sample anchors both axes at the same vertical position. Alignment only expands an
+axis, so no visible series is clipped; the utilization display axis may exceed
+100% even though utilization data remains bounded to 0–100%. Zero or missing
+anchors retain the independent base ranges. The two series retain their own timestamps;
+hover shows the timestamp of each displayed value (Quota to minute precision).
+**History** is enabled by default with the previous full-quota cycle when Compare
+Quota is first enabled. Its reference button opens a dialog with None, manual USD
+amount, previous full-quota cycle, previous cycle, or a selected ended Reset cycle.
+Choosing None and applying disables the reference; the choice is retained when
+Compare is toggled during the page session. There is no separate History checkbox. Full means a
+cycle that reached 100%, including peaks omitted by chart downsampling. Automatic
+sources follow the cycle containing the viewed range's exclusive end (capped at
+now); manual amounts and explicitly selected cycles stay fixed. Historical quota
+is the selected cycle's cumulative cost through its last valid utilization sample,
+divided by that percentage. Usage filters and billing multipliers still apply.
+Applying a reference draws a horizontal line and maps its USD amount to 100%,
+replacing latest-bucket alignment until disabled. Token and Requests retain their
+own axes and use a separate USD axis. All axes retain shared tick heights and
+100% stays visible. Predict and Estimated quota remain independently controlled.
+An unavailable reference is shown in the control; it never silently reuses a
+reference from another identity or falls back to latest-bucket alignment. Cancel
+leaves the applied reference unchanged. Data is cached for five minutes; manual
+Refresh revalidates it, and stale requests cannot overwrite a newer selection.
+
+Usage point markers are shown for up to 120 points and hidden above that. Compare also supports Predict,
+sharing the selected metric's switch and prediction cache with Quota history;
+the dotted forecast extends the time axis and is included in quota-axis scaling.
+Predict also draws **Estimated quota** from each confirmed reset cycle's cumulative
+Estimated cost divided by utilization (as a fraction). It retains the Usage
+filters and billing multipliers, queries missing pre-range costs, and starts a
+new cost accumulator at each reset. Each point uses a cost bucket's end and the
+latest quota sample within that bucket and cycle; the tooltip shows both times.
+Zero/missing utilization, unconfirmed cycles, and sampling gaps are not bridged.
+This historical estimate does not extend into the future and is independent of
+the cumulative display switch or availability of a utilization speed forecast.
+It shares the cost axis for Estimated cost and uses a separate USD axis for Token
+and Requests. Predict's extra requests use at most three concurrent cycle workers;
+selection/filter/range changes cancel stale work. Refreshes retain the previous
+complete curves while loading and silently update them without entry animations.
+Cycle/prefix caches reuse unchanged data for five minutes; manual Refresh
+revalidates them and retries failures without removing the plotted line. Legend
+visibility is preserved. Late data and price/multiplier changes invalidate the
+affected calculations.
+Quota Provider, Quota window, and Predict controls are right-aligned and wrap on
+narrow screens. The comparison chart reserves extra header space so its plot stays full height.
 
 `GET /admin/api/settings` returns `{ settings, providers }`, including the known
 metric catalog. `PUT /admin/api/settings` accepts and returns the settings object;
@@ -454,3 +582,55 @@ the server and allows histories longer than 720 days while retaining the trend
 point-count limit. Other custom ranges keep their existing limit. All time is
 also available as an Admin default. Empty databases show an empty recent window
 rather than a range starting in 1970.
+
+### Dashboard read projections and refresh performance
+
+Dashboard filters refresh Usage statistics, events and the daily heatmap without
+reloading unchanged Quota data. Time-range changes reuse the full-year heatmap
+when its filters and calendar bounds are unchanged. Ordinary trends render as
+soon as their statistics arrive; Compare waits only for matching Usage and Quota
+ranges. Requests are cancelled per consumer, duplicate in-flight GETs are shared,
+and chart updates are coalesced into animation frames. Manual refresh and the
+30-second automatic refresh still revalidate the full view.
+
+SQLite retains all original observations and billing amounts. Rebuildable read
+projections add indexed Quota samples, latest metrics, consecutive reset runs,
+and signed per-event component billing results. Hourly billing sums are computed
+from individual adjusted events, not from aggregate token ratios. Pricing changes
+invalidate signatures; unready projections fall back to the original calculation.
+Quota insert/delete triggers maintain read projections in the same transaction;
+late samples invalidate only their metric's reset history. Background work runs
+on blocking threads, one reset series, up to 2,000 billing events and one hour per
+iteration. Each statistics response reads a consistent SQLite snapshot.
+
+The first startup performs a restartable quota-history backfill in 2,000-row
+transactions before opening the listener. On the September 26 validation backup
+(about 339,000 quota metrics), initial startup took approximately 25 seconds.
+Billing and reset caches warm in the background; subsequent starts reuse them.
+Take a SQLite backup (including WAL content through the backup API), settings and
+binary backup before deployment. All projections are additive; an older binary
+can read the original records, but after running an older writer the projections
+must be rebuilt before returning to the optimized version.
+
+For an offline projection rebuild, with every writer stopped, drop the
+`quota_metric_project`, `quota_metric_unproject`, `quota_metric_reproject`,
+`usage_billing_invalidate`, `usage_billing_delete` and `billing_revision_*`
+triggers, then the `quota_sample_cache`, `quota_current_cache`,
+`quota_reset_cache`, `quota_projection_meta`, `usage_billing_cache` and
+`billing_projection_meta` tables; mark every `usage_cache_partitions` row dirty.
+Restart the optimized server to rebuild from original records. Do not delete
+`quota_observations`, `quota_metrics` or `usage_events`.
+
+Dashboard assets and JSON support negotiated gzip. Reset history supports ETag
+revalidation and optional `node_id`, `provider_id`, `metric_key`, `metric_kind`
+and `unit` filters; omitting them preserves the full-history response. Expensive
+Dashboard responses include `Server-Timing` for SQL plus projection and JSON
+serialization. This excludes network transfer and browser drawing.
+
+Validation helpers:
+
+- `python3 scripts/test-ui-performance-browser.py`: isolated refresh/race regression.
+- `python3 scripts/benchmark-dashboard.py <backup-directory>`: compare
+  `baseline-server`, `baseline.db` and `optimized.db` with the release binary;
+  the directory must also contain the same `settings.json` for both copies.
+  Use disposable SQLite backups, never production database paths.

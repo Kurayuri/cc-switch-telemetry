@@ -5,6 +5,8 @@
 //! deduplication, and rollup range decisions belong here so every consumer
 //! produces the same answer from the same rows.
 
+pub mod fast_pricing;
+
 use chrono::{NaiveDate, TimeZone, Timelike};
 use rust_decimal::Decimal;
 
@@ -385,4 +387,43 @@ mod tests {
         assert_eq!(effective_model("alias", Some("priced")), "priced");
         assert_eq!(effective_model("alias", Some("")), "alias");
     }
+}
+
+// Shared model aliases for collector pricing and Dashboard reference prices.
+pub fn pricing_candidates(model: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut add = |s: String| {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    let base = model
+        .rsplit_once('/')
+        .map_or(model, |(_, v)| v)
+        .split(':')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .replace('@', "-")
+        .to_ascii_lowercase();
+    add(base.clone());
+    if let Some(pos) = base.rfind("claude-") {
+        if pos > 0 {
+            add(base[pos..].to_string());
+        }
+    }
+    for prefix in ["openai.", "anthropic.", "google.", "bedrock.", "global."] {
+        if let Some(v) = base.strip_prefix(prefix) {
+            add(v.to_string());
+        }
+    }
+    if let Some((head, suffix)) = base.rsplit_once('-') {
+        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+            add(head.to_string());
+        }
+    }
+    if let Some(v) = base.strip_suffix("-thinking") {
+        add(v.to_string());
+    }
+    out
 }

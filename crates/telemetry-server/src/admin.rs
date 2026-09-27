@@ -672,6 +672,7 @@ pub fn routes() -> Router<ServerState> {
         .route("/admin/logout", post(logout))
         .route("/admin/api/session", get(session))
         .route("/admin/quota-settings.js", get(crate::settings::script))
+        .route("/admin/api/model-pricing", get(crate::pricing::resolve))
         .route(
             "/admin/api/settings",
             get(crate::settings::admin_get).put(crate::settings::admin_put),

@@ -142,6 +142,7 @@ export function renderPicker(host, options) {
   trigger.className = "quota-picker-trigger";
   const selectionLabel = selected === null ? allLabel : selected.length;
   trigger.textContent = showTitleInTrigger ? `${title}: ${selectionLabel}` : selectionLabel;
+  trigger.title = `${title}: ${selectionLabel}`;
   trigger.setAttribute("aria-label", title);
   trigger.setAttribute("aria-expanded", "false");
   const menu = document.createElement("div");
@@ -226,4 +227,10 @@ export function renderPicker(host, options) {
       && input.dataset.control === focusControl);
     (focus || trigger).focus({ preventScroll: true });
   }
+}
+
+// Order: Fresh, Creation, Read, Output. Only the selected mode is effective.
+export function billingFactors(entry) {
+  if (entry.mode === "components") return [entry.freshMultiplier ?? 1, entry.creationMultiplier ?? 1, entry.readMultiplier ?? 1, entry.outputMultiplier ?? 1];
+  return Array(4).fill(entry.multiplier ?? 1);
 }

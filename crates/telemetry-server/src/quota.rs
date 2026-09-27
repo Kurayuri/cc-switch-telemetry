@@ -75,6 +75,12 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_quota_metric_series
              ON quota_metrics(node_id, metric_key, observation_id);",
     )?;
+    crate::ensure_column(
+        connection,
+        "quota_provider_states",
+        "diagnostic_code",
+        "TEXT",
+    )?;
     Ok(())
 }
 
@@ -155,6 +161,10 @@ fn valid_state(state: &QuotaProviderState) -> bool {
         && valid_text(&state.provider_id, 256)
         && valid_text(&state.provider_name, MAX_LABEL_BYTES)
         && state.checked_at > 0
+        && state
+            .diagnostic_code
+            .as_deref()
+            .is_none_or(|code| matches!(code, "cli_schema_incompatible" | "quota_api_unavailable"))
 }
 
 fn valid_observation(observation: &QuotaObservation) -> bool {
@@ -236,9 +246,10 @@ fn store_batch(
         transaction.execute(
             "INSERT INTO quota_provider_states (
                  node_id,app_type,provider_id,provider_name,status,target_kind,
-                 checked_at,received_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                 checked_at,received_at,diagnostic_code
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(node_id,app_type,provider_id) DO UPDATE SET
+                 diagnostic_code=excluded.diagnostic_code,
                  provider_name=excluded.provider_name,
                  status=excluded.status,
                  target_kind=excluded.target_kind,
@@ -254,6 +265,7 @@ fn store_batch(
                 state.target_kind.as_ref().map(target_text),
                 state.checked_at,
                 now,
+                state.diagnostic_code,
             ],
         )?;
     }
@@ -368,36 +380,46 @@ pub async fn ingest(
     if let Err(message) = validate_batch(&batch) {
         return error(StatusCode::BAD_REQUEST, "invalid_quota_batch", message);
     }
-    let Ok(mut connection) = state.db.lock() else {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "database_unavailable",
-            "database unavailable",
-        );
-    };
-    match store_batch(&mut connection, &node_id, &batch) {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(StoreError::Conflict) => error(
-            StatusCode::CONFLICT,
-            "observation_conflict",
-            "observation id already exists with different content",
-        ),
-        Err(StoreError::MissingProvider) => error(
-            StatusCode::BAD_REQUEST,
-            "missing_provider_state",
-            "observation has no provider state",
-        ),
-        Err(StoreError::Sqlite(error_value)) => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "database_unavailable",
-            &error_value.to_string(),
-        ),
-        Err(StoreError::Encode(error_value)) => error(
-            StatusCode::BAD_REQUEST,
-            "invalid_observation",
-            &error_value.to_string(),
-        ),
-    }
+    tokio::task::spawn_blocking(move || {
+        let Ok(mut connection) = state.db.lock() else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database_unavailable",
+                "database unavailable",
+            );
+        };
+        match store_batch(&mut connection, &node_id, &batch) {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(StoreError::Conflict) => error(
+                StatusCode::CONFLICT,
+                "observation_conflict",
+                "observation id already exists with different content",
+            ),
+            Err(StoreError::MissingProvider) => error(
+                StatusCode::BAD_REQUEST,
+                "missing_provider_state",
+                "observation has no provider state",
+            ),
+            Err(StoreError::Sqlite(error_value)) => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database_unavailable",
+                &error_value.to_string(),
+            ),
+            Err(StoreError::Encode(error_value)) => error(
+                StatusCode::BAD_REQUEST,
+                "invalid_observation",
+                &error_value.to_string(),
+            ),
+        }
+    })
+    .await
+    .unwrap_or_else(|err| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "write_failed",
+            &err.to_string(),
+        )
+    })
 }
 
 pub fn ingest_routes() -> Router<ServerState> {
@@ -444,6 +466,7 @@ pub struct QuotaProviderView {
     pub target_kind: Option<String>,
     pub checked_at: i64,
     pub last_success_at: Option<i64>,
+    pub diagnostic_code: Option<String>,
     pub current: Vec<QuotaCurrentMetric>,
     pub series: Vec<QuotaSeries>,
 }
@@ -485,7 +508,7 @@ pub struct QuotaPoint {
     pub resets_at: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResetObservation {
     resets_at: i64,
@@ -495,7 +518,7 @@ struct ResetObservation {
     first_usage_at: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResetTier {
     key: String,
@@ -520,68 +543,64 @@ struct ResetHistory {
     providers: Vec<ResetProvider>,
 }
 
-fn query_resets(path: &std::path::Path) -> anyhow::Result<ResetHistory> {
-    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    // Preserve chronological transitions (including zero usage and old-value returns).
-    // Compact only consecutive samples within 60s of a fixed reset anchor.
-    let mut statement = connection.prepare(
-        "SELECT o.node_id,n.node_name,o.provider_id,COALESCE(s.provider_name,o.provider_id),
-                m.metric_key,m.metric_label,m.metric_kind,NULLIF(COALESCE(m.unit,''),''),
-                m.resets_at,o.sampled_at,
-                CASE WHEN m.utilization_percent IS NOT NULL THEN m.utilization_percent>0
-                     WHEN m.used IS NOT NULL THEN m.used>0
-                     ELSE COALESCE(m.total-m.remaining>0,0) END
-         FROM quota_observations o
-         JOIN quota_metrics m ON m.node_id=o.node_id AND m.observation_id=o.observation_id
-         JOIN nodes n ON n.uuid=o.node_id
-         LEFT JOIN quota_provider_states s ON s.node_id=o.node_id
-           AND s.provider_id=o.provider_id AND s.app_type=o.app_type
-         WHERE o.app_type='codex' AND o.sampled_at>=0 AND m.resets_at>o.sampled_at
-         ORDER BY o.node_id,o.provider_id,m.metric_key,m.metric_kind,COALESCE(m.unit,''),o.sampled_at,o.observation_id",
-    )?;
-    let mut rows = statement.query([])?;
-    let mut providers: Vec<ResetProvider> = Vec::new();
-    while let Some(row) = rows.next()? {
-        let node_id: String = row.get(0)?;
-        let provider_id: String = row.get(2)?;
-        if providers
-            .last()
-            .is_none_or(|p| p.node_id != node_id || p.provider_id != provider_id)
-        {
-            providers.push(ResetProvider {
-                node_id,
-                node_name: public_alias(row.get(1)?, "Node"),
-                provider_id,
-                provider_name: public_alias(row.get(3)?, "Provider"),
-                tiers: Vec::new(),
-            });
-        }
-        let tiers = &mut providers.last_mut().unwrap().tiers;
-        let key: String = row.get(4)?;
-        let kind: String = row.get(6)?;
-        let unit: Option<String> = row.get(7)?;
-        if tiers
-            .last()
-            .is_none_or(|t| t.key != key || t.kind != kind || t.unit != unit)
-        {
-            tiers.push(ResetTier {
-                key,
-                label: public_alias(row.get(5)?, "Metric"),
-                kind,
-                unit,
+#[derive(Debug, Default, Deserialize)]
+pub struct ResetQuery {
+    node_id: Option<String>,
+    provider_id: Option<String>,
+    metric_key: Option<String>,
+    metric_kind: Option<String>,
+    unit: Option<String>,
+}
+
+fn reset_tier(
+    connection: &Connection,
+    identity: &[String],
+    previous: Option<(ResetTier, i64, String)>,
+) -> anyhow::Result<ResetTier> {
+    let (mut tier, after, observation) = previous.unwrap_or_else(|| {
+        (
+            ResetTier {
+                key: identity[3].clone(),
+                label: String::new(),
+                kind: identity[4].clone(),
+                unit: (!identity[5].is_empty()).then(|| identity[5].clone()),
                 resets: Vec::new(),
-            });
+            },
+            -1,
+            String::new(),
+        )
+    });
+    let mut statement = connection.prepare(
+        "SELECT metric_label,resets_at,sampled_at,
+        CASE WHEN utilization_percent IS NOT NULL THEN utilization_percent>0
+          WHEN used IS NOT NULL THEN used>0 ELSE COALESCE(total-remaining>0,0) END
+        FROM quota_sample_cache WHERE node_id=?1 AND app_type=?2 AND provider_id=?3
+          AND metric_key=?4 AND metric_kind=?5 AND unit_key=?6
+          AND sampled_at>=0 AND resets_at>sampled_at AND (sampled_at,observation_id)>(?7,?8)
+        ORDER BY sampled_at,observation_id",
+    )?;
+    let mut rows = statement.query(params![
+        identity[0],
+        identity[1],
+        identity[2],
+        identity[3],
+        identity[4],
+        identity[5],
+        after,
+        observation
+    ])?;
+    while let Some(row) = rows.next()? {
+        if tier.resets.is_empty() {
+            tier.label = public_alias(row.get(0)?, "Metric");
         }
-        let resets = &mut tiers.last_mut().unwrap().resets;
-        let resets_at: i64 = row.get(8)?;
-        let sampled_at: i64 = row.get(9)?;
-        let has_usage: bool = row.get(10)?;
-        if let Some(previous) = resets
+        let resets_at: i64 = row.get(1)?;
+        let sampled_at: i64 = row.get(2)?;
+        let has_usage: bool = row.get(3)?;
+        if let Some(previous) = tier
+            .resets
             .last_mut()
-            .filter(|previous| (previous.resets_at - resets_at).abs() <= 60)
+            .filter(|p| (p.resets_at - resets_at).abs() <= 60)
         {
-            // Duplicate timestamps are not independent confirmation samples.
             if sampled_at > previous.last_sampled_at {
                 previous.sample_count += 1;
             }
@@ -590,7 +609,7 @@ fn query_resets(path: &std::path::Path) -> anyhow::Result<ResetHistory> {
                 previous.first_usage_at = Some(sampled_at);
             }
         } else {
-            resets.push(ResetObservation {
+            tier.resets.push(ResetObservation {
                 resets_at,
                 first_sampled_at: sampled_at,
                 last_sampled_at: sampled_at,
@@ -599,13 +618,117 @@ fn query_resets(path: &std::path::Path) -> anyhow::Result<ResetHistory> {
             });
         }
     }
+    Ok(tier)
+}
+
+pub(crate) fn rebuild_reset_cache(connection: &Connection) -> anyhow::Result<bool> {
+    let Some(identity) = crate::quota_cache::next_dirty(connection)? else {
+        return Ok(false);
+    };
+    let tx = connection.unchecked_transaction()?;
+    let condition="node_id=?1 AND app_type=?2 AND provider_id=?3 AND metric_key=?4 AND metric_kind=?5 AND unit_key=?6";
+    let (dirty,through,id,cached,revision):(i64,i64,String,String,i64)=tx.query_row(&format!("SELECT dirty_from,through_at,through_id,runs,revision FROM quota_reset_cache WHERE {condition}"),params_from_iter(&identity),|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    let previous = if dirty > through {
+        serde_json::from_str(&cached)
+            .ok()
+            .map(|tier| (tier, through, id))
+    } else {
+        None
+    };
+    let tier = reset_tier(&tx, &identity, previous)?;
+    let (through, id): (i64, String) = tx.query_row(
+        &format!("SELECT sampled_at,observation_id FROM quota_current_cache WHERE {condition}"),
+        params_from_iter(&identity),
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    tx.execute(&format!("UPDATE quota_reset_cache SET cached_revision=?7,dirty_from=9223372036854775807,through_at=?8,through_id=?9,runs=?10 WHERE {condition}"),params![identity[0],identity[1],identity[2],identity[3],identity[4],identity[5],revision,through,id,serde_json::to_string(&tier)?])?;
+    tx.commit()?;
+    Ok(true)
+}
+
+#[cfg(test)]
+fn query_resets(path: &std::path::Path) -> anyhow::Result<ResetHistory> {
+    query_resets_filtered(path, &ResetQuery::default())
+}
+
+fn query_resets_filtered(
+    path: &std::path::Path,
+    query: &ResetQuery,
+) -> anyhow::Result<ResetHistory> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = connection.unchecked_transaction()?;
+    let mut where_sql = "c.app_type='codex'".to_owned();
+    let mut values = Vec::<String>::new();
+    for (column, value) in [
+        ("node_id", &query.node_id),
+        ("provider_id", &query.provider_id),
+        ("metric_key", &query.metric_key),
+        ("metric_kind", &query.metric_kind),
+        ("unit_key", &query.unit),
+    ] {
+        if let Some(value) = value {
+            values.push(value.clone());
+            where_sql.push_str(&format!(" AND c.{column}=?{}", values.len()));
+        }
+    }
+    let mut statement=tx.prepare(&format!("SELECT c.node_id,c.app_type,c.provider_id,c.metric_key,c.metric_kind,c.unit_key,n.node_name,COALESCE(s.provider_name,c.provider_id),CASE WHEN c.cached_revision=c.revision THEN c.runs END
+        FROM quota_reset_cache c JOIN nodes n ON n.uuid=c.node_id
+        LEFT JOIN quota_provider_states s ON s.node_id=c.node_id AND s.app_type=c.app_type AND s.provider_id=c.provider_id
+        WHERE {where_sql} ORDER BY c.node_id,c.provider_id,c.metric_key,c.metric_kind,c.unit_key"))?;
+    let entries = statement
+        .query_map(params_from_iter(values), |r| {
+            Ok((
+                (0..6)
+                    .map(|i| r.get::<_, String>(i))
+                    .collect::<Result<Vec<_>, _>>()?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut providers: Vec<ResetProvider> = Vec::new();
+    for (identity, node_name, provider_name, cached) in entries {
+        let tier = match cached.and_then(|s| serde_json::from_str::<ResetTier>(&s).ok()) {
+            Some(tier) => tier,
+            None => reset_tier(&tx, &identity, None)?,
+        };
+        if tier.resets.is_empty() {
+            continue;
+        }
+        if providers
+            .last()
+            .is_none_or(|p| p.node_id != identity[0] || p.provider_id != identity[2])
+        {
+            providers.push(ResetProvider {
+                node_id: identity[0].clone(),
+                node_name: public_alias(node_name, "Node"),
+                provider_id: identity[2].clone(),
+                provider_name: public_alias(provider_name, "Provider"),
+                tiers: Vec::new(),
+            });
+        }
+        providers.last_mut().unwrap().tiers.push(tier);
+    }
     Ok(ResetHistory { providers })
 }
 
-pub async fn resets(State(state): State<ServerState>) -> Response {
+pub async fn resets(
+    State(state): State<ServerState>,
+    Query(query): Query<ResetQuery>,
+    headers: HeaderMap,
+) -> Response {
     let path = state.db_path.clone();
-    match tokio::task::spawn_blocking(move || query_resets(&path)).await {
-        Ok(Ok(response)) => Json(response).into_response(),
+    match tokio::task::spawn_blocking(move || {
+        crate::performance::conditional_json(
+            || query_resets_filtered(&path, &query),
+            Some(&headers),
+        )
+    })
+    .await
+    {
+        Ok(Ok(response)) => response,
         Ok(Err(err)) => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "query_failed",
@@ -649,12 +772,14 @@ fn nice_bucket(required: i64) -> i64 {
     .unwrap_or(required)
 }
 
+pub(crate) fn automatic_bucket_seconds(duration: i64) -> i64 {
+    nice_bucket(((duration + TARGET_POINTS_PER_SERIES - 1) / TARGET_POINTS_PER_SERIES).max(60))
+}
+
 fn parse_bucket(value: Option<&str>, duration: i64) -> Result<(i64, String), String> {
     let text = value.unwrap_or("auto");
     if text == "auto" {
-        let seconds = nice_bucket(
-            ((duration + TARGET_POINTS_PER_SERIES - 1) / TARGET_POINTS_PER_SERIES).max(60),
-        );
+        let seconds = automatic_bucket_seconds(duration);
         return Ok((seconds, bucket_label(seconds)));
     }
     let (digits, multiplier) = if let Some(value) = text.strip_suffix("mo") {
@@ -756,57 +881,43 @@ fn query_metric_rows(
     query: &ResolvedQuotaQuery,
     current_only: bool,
 ) -> rusqlite::Result<Vec<MetricRow>> {
-    let mut filters = vec!["o.app_type='codex'".to_owned()];
+    let mut filters = vec!["app_type='codex'".to_owned()];
     let mut values = Vec::<Value>::new();
-    if !current_only {
-        filters.push(format!("o.sampled_at >= ?{}", values.len() + 1));
-        values.push(Value::Integer(query.from));
-        filters.push(format!("o.sampled_at <= ?{}", values.len() + 1));
-        values.push(Value::Integer(query.to));
+    for (column, value) in [
+        ("node_id", &query.node_id),
+        ("provider_id", &query.provider_id),
+    ] {
+        if let Some(value) = value {
+            values.push(Value::Text(value.clone()));
+            filters.push(format!("{column}=?{}", values.len()));
+        }
     }
-    if let Some(node_id) = &query.node_id {
-        filters.push(format!("o.node_id = ?{}", values.len() + 1));
-        values.push(Value::Text(node_id.clone()));
-    }
-    if let Some(provider_id) = &query.provider_id {
-        filters.push(format!("o.provider_id = ?{}", values.len() + 1));
-        values.push(Value::Text(provider_id.clone()));
-    }
-    let identity = "node_id,provider_id,metric_key,metric_kind,COALESCE(unit,'')";
-    let raw = format!(
-        "SELECT o.node_id,o.provider_id,m.metric_key,m.metric_label,m.metric_kind,m.unit,
-                o.sampled_at,m.utilization_percent,m.used,m.remaining,m.total,m.resets_at,
-                o.observation_id,
-                CASE WHEN m.utilization_percent IS NOT NULL OR
-                    (m.total>0 AND (m.used IS NOT NULL OR m.remaining IS NOT NULL))
-                    THEN 0 ELSE 1 END AS value_axis
-         FROM quota_observations o JOIN quota_metrics m
-           ON m.node_id=o.node_id AND m.observation_id=o.observation_id
-         WHERE {}",
-        filters.join(" AND ")
-    );
-    let columns = "node_id,provider_id,metric_key,metric_label,metric_kind,unit,sampled_at,
-                   utilization_percent,used,remaining,total,resets_at";
-    let sql = if current_only {
-        format!(
-            "WITH raw AS ({raw}), ranked AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY {identity}
-                ORDER BY sampled_at DESC,observation_id DESC) AS position FROM raw
-        ) SELECT {columns},0 AS segment_id FROM ranked WHERE position=1
-          ORDER BY node_id,provider_id,metric_key,sampled_at"
-        )
-    } else {
-        format!(
-            "WITH raw AS ({raw}) SELECT {columns},0 AS segment_id FROM raw
-            ORDER BY {identity},sampled_at,observation_id"
-        )
-    };
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map(params_from_iter(values), metric_row)?;
+    let columns = "node_id,provider_id,metric_key,metric_label,metric_kind,unit,sampled_at,utilization_percent,used,remaining,total,resets_at,0";
+    let mut statement = connection.prepare(&format!("SELECT {columns} FROM quota_current_cache WHERE {} ORDER BY node_id,provider_id,metric_key,metric_kind,unit_key", filters.join(" AND ")))?;
+    let current = statement
+        .query_map(params_from_iter(values), metric_row)?
+        .collect::<Result<Vec<_>, _>>()?;
     if current_only {
-        return rows.collect();
+        return Ok(current);
     }
-    retain_history(rows, query.from, query.bucket_seconds)
+    let mut history = Vec::new();
+    let mut statement = connection.prepare(&format!("SELECT {columns} FROM quota_sample_cache WHERE node_id=?1 AND app_type='codex' AND provider_id=?2 AND metric_key=?3 AND metric_kind=?4 AND unit_key=?5 AND sampled_at>=?6 AND sampled_at<=?7 ORDER BY sampled_at,observation_id"))?;
+    for metric in current {
+        let rows = statement.query_map(
+            params![
+                metric.node_id,
+                metric.provider_id,
+                metric.key,
+                metric.kind,
+                metric.unit.as_deref().unwrap_or(""),
+                query.from,
+                query.to
+            ],
+            metric_row,
+        )?;
+        history.extend(retain_history(rows, query.from, query.bucket_seconds)?);
+    }
+    Ok(history)
 }
 
 fn same_metric(a: &MetricRow, b: &MetricRow) -> bool {
@@ -925,9 +1036,10 @@ fn query_dashboard(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch("BEGIN")?;
 
     let mut state_sql = "SELECT s.node_id,n.node_name,s.provider_id,s.provider_name,s.status,
-                                s.target_kind,s.checked_at,s.last_success_at
+                                s.target_kind,s.checked_at,s.last_success_at,s.diagnostic_code
                          FROM quota_provider_states s JOIN nodes n ON n.uuid=s.node_id
                          WHERE s.app_type='codex'"
         .to_owned();
@@ -957,6 +1069,7 @@ fn query_dashboard(
                 target_kind: row.get(5)?,
                 checked_at: row.get(6)?,
                 last_success_at: row.get(7)?,
+                diagnostic_code: row.get(8)?,
                 current: Vec::new(),
                 series: Vec::new(),
             },
@@ -1043,9 +1156,12 @@ pub async fn dashboard(
         }
     };
     let path = state.db_path.clone();
-    match tokio::task::spawn_blocking(move || query_dashboard(&path, query, include_history)).await
+    match tokio::task::spawn_blocking(move || {
+        crate::performance::query_json(|| query_dashboard(&path, query, include_history))
+    })
+    .await
     {
-        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Ok(response)) => response,
         Ok(Err(error_value)) => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "database_unavailable",
@@ -1089,6 +1205,7 @@ mod tests {
         QuotaUploadBatch {
             schema_version: SCHEMA_VERSION,
             provider_states: vec![QuotaProviderState {
+                diagnostic_code: None,
                 app_type: "codex".to_owned(),
                 provider_id: "provider-a".to_owned(),
                 provider_name: "Provider A".to_owned(),
@@ -1104,6 +1221,18 @@ mod tests {
                 metrics: vec![metric(value)],
             }],
         }
+    }
+
+    #[test]
+    fn quota_api_diagnostic_is_allowlisted_without_arbitrary_error_text() {
+        let mut state = batch("unused", 1_800_000_000, 0.0)
+            .provider_states
+            .remove(0);
+        state.status = QuotaProviderStatus::QueryFailed;
+        state.diagnostic_code = Some("quota_api_unavailable".into());
+        assert!(valid_state(&state));
+        state.diagnostic_code = Some("token SECRET request failed".into());
+        assert!(!valid_state(&state));
     }
 
     #[test]
@@ -1251,6 +1380,88 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn projection_migration_late_upload_delete_and_reset_cache_match_raw() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let mut db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        nodes::ensure_schema(&db).unwrap();
+        ensure_schema(&db).unwrap();
+        let (node, _) = nodes::create(&db, "node").unwrap();
+        let first = Uuid::new_v4().to_string();
+        let latest = Uuid::new_v4().to_string();
+        store_batch(&mut db, &node.uuid, &batch(&first, 100, 10.0)).unwrap();
+        store_batch(&mut db, &node.uuid, &batch(&latest, 220, 30.0)).unwrap();
+        crate::quota_cache::ensure_schema(&db).unwrap();
+        crate::quota_cache::ensure_schema(&db).unwrap(); // restart is idempotent
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM quota_sample_cache", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let query = resolve_query(QuotaDashboardQuery {
+            from: Some(0),
+            to: Some(500),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            query_metric_rows(&db, &query, true).unwrap()[0].utilization_percent,
+            Some(30.0)
+        );
+        for sample in [160, 280, 280] {
+            // late, append, equal-time tie
+            let mut value = batch(&Uuid::new_v4().to_string(), sample, 20.0);
+            if sample == 160 {
+                value.observations[0].metrics[0].resets_at = Some(1_800_000_120);
+            }
+            store_batch(&mut db, &node.uuid, &value).unwrap();
+            let raw = serde_json::to_value(query_resets(&path).unwrap()).unwrap();
+            while rebuild_reset_cache(&db).unwrap() {}
+            assert_eq!(
+                serde_json::to_value(query_resets(&path).unwrap()).unwrap(),
+                raw
+            );
+        }
+        db.execute("DELETE FROM quota_observations WHERE sampled_at>=220", [])
+            .unwrap();
+        assert_eq!(
+            query_metric_rows(&db, &query, true).unwrap()[0].sampled_at,
+            160
+        );
+        let raw = serde_json::to_value(query_resets(&path).unwrap()).unwrap();
+        while rebuild_reset_cache(&db).unwrap() {}
+        assert_eq!(
+            serde_json::to_value(query_resets(&path).unwrap()).unwrap(),
+            raw
+        );
+        let filtered = query_resets_filtered(
+            &path,
+            &ResetQuery {
+                node_id: Some("missing".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(filtered.providers.is_empty());
+        db.execute("DELETE FROM nodes WHERE uuid=?1", [&node.uuid])
+            .unwrap();
+        for table in [
+            "quota_sample_cache",
+            "quota_current_cache",
+            "quota_reset_cache",
+        ] {
+            assert_eq!(
+                db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
         }
     }
 

@@ -1,5 +1,6 @@
 import {
   providerIdentity,
+  billingFactors,
   metricIdentity,
   providerSelected,
   mergeProviders,
@@ -353,6 +354,28 @@ function setDashboardResetSelection(group, tier) {
     : null;
 }
 
+const pendingPrices = new WeakMap();
+async function loadReferencePrice(entry, refresh = false) {
+  const model = entry.model.trim();
+  const token = {};
+  pendingPrices.set(entry, token);
+  renderModelBillingMultipliers();
+  try {
+    const query = new URLSearchParams({ model, refresh: String(refresh) });
+    const snapshot = await api(`/admin/api/model-pricing?${query}`);
+    if (entry.model.trim() !== model || pendingPrices.get(entry) !== token) return;
+    entry.referencePricing = snapshot;
+    settingsChanged();
+  } catch (error) {
+    if (entry.model.trim() === model && pendingPrices.get(entry) === token) showMessage(settingsMessage, error.message);
+  } finally {
+    if (pendingPrices.get(entry) === token) {
+      pendingPrices.delete(entry);
+      renderModelBillingMultipliers();
+    }
+  }
+}
+
 function renderModelBillingMultipliers() {
   const entries = settingsDraft.dashboardDefaults.modelBillingMultipliers;
   if (!entries.length) entries.push({ model: "", multiplier: 1 });
@@ -371,27 +394,65 @@ function renderModelBillingMultipliers() {
     modelInput.value = entry.model || "";
     modelInput.addEventListener("input", () => {
       entry.model = modelInput.value;
+      entry.referencePricing = null;
       settingsChanged();
+    });
+    modelInput.addEventListener("change", () => {
+      renderModelBillingMultipliers();
+      if (entry.mode && entry.mode !== "overall" && entry.model.trim()) loadReferencePrice(entry);
     });
     modelLabel.append(modelInput);
 
-    const multiplierLabel = document.createElement("label");
-    multiplierLabel.className = "settings-model-billing-multiplier";
-    multiplierLabel.textContent = "倍率";
-    const multiplierInput = document.createElement("input");
-    multiplierInput.className = "settings-model-billing-multiplier-input";
-    multiplierInput.type = "number";
-    multiplierInput.min = "0";
-    multiplierInput.max = "1000";
-    multiplierInput.step = "0.01";
-    multiplierInput.inputMode = "decimal";
-    multiplierInput.value = String(entry.multiplier ?? 1);
-    multiplierInput.addEventListener("input", () => {
-      const value = Number(multiplierInput.value);
-      if (Number.isFinite(value) && value >= 0 && value <= 1000) entry.multiplier = value;
-      settingsChanged();
+    const modeLabel = document.createElement("label");
+    modeLabel.textContent = "计费倍率模式";
+    const mode = document.createElement("select");
+    mode.className = "settings-billing-mode";
+    for (const [value, label] of [["overall", "整体"], ["components", "分项"]]) {
+      mode.append(new Option(label, value));
+    }
+    mode.value = entry.mode || "overall";
+    mode.addEventListener("change", () => {
+      entry.mode = mode.value;
+      settingsChanged(); renderModelBillingMultipliers();
+      if (entry.mode !== "overall" && entry.model.trim() && !entry.referencePricing) loadReferencePrice(entry);
     });
-    multiplierLabel.append(multiplierInput);
+    modeLabel.append(mode);
+    const fields = document.createElement("div");
+    fields.className = "settings-billing-factors";
+    const activeFields = mode.value === "overall" ? [["multiplier", "整体"]]
+      : [["freshMultiplier", "Fresh"], ["creationMultiplier", "Creation"], ["readMultiplier", "Read"], ["outputMultiplier", "Output"]];
+    for (const [key, label] of activeFields) {
+      const multiplierLabel = document.createElement("label");
+      multiplierLabel.className = "settings-model-billing-multiplier";
+      multiplierLabel.textContent = label + " 倍率";
+      const multiplierInput = document.createElement("input");
+      multiplierInput.className = "settings-model-billing-multiplier-input";
+      multiplierInput.type = "number"; multiplierInput.min = "0"; multiplierInput.max = "1000";
+      multiplierInput.step = "any"; multiplierInput.required = true; multiplierInput.inputMode = "decimal";
+      multiplierInput.dataset.factor = key;
+      multiplierInput.value = String(entry[key] ?? 1);
+      multiplierInput.addEventListener("input", () => {
+        entry[key] = multiplierInput.value === "" ? NaN : Number(multiplierInput.value);
+        settingsChanged();
+      });
+      multiplierLabel.append(multiplierInput);
+      fields.append(multiplierLabel);
+    }
+    const pricing = document.createElement("div");
+    pricing.className = "settings-billing-pricing";
+    pricing.hidden = mode.value === "overall";
+    const snapshot = entry.referencePricing;
+    const description = document.createElement("p");
+    description.className = "muted";
+    description.textContent = snapshot
+      ? `${snapshot.source} · ${snapshot.resolvedModel} · ${new Date(snapshot.fetchedAt * 1000).toLocaleString()}\nUSD / 1M tokens — Fresh: ${snapshot.fresh ?? "缺失"}, Creation: ${snapshot.creation ?? "缺失"}, Read: ${snapshot.read ?? "缺失"}, Output: ${snapshot.output ?? "缺失"}`
+      : "尚未获取参考价格。缺失必要单价的记录保留原费用，并在 Dashboard 提示。";
+    const priceButton = document.createElement("button");
+    priceButton.type = "button"; priceButton.className = "button secondary";
+    priceButton.textContent = pendingPrices.has(entry) ? "获取中…" : "更新参考价格";
+    priceButton.disabled = pendingPrices.has(entry) || !entry.model.trim();
+    priceButton.addEventListener("click", () => loadReferencePrice(entry, true));
+    pricing.append(description, priceButton);
 
     const remove = document.createElement("button");
     remove.className = "button danger";
@@ -403,7 +464,7 @@ function renderModelBillingMultipliers() {
       renderModelBillingMultipliers();
       settingsChanged();
     });
-    row.append(modelLabel, multiplierLabel, remove);
+    row.append(modelLabel, modeLabel, fields, remove, pricing);
     settingsModelBillingMultipliers.append(row);
   }
 }
@@ -569,27 +630,40 @@ settingsForm.addEventListener("submit", async (event) => {
   const multipliers = [];
   for (const row of entries) {
     const model = row.querySelector('input[type="text"]').value.trim();
-    const multiplier = Number(row.querySelector('input[type="number"]').value);
-    if (!model && multiplier === 1) continue;
+    const entry = settingsDraft.dashboardDefaults.modelBillingMultipliers[entries.indexOf(row)];
+    const factors = billingFactors(entry);
+    if (!model && factors.every((value) => value === 1)) continue;
     const hasControl = [...model].some((character) => /\p{C}/u.test(character));
     if (!model || new TextEncoder().encode(model).length > 256 || hasControl || seen.has(model)) {
       showMessage(settingsMessage, "模型名称必须非空、唯一且不超过 256 字节。");
       button.disabled = false;
       return;
     }
-    if (!Number.isFinite(multiplier) || multiplier < 0 || multiplier > 1000) {
+    if (factors.some((value) => !Number.isFinite(value) || value < 0 || value > 1000)) {
       showMessage(settingsMessage, "模型计费倍率必须是 0 到 1000 之间的数字。");
       button.disabled = false;
       return;
     }
     seen.add(model);
-    multipliers.push({ model, multiplier });
+    // Serialize only the active mode, so dormant edits cannot stack or block saves.
+    const value = { model, mode: entry.mode || "overall", multiplier: 1 };
+    if (value.mode === "overall") value.multiplier = factors[0];
+    else {
+      value.referencePricing = entry.referencePricing;
+      [value.freshMultiplier, value.creationMultiplier, value.readMultiplier, value.outputMultiplier] = factors;
+    }
+    multipliers.push(value);
   }
-  settingsDraft.dashboardDefaults.modelBillingMultipliers = multipliers;
+  const submission = structuredClone(settingsDraft);
+  submission.dashboardDefaults.modelBillingMultipliers = multipliers;
   try {
-    settingsDraft = await api("/admin/api/settings", { method: "PUT", body: JSON.stringify(settingsDraft) });
+    settingsDraft = await api("/admin/api/settings", { method: "PUT", body: JSON.stringify(submission) });
     renderSettings();
-    showMessage(settingsMessage, "设置已保存。Dashboard 下次打开时应用。", "ok");
+    const unresolved = settingsDraft.dashboardDefaults.modelBillingMultipliers.filter((entry) =>
+      entry.mode !== "overall" && billingFactors(entry).some((factor) => factor !== 1) && !entry.referencePricing).length;
+    showMessage(settingsMessage, unresolved
+      ? `设置已保存；${unresolved} 个模型没有可用参考价格，暂保留原费用。可更新参考价格后再次保存。`
+      : "设置已保存。Dashboard 下次刷新时应用。", unresolved ? "" : "ok");
   } catch (error) {
     if (error.status === 401) showLogin("登录已过期，请重新登录。");
     else showMessage(settingsMessage, error.message);

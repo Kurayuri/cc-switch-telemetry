@@ -5,11 +5,11 @@ use std::{fs, path::Path};
 const SNAPSHOT_FILES: [(&str, &str); 6] = [
     (
         "session_usage.rs",
-        "7ae348e46f259d19195d8de4f42bea48dd6963ad77441aff94d05d52c44621f9",
+        "f159e9ebb92fc57d99070cedc479a29ba0b3a1a42653c426b81a6725bd0f0e9e",
     ),
     (
         "session_usage_codex.rs",
-        "eadb325ca4b408c9a330784d3e6e6bca86b235cf0e5ce9a4568c82596e055d03",
+        "8a2925ede70a1603068bb97b4dbb177f45cea3c6649c6845307c1d5ea687315c",
     ),
     (
         "session_usage_gemini.rs",
@@ -33,7 +33,7 @@ const SNAPSHOT_FILES: [(&str, &str); 6] = [
 fn vendored_parser_snapshot_matches_declared_source() {
     assert_eq!(
         IMPORTER_SOURCE_COMMIT,
-        "3217f72596f2d1c0f879f0a05f83803825d9809f"
+        "87d966b7f887adfe0e9856ee0f7e93cc8efc874f"
     );
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../3rdparty/cc-switch/src-tauri/src/services");

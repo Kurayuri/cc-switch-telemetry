@@ -14,21 +14,20 @@ use telemetry_core::{
     QuotaBatchResponse, QuotaMetric, QuotaMetricKind, QuotaObservation, QuotaProviderState,
     QuotaProviderStatus, QuotaTargetKind, QuotaUploadBatch, SCHEMA_VERSION,
 };
-use tokio::process::Command;
+mod api;
 use uuid::Uuid;
 
 pub const DEFAULT_INTERVAL_SECONDS: u64 = 60;
-pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_COMMAND_OUTPUT_BYTES: usize = 128 * 1024;
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_API_RESPONSE_BYTES: usize = 128 * 1024;
 const DEFAULT_UPLOAD_BATCH_SIZE: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct QuotaConfig {
-    pub cc_switch_db: PathBuf,
+    pub api_file: PathBuf,
     pub quota_db: PathBuf,
-    pub cli_override: Option<PathBuf>,
     pub interval: Duration,
-    pub command_timeout: Duration,
+    pub query_timeout: Duration,
     pub upload_batch_size: usize,
 }
 
@@ -44,15 +43,14 @@ impl QuotaConfig {
             .transpose()?
             .unwrap_or(DEFAULT_INTERVAL_SECONDS);
         Ok(Self {
-            cc_switch_db,
+            api_file: env::var_os("CC_SWITCH_QUOTA_API_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cc_switch_db.with_file_name("quota-api.json")),
             quota_db: env::var_os("TELEMETRY_QUOTA_DB")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./data/quota-history.db")),
-            cli_override: env::var_os("CC_SWITCH_CLI")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
             interval: Duration::from_secs(interval_seconds),
-            command_timeout: COMMAND_TIMEOUT,
+            query_timeout: QUERY_TIMEOUT,
             upload_batch_size: DEFAULT_UPLOAD_BATCH_SIZE,
         })
     }
@@ -62,7 +60,7 @@ impl QuotaConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CodexProvider {
     pub id: String,
     pub name: String,
@@ -76,24 +74,24 @@ pub struct CollectedQuota {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CliQuotaOutput {
+struct ApiQuotaOutput {
     app: String,
     provider_id: String,
-    target: Option<CliTarget>,
+    target: Option<ApiTarget>,
     status: String,
     available: bool,
     queried_at: i64,
-    result: Option<CliQuotaResult>,
+    result: Option<ApiQuotaResult>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CliTarget {
-    kind: CliTargetKind,
+struct ApiTarget {
+    kind: ApiTargetKind,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
-enum CliTargetKind {
+enum ApiTargetKind {
     SubscriptionTool,
     CodexOAuth,
     UsageScript,
@@ -101,23 +99,23 @@ enum CliTargetKind {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "type", content = "quota")]
-enum CliQuotaResult {
-    Subscription(CliSubscriptionQuota),
-    Script(CliUsageResult),
+enum ApiQuotaResult {
+    Subscription(ApiSubscriptionQuota),
+    Script(ApiUsageResult),
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CliSubscriptionQuota {
+struct ApiSubscriptionQuota {
     success: bool,
     #[serde(default)]
-    tiers: Vec<CliQuotaTier>,
-    extra_usage: Option<CliExtraUsage>,
+    tiers: Vec<ApiQuotaTier>,
+    extra_usage: Option<ApiExtraUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CliQuotaTier {
+struct ApiQuotaTier {
     name: String,
     utilization: f64,
     resets_at: Option<String>,
@@ -125,7 +123,7 @@ struct CliQuotaTier {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CliExtraUsage {
+struct ApiExtraUsage {
     is_enabled: bool,
     monthly_limit: Option<f64>,
     used_credits: Option<f64>,
@@ -134,14 +132,14 @@ struct CliExtraUsage {
 }
 
 #[derive(Debug, Deserialize)]
-struct CliUsageResult {
+struct ApiUsageResult {
     success: bool,
-    data: Option<Vec<CliUsageData>>,
+    data: Option<Vec<ApiUsageData>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CliUsageData {
+struct ApiUsageData {
     plan_name: Option<String>,
     is_valid: Option<bool>,
     total: Option<f64>,
@@ -207,17 +205,18 @@ fn reset_timestamp(value: Option<&str>) -> Option<i64> {
         .map(|value| value.timestamp())
 }
 
-fn target_kind(target: Option<&CliTarget>) -> Option<QuotaTargetKind> {
+fn target_kind(target: Option<&ApiTarget>) -> Option<QuotaTargetKind> {
     target.map(|target| match target.kind {
-        CliTargetKind::SubscriptionTool => QuotaTargetKind::SubscriptionTool,
-        CliTargetKind::CodexOAuth => QuotaTargetKind::CodexOAuth,
-        CliTargetKind::UsageScript => QuotaTargetKind::UsageScript,
+        ApiTargetKind::SubscriptionTool => QuotaTargetKind::SubscriptionTool,
+        ApiTargetKind::CodexOAuth => QuotaTargetKind::CodexOAuth,
+        ApiTargetKind::UsageScript => QuotaTargetKind::UsageScript,
     })
 }
 
 fn upstream_status(value: &str) -> Option<QuotaProviderStatus> {
     match value {
         "ok" => Some(QuotaProviderStatus::Ok),
+        "timed_out" => Some(QuotaProviderStatus::TimedOut),
         "not_available" => Some(QuotaProviderStatus::NotAvailable),
         "credential_parse_failed" => Some(QuotaProviderStatus::CredentialParseFailed),
         "login_expired" => Some(QuotaProviderStatus::LoginExpired),
@@ -244,7 +243,7 @@ fn utilization_percent(
     })
 }
 
-fn subscription_metrics(quota: CliSubscriptionQuota) -> Option<Vec<QuotaMetric>> {
+fn subscription_metrics(quota: ApiSubscriptionQuota) -> Option<Vec<QuotaMetric>> {
     if !quota.success || quota.tiers.is_empty() {
         return None;
     }
@@ -303,7 +302,7 @@ fn subscription_metrics(quota: CliSubscriptionQuota) -> Option<Vec<QuotaMetric>>
     Some(metrics)
 }
 
-fn script_metrics(result: CliUsageResult) -> Option<Vec<QuotaMetric>> {
+fn script_metrics(result: ApiUsageResult) -> Option<Vec<QuotaMetric>> {
     if !result.success {
         return None;
     }
@@ -352,6 +351,7 @@ fn state_only(
 ) -> CollectedQuota {
     CollectedQuota {
         state: QuotaProviderState {
+            diagnostic_code: None,
             app_type: "codex".to_owned(),
             provider_id: provider.id.clone(),
             provider_name: public_label(&provider.name, "Codex provider"),
@@ -363,7 +363,7 @@ fn state_only(
     }
 }
 
-fn normalize_output(provider: &CodexProvider, output: CliQuotaOutput) -> CollectedQuota {
+fn normalize_output(provider: &CodexProvider, output: ApiQuotaOutput) -> CollectedQuota {
     let fallback_time = chrono::Utc::now().timestamp();
     let checked_at = normalized_seconds(output.queried_at).unwrap_or(fallback_time);
     let target = target_kind(output.target.as_ref());
@@ -395,8 +395,8 @@ fn normalize_output(provider: &CodexProvider, output: CliQuotaOutput) -> Collect
         );
     }
     let metrics = match output.result {
-        Some(CliQuotaResult::Subscription(quota)) => subscription_metrics(quota),
-        Some(CliQuotaResult::Script(result)) => script_metrics(result),
+        Some(ApiQuotaResult::Subscription(quota)) => subscription_metrics(quota),
+        Some(ApiQuotaResult::Script(result)) => script_metrics(result),
         None => None,
     };
     let Some(metrics) = metrics else {
@@ -409,6 +409,7 @@ fn normalize_output(provider: &CodexProvider, output: CliQuotaOutput) -> Collect
     };
     CollectedQuota {
         state: QuotaProviderState {
+            diagnostic_code: None,
             app_type: "codex".to_owned(),
             provider_id: provider.id.clone(),
             provider_name: public_label(&provider.name, "Codex provider"),
@@ -426,143 +427,40 @@ fn normalize_output(provider: &CodexProvider, output: CliQuotaOutput) -> Collect
     }
 }
 
-pub fn read_codex_providers(path: &Path) -> anyhow::Result<Vec<CodexProvider>> {
-    let connection = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("open cc-switch database read-only: {}", path.display()))?;
-    connection.busy_timeout(Duration::from_secs(2))?;
-    let mut statement = connection.prepare(
-        "SELECT id,name FROM providers
-         WHERE app_type='codex' AND TRIM(id)<>''
-         ORDER BY id",
-    )?;
-    let providers = statement
-        .query_map([], |row| {
-            Ok(CodexProvider {
-                id: row.get(0)?,
-                name: row.get(1)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(providers)
-}
-
-fn executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-pub fn resolve_cli(config: &QuotaConfig) -> anyhow::Result<PathBuf> {
-    if let Some(path) = &config.cli_override {
-        if executable_file(path) {
-            return Ok(path.clone());
-        }
-        anyhow::bail!(
-            "CC_SWITCH_CLI is not an executable file: {}",
-            path.display()
-        );
-    }
-    if let Some(path) = env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|directory| directory.join("cc-switch-cli"))
-            .find(|candidate| executable_file(candidate))
-    }) {
-        return Ok(path);
-    }
-    if let Some(path) = dirs::home_dir()
-        .map(|home| home.join(".local/bin/cc-switch-cli"))
-        .filter(|candidate| executable_file(candidate))
-    {
-        return Ok(path);
-    }
-    anyhow::bail!("cc-switch-cli was not found in PATH or $HOME/.local/bin")
-}
-
-async fn query_provider_with_timeout(
-    executable: &Path,
-    provider: &CodexProvider,
-    timeout: Duration,
-) -> CollectedQuota {
-    let checked_at = chrono::Utc::now().timestamp();
-    let output = tokio::time::timeout(
-        timeout,
-        Command::new(executable)
-            .args([
-                "--app",
-                "codex",
-                "provider",
-                "quota",
-                &provider.id,
-                "--json",
-            ])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-    match output {
-        Err(_) => state_only(provider, QuotaProviderStatus::TimedOut, None, checked_at),
-        Ok(Err(_)) => state_only(
-            provider,
-            QuotaProviderStatus::CommandFailed,
-            None,
-            checked_at,
-        ),
-        Ok(Ok(output)) if !output.status.success() => state_only(
-            provider,
-            QuotaProviderStatus::CommandFailed,
-            None,
-            checked_at,
-        ),
-        Ok(Ok(output)) if output.stdout.len() > MAX_COMMAND_OUTPUT_BYTES => state_only(
-            provider,
-            QuotaProviderStatus::InvalidOutput,
-            None,
-            checked_at,
-        ),
-        Ok(Ok(output)) => match serde_json::from_slice::<CliQuotaOutput>(&output.stdout) {
-            Ok(output) => normalize_output(provider, output),
-            Err(_) => state_only(
-                provider,
-                QuotaProviderStatus::InvalidOutput,
-                None,
-                checked_at,
-            ),
-        },
-    }
-}
-
 pub async fn collect_cycle(config: &QuotaConfig) -> anyhow::Result<Vec<CollectedQuota>> {
-    let providers = read_codex_providers(&config.cc_switch_db)?;
-    let executable = resolve_cli(config);
+    let transport = api::QuotaApi::connect(&config.api_file, config.query_timeout);
+    let catalog = match &transport {
+        Ok(api) => api.providers().await,
+        Err(_) => Err(api::ApiError::Unavailable),
+    };
+    let providers = match catalog {
+        Ok(providers) => providers,
+        Err(error) => {
+            // Record failure against previously known identities, never re-emit
+            // the last successful measurement as a fresh observation.
+            if !config.quota_db.exists() {
+                anyhow::bail!("quota API unavailable; start cc-switch fix4");
+            }
+            let connection = init_db(&config.quota_db)?;
+            return Ok(load_states(&connection)?
+                .into_iter()
+                .filter(|s| s.app_type == "codex")
+                .map(|s| {
+                    api::failed(
+                        &CodexProvider {
+                            id: s.provider_id,
+                            name: s.provider_name,
+                        },
+                        error,
+                    )
+                })
+                .collect());
+        }
+    };
+    let api = transport.map_err(|_| anyhow::anyhow!("quota API unavailable"))?;
     let mut collected = Vec::with_capacity(providers.len());
     for provider in providers {
-        let item = match &executable {
-            Ok(executable) => {
-                query_provider_with_timeout(executable, &provider, config.command_timeout).await
-            }
-            Err(_) => state_only(
-                &provider,
-                QuotaProviderStatus::CommandFailed,
-                None,
-                chrono::Utc::now().timestamp(),
-            ),
-        };
-        collected.push(item);
+        collected.push(api.query(&provider).await);
     }
     Ok(collected)
 }
@@ -617,6 +515,14 @@ pub fn init_db(path: &Path) -> anyhow::Result<Connection> {
              sequence INTEGER NOT NULL
          );",
     )?;
+    let columns = connection
+        .prepare("PRAGMA table_info(quota_provider_states)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|c| c == "diagnostic_code") {
+        connection
+            .execute_batch("ALTER TABLE quota_provider_states ADD COLUMN diagnostic_code TEXT")?;
+    }
     Ok(connection)
 }
 
@@ -638,9 +544,10 @@ pub fn persist_cycle(path: &Path, collected: &[CollectedQuota]) -> anyhow::Resul
     for item in collected {
         transaction.execute(
             "INSERT INTO quota_provider_states (
-                 app_type,provider_id,provider_name,status,target_kind,checked_at
-             ) VALUES (?1,?2,?3,?4,?5,?6)
+                 app_type,provider_id,provider_name,status,target_kind,checked_at,diagnostic_code
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(app_type,provider_id) DO UPDATE SET
+                 diagnostic_code=excluded.diagnostic_code,
                  provider_name=excluded.provider_name,
                  status=excluded.status,
                  target_kind=excluded.target_kind,
@@ -653,6 +560,7 @@ pub fn persist_cycle(path: &Path, collected: &[CollectedQuota]) -> anyhow::Resul
                 enum_text(&item.state.status)?,
                 item.state.target_kind.as_ref().map(enum_text).transpose()?,
                 item.state.checked_at,
+                item.state.diagnostic_code,
             ],
         )?;
         let Some(observation) = &item.observation else {
@@ -709,7 +617,7 @@ fn remote_key(config: &ClientConfig) -> String {
 
 fn load_states(connection: &Connection) -> anyhow::Result<Vec<QuotaProviderState>> {
     let mut statement = connection.prepare(
-        "SELECT app_type,provider_id,provider_name,status,target_kind,checked_at
+        "SELECT app_type,provider_id,provider_name,status,target_kind,checked_at,diagnostic_code
          FROM quota_provider_states ORDER BY app_type,provider_id",
     )?;
     let rows = statement
@@ -721,13 +629,23 @@ fn load_states(connection: &Connection) -> anyhow::Result<Vec<QuotaProviderState
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
         .map(
-            |(app_type, provider_id, provider_name, status, target_kind, checked_at)| {
+            |(
+                app_type,
+                provider_id,
+                provider_name,
+                status,
+                target_kind,
+                checked_at,
+                diagnostic_code,
+            )| {
                 Ok(QuotaProviderState {
+                    diagnostic_code,
                     app_type,
                     provider_id,
                     provider_name,
@@ -945,7 +863,7 @@ mod tests {
         }
     }
 
-    fn subscription_json(status: &str, available: bool) -> String {
+    pub(super) fn subscription_json(status: &str, available: bool) -> String {
         serde_json::json!({
             "app": "codex",
             "providerId": "provider-a",
@@ -983,7 +901,7 @@ mod tests {
 
     #[test]
     fn successful_subscription_is_allowlist_normalized() {
-        let raw: CliQuotaOutput = serde_json::from_str(&subscription_json("ok", true)).unwrap();
+        let raw: ApiQuotaOutput = serde_json::from_str(&subscription_json("ok", true)).unwrap();
         let collected = normalize_output(&provider(), raw);
         assert_eq!(collected.state.status, QuotaProviderStatus::Ok);
         assert_eq!(
@@ -1000,10 +918,10 @@ mod tests {
 
     #[test]
     fn balances_derive_bounded_utilization_when_total_is_available() {
-        let metrics = script_metrics(CliUsageResult {
+        let metrics = script_metrics(ApiUsageResult {
             success: true,
             data: Some(vec![
-                CliUsageData {
+                ApiUsageData {
                     plan_name: Some("used".to_owned()),
                     is_valid: Some(true),
                     total: Some(20.0),
@@ -1011,7 +929,7 @@ mod tests {
                     remaining: None,
                     unit: Some("USD".to_owned()),
                 },
-                CliUsageData {
+                ApiUsageData {
                     plan_name: Some("remaining".to_owned()),
                     is_valid: Some(true),
                     total: Some(20.0),
@@ -1019,7 +937,7 @@ mod tests {
                     remaining: Some(18.0),
                     unit: Some("USD".to_owned()),
                 },
-                CliUsageData {
+                ApiUsageData {
                     plan_name: Some("capped".to_owned()),
                     is_valid: Some(true),
                     total: Some(20.0),
@@ -1027,7 +945,7 @@ mod tests {
                     remaining: None,
                     unit: Some("USD".to_owned()),
                 },
-                CliUsageData {
+                ApiUsageData {
                     plan_name: Some("amount-only".to_owned()),
                     is_valid: Some(true),
                     total: None,
@@ -1055,13 +973,13 @@ mod tests {
 
     #[test]
     fn status_and_available_are_not_inferred_from_exit_success() {
-        let raw: CliQuotaOutput =
+        let raw: ApiQuotaOutput =
             serde_json::from_str(&subscription_json("login_expired", false)).unwrap();
         let collected = normalize_output(&provider(), raw);
         assert_eq!(collected.state.status, QuotaProviderStatus::LoginExpired);
         assert!(collected.observation.is_none());
 
-        let raw: CliQuotaOutput = serde_json::from_str(&subscription_json("ok", false)).unwrap();
+        let raw: ApiQuotaOutput = serde_json::from_str(&subscription_json("ok", false)).unwrap();
         let collected = normalize_output(&provider(), raw);
         assert_eq!(collected.state.status, QuotaProviderStatus::InvalidOutput);
         assert!(collected.observation.is_none());
@@ -1070,7 +988,7 @@ mod tests {
     #[test]
     fn cadence_timeout_dynamic_tiers_and_provider_identity_are_stable() {
         assert_eq!(DEFAULT_INTERVAL_SECONDS, 60);
-        assert_eq!(COMMAND_TIMEOUT, Duration::from_secs(20));
+        assert_eq!(QUERY_TIMEOUT, Duration::from_secs(20));
 
         let mut value =
             serde_json::from_str::<serde_json::Value>(&subscription_json("ok", true)).unwrap();
@@ -1098,66 +1016,11 @@ mod tests {
         assert_eq!(collected_b.observation.unwrap().provider_id, "provider-b");
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn mock_executable_receives_exact_argv() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("cc-switch-cli");
-        let argv = directory.path().join("argv");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{}'\n",
-            argv.display(),
-            subscription_json("ok", true).replace('\'', "'\\''")
-        );
-        std::fs::write(&executable, script).unwrap();
-        let mut permissions = executable.metadata().unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-
-        let collected =
-            query_provider_with_timeout(&executable, &provider(), Duration::from_secs(2)).await;
-        assert_eq!(collected.state.status, QuotaProviderStatus::Ok);
-        assert_eq!(
-            std::fs::read_to_string(argv).unwrap(),
-            "--app\ncodex\nprovider\nquota\nprovider-a\n--json\n"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn subprocess_nonzero_invalid_json_and_timeout_are_states_only() {
-        use std::os::unix::fs::PermissionsExt;
-
-        async fn run_script(body: &str, timeout: Duration) -> CollectedQuota {
-            let directory = tempfile::tempdir().unwrap();
-            let executable = directory.path().join("cc-switch-cli");
-            std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
-            let mut permissions = executable.metadata().unwrap().permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(&executable, permissions).unwrap();
-            query_provider_with_timeout(&executable, &provider(), timeout).await
-        }
-
-        let nonzero = run_script("exit 7", Duration::from_secs(1)).await;
-        assert_eq!(nonzero.state.status, QuotaProviderStatus::CommandFailed);
-        assert!(nonzero.observation.is_none());
-
-        let invalid = run_script("printf 'not-json\\n'", Duration::from_secs(1)).await;
-        assert_eq!(invalid.state.status, QuotaProviderStatus::InvalidOutput);
-        assert!(invalid.observation.is_none());
-
-        let timed_out = run_script("sleep 1", Duration::from_millis(10)).await;
-        assert_eq!(timed_out.state.status, QuotaProviderStatus::TimedOut);
-        assert!(timed_out.observation.is_none());
-    }
-
     #[test]
     fn durable_ledger_keeps_observations_and_cursor_is_remote_scoped() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("quota.db");
-        let raw: CliQuotaOutput = serde_json::from_str(&subscription_json("ok", true)).unwrap();
+        let raw: ApiQuotaOutput = serde_json::from_str(&subscription_json("ok", true)).unwrap();
         let collected = normalize_output(&provider(), raw);
         let observation_id = collected
             .observation
@@ -1209,7 +1072,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let quota_path = directory.path().join("quota.db");
         let telemetry_path = directory.path().join("telemetry.db");
-        let raw: CliQuotaOutput = serde_json::from_str(&subscription_json("ok", true)).unwrap();
+        let raw: ApiQuotaOutput = serde_json::from_str(&subscription_json("ok", true)).unwrap();
         persist_cycle(&quota_path, &[normalize_output(&provider(), raw)]).unwrap();
 
         let connection = telemetry_server::init_db(&telemetry_path).unwrap();
@@ -1229,11 +1092,10 @@ mod tests {
             batch_size: 512,
         };
         let quota = QuotaConfig {
-            cc_switch_db: directory.path().join("unused-cc-switch.db"),
+            api_file: directory.path().join("quota-api.json"),
             quota_db: quota_path,
-            cli_override: None,
             interval: Duration::from_secs(60),
-            command_timeout: COMMAND_TIMEOUT,
+            query_timeout: QUERY_TIMEOUT,
             upload_batch_size: 512,
         };
 
@@ -1255,5 +1117,18 @@ mod tests {
             1
         );
         server.abort();
+    }
+    #[test]
+    fn historic_diagnostic_still_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.db");
+        let mut item = state_only(&provider(), QuotaProviderStatus::CommandFailed, None, 123);
+        item.state.diagnostic_code = Some("cli_schema_incompatible".into());
+        persist_cycle(&path, &[item]).unwrap();
+        let db = init_db(&path).unwrap();
+        assert_eq!(
+            load_states(&db).unwrap()[0].diagnostic_code.as_deref(),
+            Some("cli_schema_incompatible")
+        );
     }
 }
